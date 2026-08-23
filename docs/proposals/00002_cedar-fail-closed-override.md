@@ -8,7 +8,6 @@ status: proposed
 authors:
   - mkoushni
 graduation_criteria:
-  - "How? section with requirements and design"
   - A test that is red if translate() starts trusting Cedar's own
     decision, or if the Deny reason loses the fail-closed label and
     evaluation error text
@@ -78,3 +77,44 @@ this dialect.
 - As an on-call, I want the Deny reason to say fail-closed and
   name the evaluation error, so I can tell a closed gate from a
   normal default-deny.
+
+## How?
+
+### Requirements
+
+- Drive the case through `CedarDirectResolver::evaluate`, the
+  route-time path. A hand-built `Response` into `translate()`
+  would bypass Cedar's error reporting.
+- The fixture is a permit that would fire plus a sibling `when`
+  that errors at evaluation. Without the override that fixture
+  Allows. With it, Deny, and the reason contains `fail-closed`
+  and the originating evaluation error. A Deny-only assertion
+  would still pass if the reason were stripped.
+- A lone erroring policy is not the fixture. Cedar default-denies
+  when nothing permitted, so asserting Deny there still passes if
+  the override is gone.
+
+### Design
+
+`translate()` already Denies when `diagnostics().errors()` is
+non-empty, regardless of `decision()`. The test has to put Cedar
+in that state, not construct the `Response` by hand.
+
+`build_principal()` sets `id`, `type`, `roles`, `permissions`,
+`teams`, and `claims`. It does not set `department`. A `when {
+principal.department == "eng" }` is therefore a Cedar runtime
+evaluation error.
+
+Policy set: an unconditional permit with `@id("allow-all")`, plus
+that `when`. Cedar records the error, still Allows on the permit,
+and `translate()` must Deny with a fail-closed reason that carries
+the error text.
+
+One test in `builtins/pdps/cedar-direct/tests/basic_allow_deny.rs`,
+same pattern as the other allow/deny cases: build a resolver, call
+`evaluate`, assert the decision. No new file, no schema, no change
+to `translate()`.
+
+`principal.roles.contains(1)` is the wrong construction. Cedar
+returns false for set non-membership without raising an error, so
+the request Allows and the override never runs.
