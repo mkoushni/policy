@@ -9,7 +9,9 @@ authors:
   - mkoushni
 graduation_criteria:
   - "How? section with requirements and design"
-  - A test that is red if translate() starts trusting Cedar's own decision
+  - A test that is red if translate() starts trusting Cedar's own
+    decision, or if the Deny reason loses the fail-closed label and
+    evaluation error text
 stakeholders:
   - araujof
   - terylt
