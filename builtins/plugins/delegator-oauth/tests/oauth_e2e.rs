@@ -299,7 +299,7 @@ async fn happy_path_mints_delegated_token() {
 /// `IdP` returns a 400 with the standard `error` / `error_description`
 /// shape — delegator surfaces `delegation.idp_rejected` carrying the
 /// `IdP`'s machine-readable code. The free-text description is not
-/// forwarded: an IdP may echo the submitted `subject_token` there.
+/// forwarded: an `IdP` may echo the submitted `subject_token` there.
 #[tokio::test]
 async fn idp_rejection_surfaces_error_code() {
     let http = idp(
