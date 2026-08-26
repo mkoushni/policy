@@ -198,7 +198,11 @@ async fn evaluation_error_denies_even_when_a_permit_fired() {
         .expect("evaluate");
 
     match decision.decision {
-        Decision::Deny { reason, .. } => {
+        Decision::Deny { reason, rule_source } => {
+            assert_eq!(
+                rule_source, "allow-all",
+                "rule_source should be the firing permit when fail-closed overrides"
+            );
             let reason = reason.expect("fail-closed deny carries a reason");
             assert!(
                 reason.contains("fail-closed"),
@@ -211,6 +215,11 @@ async fn evaluation_error_denies_even_when_a_permit_fired() {
         },
         other => panic!("expected Deny on a partially failed Allow, got {other:?}"),
     }
+    assert_eq!(
+        decision.diagnostics,
+        vec!["allow-all".to_owned()],
+        "firing policies should still flow into diagnostics on fail-closed"
+    );
 }
 
 /// Missing `subject.id` in the bag is a configuration fault (identity
