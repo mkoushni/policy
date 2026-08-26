@@ -76,7 +76,6 @@ valkey = ["_builtin", "dep:praxis-policy-session-valkey"]
 # pingora-backed transport instead and builds without this feature, so it
 # links no hyper at all.
 http-hyper = [
-    "dep:hyper",
     "dep:hyper-util",
     "dep:hyper-rustls",
     "dep:http-body-util",
@@ -124,7 +123,6 @@ praxis-policy-session-valkey = { workspace = true, optional = true }
 # `ring`, webpki roots, TLS 1.2 kept because some enterprise IdPs still
 # require it. `default-features = false` throughout so no OpenSSL and no
 # native-cert store creep in.
-hyper = { version = "1", optional = true, default-features = false, features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", optional = true, default-features = false, features = [
     "client-legacy",
     "http1",

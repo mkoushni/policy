@@ -57,6 +57,14 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 - **A workload's trust domain is no longer mappable.** It is the authority of the SPIFFE ID, so it is derived from the identity rather than read from a claim. ([#31](https://github.com/praxis-proxy/policy/pull/31))
 
+- **Unused items fail the build.** `dead_code` is denied workspace-wide, so a function with no caller is a compile error rather than something coverage work has to find by hand. Public host-facing API with no in-tree caller stays, marked with a reason naming who calls it from outside. ([#13](https://github.com/praxis-proxy/policy/issues/13))
+
+### Removed
+
+- **`PolicyEngine::remove_route_annotation` is gone.** No host or in-tree caller used it. Hosts that need to replace a route's handler still call `annotate_route`. ([#13](https://github.com/praxis-proxy/policy/issues/13))
+
+- **`AplRouteHandler::with_pdp_router` is gone.** Install a `PdpRouter` through `with_pdp`, which is what the visitor already does. ([#13](https://github.com/praxis-proxy/policy/issues/13))
+
 ### Fixed
 
 - **Subject claims keep their JSON shape.** `SubjectExtension.claims` holds `serde_json::Value` and flattens into the attribute bag through `payload::walk`, so Keycloak's nested `realm_access.roles` is a `StringSet` a policy can test instead of one opaque string. Client claims always worked this way. **Breaking** for Rust callers reading `claims`; `SubjectExtension::claim_str` covers the scalar lookups. Scalar policies such as `claim.tenant == 'acme'` are unaffected, but a structured claim now sets only the flattened children beneath `claim.<name>`, not the key itself, and a claim whose value is `{}` or `null` sets no key at all where it previously landed as stringified text. ([#9](https://github.com/praxis-proxy/policy/pull/9))

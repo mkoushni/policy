@@ -2318,7 +2318,6 @@ dependencies = [
  "bytes",
  "http",
  "http-body-util",
- "hyper",
  "hyper-rustls",
  "hyper-util",
  "mockito",

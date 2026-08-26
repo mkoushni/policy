@@ -927,18 +927,6 @@ pub enum PluginError {
     Dispatch(String),
 }
 
-impl Step {
-    /// Wrap a `Rule` as a `Step`. Saves typing in tests and parser code.
-    pub(crate) fn rule(r: Rule) -> Self {
-        Step::Rule(r)
-    }
-
-    /// Returns true if this step is a plain rule (no async dispatch needed).
-    pub(crate) fn is_rule(&self) -> bool {
-        matches!(self, Step::Rule(_))
-    }
-}
-
 /// Bag keys the delegation step writes after a successful dispatch.
 /// Centralized here so the evaluator (writer) and policy authors
 /// (readers, via `require(delegation.granted.*)`) agree on the

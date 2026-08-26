@@ -1425,27 +1425,6 @@ impl PolicyEngine {
         });
     }
 
-    /// Remove a route annotation for a specific hook. No-op when no
-    /// annotation exists for the key. Bumps the generation so downstream
-    /// caches invalidate.
-    pub fn remove_route_annotation(
-        &self,
-        entity_type: &str,
-        entity_name: &str,
-        scope: Option<&str>,
-        hook_name: &str,
-    ) {
-        let key = AnnotationKey {
-            entity_type: entity_type.to_owned(),
-            entity_name: entity_name.to_owned(),
-            scope: scope.map(str::to_owned),
-            hook_name: hook_name.to_owned(),
-        };
-        self.mutate_runtime(|snap| {
-            snap.route_annotations.remove(&key);
-        });
-    }
-
     /// Filter hook entries based on route resolution, with caching.
     ///
     /// When routing is enabled and extensions.meta provides entity
@@ -6437,21 +6416,6 @@ global:
     // =====================================================================
     // Route annotations and small accessors
     // =====================================================================
-
-    /// `remove_route_annotation` had no caller anywhere. Removing an annotation
-    /// that is not there must be a no-op rather than a panic, since a caller
-    /// tearing down routes cannot know which ones were annotated.
-    #[test]
-    fn removing_an_absent_route_annotation_is_a_no_op() {
-        let mgr = PolicyEngine::default();
-        mgr.remove_route_annotation("tool", "never-annotated", None, "cmf.tool_pre_invoke");
-        mgr.remove_route_annotation(
-            "tool",
-            "never-annotated",
-            Some("scope"),
-            "cmf.tool_pre_invoke",
-        );
-    }
 
     /// `plugin_names` is how a host enumerates what loaded. It had no test, so
     /// nothing checked it reports the configured names rather than an empty list.
