@@ -198,7 +198,10 @@ async fn evaluation_error_denies_even_when_a_permit_fired() {
         .expect("evaluate");
 
     match decision.decision {
-        Decision::Deny { reason, rule_source } => {
+        Decision::Deny {
+            reason,
+            rule_source,
+        } => {
             assert_eq!(
                 rule_source, "allow-all",
                 "rule_source should be the firing permit when fail-closed overrides"
