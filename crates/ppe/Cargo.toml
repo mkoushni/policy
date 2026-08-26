@@ -84,6 +84,7 @@ http-hyper = [
     "dep:http",
     "dep:async-trait",
     "dep:tokio",
+    "dep:tower-service",
 ]
 
 # Private marker meaning "at least one builtin is enabled", which is what gates
@@ -147,6 +148,8 @@ async-trait = { workspace = true, optional = true }
 # default features. The transport spawns nothing and runs on whatever
 # runtime the host is already using.
 tokio = { workspace = true, optional = true }
+# `Service<Name>` for the DNS resolver that drops private addresses.
+tower-service = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

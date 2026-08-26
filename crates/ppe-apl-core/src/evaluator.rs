@@ -4,7 +4,11 @@
 // APL evaluator — walks the IR against an AttributeBag and returns a Decision.
 //
 // The evaluator is sync and infallible by design. Missing attributes resolve
-// to `false`; operator type mismatches resolve to `false`.
+// to `false` for presence, equality, membership, and order; operator type
+// mismatches resolve to `false`. `!=` is the exception: an absent key is
+// not equal to a concrete value, so `NotEq` is true, matching `!(x == y)`.
+// A deny rule written as `subject.role != "admin"` therefore fires when
+// the role is missing rather than falling through to Allow.
 // The host drives the four phases separately by calling `evaluate_rules` once
 // per declared phase — phase orchestration lives in `praxis-policy-apl-runtime`.
 //
@@ -105,7 +109,8 @@ fn eval_condition(cond: &Condition, bag: &AttributeBag) -> bool {
             .unwrap_or(false),
         Condition::Comparison { key, op, value } => match bag.resolve_key(key) {
             Some(k) => eval_comparison(&k, *op, value, bag),
-            None => false,
+            // An unresolvable interpolated path is an absent key.
+            None => matches!(*op, CompareOp::NotEq),
         },
         Condition::InSet {
             value_key,
@@ -127,7 +132,11 @@ fn eval_condition(cond: &Condition, bag: &AttributeBag) -> bool {
 fn eval_comparison(key: &str, op: CompareOp, lit: &Literal, bag: &AttributeBag) -> bool {
     let attr = match bag.get(key) {
         Some(v) => v,
-        None => return false, // missing → false
+        // Missing is false for every operator except `!=`. Treating
+        // `NotEq` as false here broke duality with `!(x == y)` and let
+        // `role != "admin": deny` fall through to Allow when `role` was
+        // omitted.
+        None => return matches!(op, CompareOp::NotEq),
     };
 
     match op {
@@ -231,8 +240,8 @@ fn numeric_compare(attr: &AttributeValue, lit: &Literal, op: OrderOp) -> bool {
 fn coerce_f64_attr(attr: &AttributeValue) -> Option<f64> {
     match attr {
         AttributeValue::Int(a) => Some(*a as f64),
-        AttributeValue::Float(a) => Some(*a),
-        AttributeValue::String(s) => s.trim().parse::<f64>().ok(),
+        AttributeValue::Float(a) => finite_f64(*a),
+        AttributeValue::String(s) => s.trim().parse::<f64>().ok().and_then(finite_f64),
         _ => None,
     }
 }
@@ -246,10 +255,19 @@ fn coerce_f64_attr(attr: &AttributeValue) -> Option<f64> {
 fn coerce_f64_lit(lit: &Literal) -> Option<f64> {
     match lit {
         Literal::Int(b) => Some(*b as f64),
-        Literal::Float(b) => Some(*b),
-        Literal::String(s) => s.trim().parse::<f64>().ok(),
+        Literal::Float(b) => finite_f64(*b),
+        Literal::String(s) => s.trim().parse::<f64>().ok().and_then(finite_f64),
         _ => None,
     }
+}
+
+/// `f64::from_str` accepts `NaN`, `inf`, and `-inf`. IEEE order tests
+/// against those are all false (`NaN > 10000` is false, `-inf > 10000`
+/// is false), so a string amount of `"NaN"` would slip past
+/// `args.amount > 10000: deny`. Non-finite is non-numeric, same as
+/// `"lots"`.
+fn finite_f64(f: f64) -> Option<f64> {
+    f.is_finite().then_some(f)
 }
 
 /// Heuristic: does `s` look like a bag attribute reference (e.g.
@@ -1093,11 +1111,11 @@ fn dispatch_parallel<'a>(
 
         // Aggregate in input order: append every branch's taints; pick
         // the first Halt (by branch index, not wall-clock order) as the
-        // overall result. Aborted / panicked branches contribute no
-        // taints — they didn't run to completion. A panicked branch is
-        // *not* converted into a Halt; we log via `tracing::warn!` and
-        // continue. (A misbehaving plugin shouldn't take down the
-        // parallel block any more than it would the host process.)
+        // overall result. Aborted branches contribute no taints — they
+        // were cancelled because a sibling already denied. A panicked
+        // or timed-out branch is a Halt: dropping it would let a
+        // sibling Allow stand in for a gate that never finished, which
+        // is the same fail-open shape as pairing a Deny with Aborted.
         let mut first_halt: Option<Decision> = None;
         for (idx, outcome) in outcomes.into_iter().enumerate() {
             match outcome {
@@ -1120,18 +1138,24 @@ fn dispatch_parallel<'a>(
                 },
                 BranchOutcome::TimedOut => {
                     // Unreachable today (no per-branch timeout
-                    // configured). Treat as a no-op if it ever fires
-                    // post-config-extension.
+                    // configured). Fail closed if it ever fires: a
+                    // gate that did not finish cannot become Allow.
+                    if first_halt.is_none() {
+                        first_halt = Some(Decision::Deny {
+                            reason: Some(format!("parallel branch {idx} timed out (fail-closed)")),
+                            rule_source: fallback_source.to_owned(),
+                        });
+                    }
                 },
                 BranchOutcome::Panicked(msg) => {
-                    // A panicking branch is a misbehaving plugin/effect;
-                    // dropping its output (no Halt, no taints) keeps the
-                    // parallel block's other branches intact rather than
-                    // taking the whole block down. praxis-policy-apl-core has no
-                    // tracing dep — host integrations that care can
-                    // surface the panic via praxis-policy-core's plugin error
-                    // path. `idx`/`msg` are eaten here.
-                    let _ = (idx, msg);
+                    if first_halt.is_none() {
+                        first_halt = Some(Decision::Deny {
+                            reason: Some(format!(
+                                "parallel branch {idx} panicked (fail-closed): {msg}"
+                            )),
+                            rule_source: fallback_source.to_owned(),
+                        });
+                    }
                 },
             }
         }
@@ -1814,6 +1838,10 @@ mod tests {
             "data.tenants[subject.tenant].data_region == 'eu'",
             &bag
         ));
+        assert!(
+            eval_pred("data.tenants[subject.tenant].data_region != 'eu'", &bag),
+            "NotEq on an unresolvable path must match !(==), not fall through"
+        );
     }
 
     #[test]
@@ -2088,6 +2116,63 @@ mod tests {
         assert!(
             !eval_condition(&cmp(CompareOp::Gt, 10000), &bag),
             "\"lots\" > 10000 is false"
+        );
+
+        // `parse::<f64>()` accepts these. IEEE order tests against them
+        // are all false, so without the finite filter they would slip
+        // past `args.amount > 10000: deny`.
+        for non_finite in ["NaN", "nan", "inf", "-inf", "Infinity", "-Infinity"] {
+            bag.set("args.amount", non_finite);
+            assert!(
+                !eval_condition(&cmp(CompareOp::Gt, 10000), &bag),
+                "{non_finite:?} must not order-compare"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_key_not_eq_is_true() {
+        // Duality: `x != "admin"` must match `!(x == "admin")` when x
+        // is absent. Returning false for NotEq let
+        // `role != "admin": deny` fall through to Allow for a request
+        // that simply omitted the attribute.
+        let bag = AttributeBag::new();
+        assert!(eval_condition(
+            &Condition::Comparison {
+                key: "subject.role".into(),
+                op: CompareOp::NotEq,
+                value: "admin".into(),
+            },
+            &bag,
+        ));
+        assert!(!eval_condition(
+            &Condition::Comparison {
+                key: "subject.role".into(),
+                op: CompareOp::Eq,
+                value: "admin".into(),
+            },
+            &bag,
+        ));
+    }
+
+    #[test]
+    fn missing_attribute_not_eq_deny_fails_closed() {
+        let rule = crate::parser::parse_rule(r#"subject.role != "admin": deny"#, "test")
+            .expect("a not-equal deny rule parses");
+        let bag = AttributeBag::new();
+        assert!(
+            matches!(evaluate_rules(&[rule], &bag), Decision::Deny { .. }),
+            "an allow-list deny must fire when the attribute is missing"
+        );
+
+        let rule = crate::parser::parse_rule(r#"subject.role != "admin": deny"#, "test")
+            .expect("a not-equal deny rule parses");
+        let mut bag = AttributeBag::new();
+        bag.set("subject.role", "admin");
+        assert_eq!(
+            evaluate_rules(&[rule], &bag),
+            Decision::Allow,
+            "the matching role must not be denied"
         );
     }
 
@@ -3982,6 +4067,62 @@ mod tests {
                 assert_eq!(rule_source, "seq.test");
             },
             other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_panic_is_fail_closed() {
+        // A panicking parallel branch used to be dropped, so a sibling
+        // Allow became the block's result — a gate that never finished
+        // opened the route. Fail closed: the panic is a Deny.
+        struct PanickingPlugin;
+        #[async_trait]
+        impl PluginInvoker for PanickingPlugin {
+            async fn invoke(
+                &self,
+                _name: &str,
+                _bag: &AttributeBag,
+                _invocation: PluginInvocation<'_>,
+            ) -> Result<PluginOutcome, PluginError> {
+                panic!("simulated plugin panic");
+            }
+        }
+
+        let mut bag = AttributeBag::new();
+        let plugins: Arc<dyn PluginInvoker> = Arc::new(PanickingPlugin);
+        let steps = vec![Effect::Parallel(vec![
+            Effect::Allow,
+            Effect::Plugin {
+                name: "boom".into(),
+            },
+        ])];
+        match evaluate_effects(
+            &steps,
+            &mut bag,
+            &(Arc::new(FakePdp {
+                decision: Decision::Allow,
+            }) as Arc<dyn PdpResolver>),
+            &plugins,
+            &noop_delegations(),
+            &noop_elicitations(),
+            crate::step::DispatchPhase::Pre,
+            &mut crate::route::RoutePayload::new(serde_json::Value::Null),
+        )
+        .await
+        .decision
+        {
+            Decision::Deny { reason, .. } => {
+                let reason = reason.expect("fail-closed deny carries a reason");
+                assert!(
+                    reason.contains("fail-closed"),
+                    "reason must say fail-closed: {reason}"
+                );
+                assert!(
+                    reason.contains("panic"),
+                    "reason must name the panic: {reason}"
+                );
+            },
+            d => panic!("a panicking parallel branch must deny, got {d:?}"),
         }
     }
 

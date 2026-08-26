@@ -31,7 +31,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 - **Retries are keyed to whether a repeat is safe.** `RetryPolicy` distinguishes an operation that can be repeated from one that cannot, and `HttpTransportError::may_have_reached_peer` answers the question a caller actually needs. A JWKS `GET` retries freely; a token exchange and a CIBA dispatch retry only failures that provably never reached the peer, because a timeout cannot tell "never arrived" from "the reply was lost" and repeating either would mint a second credential or ask a human twice.
 
-- **`delegation.egress_denied` / `elicitation.egress_denied`.** New deny codes for the case where the host refuses a call before it leaves the process — an egress policy, an SSRF guard, an open circuit. Kept distinct from `idp_unreachable` on purpose: "we declined to try" and "we tried and failed" send an operator to different places, and collapsing them turns a blocked destination into a phantom network problem. No behaviour changes until a host transport produces the refusal; the bundled hyper transport never does.
+- **`delegation.egress_denied` / `elicitation.egress_denied`.** New deny codes for the case where the host refuses a call before it leaves the process — an egress policy, an SSRF guard, an open circuit. Kept distinct from `idp_unreachable` on purpose: "we declined to try" and "we tried and failed" send an operator to different places, and collapsing them turns a blocked destination into a phantom network problem. The bundled hyper transport produces the refusal for destinations in the shared address table.
 
 - **A shared table of addresses an outbound call must not reach.** `praxis_policy_core::http_addr` covers loopback, RFC 1918, link-local (the cloud-metadata range), CGNAT `100.64/10`, the IPv6 equivalents, and the embedded-IPv4 forms including NAT64. The table only; `praxis-policy-core` opens no sockets, so a transport enforces it where it dials. Sharing it stops three transports each writing a range list that drifts, and these are exactly the ranges that look finished while missing an entry.
 
@@ -56,6 +56,22 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 - **A SPIFFE ID with no trust domain is refused.** `spiffe:///ns/default/sa/agent` carries the scheme but no authority, so it named no trust boundary and the mapper still filed it as a workload identity whose trust domain was the empty string. It now declines, the same as any other non-SPIFFE subject, and a valid candidate behind it still resolves. **Breaking** for a deployment minting such a token, which was never a valid SPIFFE ID. ([#31](https://github.com/praxis-proxy/policy/pull/31))
 
 - **A workload's trust domain is no longer mappable.** It is the authority of the SPIFFE ID, so it is derived from the identity rather than read from a claim. ([#31](https://github.com/praxis-proxy/policy/pull/31))
+
+### Security
+
+- **A panicking `parallel:` branch is a Deny.** Dropping it let a sibling Allow stand in for a gate that never finished, the same fail-open shape as pairing a Deny with Aborted. The Deny reason says fail-closed and names the panic. ([#16](https://github.com/praxis-proxy/policy/issues/16))
+
+- **The bundled hyper transport enforces the shared address table.** Loopback, RFC 1918, link-local (including cloud metadata), and CGNAT are refused at the address that would be dialled, including IP literals that never hit DNS. `with_allow_private_destinations` is the hatch for a local `IdP`. ([#16](https://github.com/praxis-proxy/policy/issues/16))
+
+- **Leg-2 token-exchange denials no longer forward `error_description` or the raw body.** Leg 1 already dropped those because an `IdP` may echo the submitted credential; leg 2 submits the caller's bearer as `subject_token` and had the same leak. The violation now carries the OAuth `error` code or the HTTP status. ([#16](https://github.com/praxis-proxy/policy/issues/16))
+
+- **An omitted JWT `audiences` list is refused at load.** An empty list used to disable `aud` checking, so a token minted for another app was accepted if the signature and issuer matched. The hatch is `skip_audience_validation: true`. **Breaking** for a config that listed no audiences. ([#16](https://github.com/praxis-proxy/policy/issues/16))
+
+- **`!=` on a missing attribute is true.** `subject.role != "admin": deny` did not fire when `role` was absent, because every missing comparison returned false, including `NotEq` — so it did not match `!(subject.role == "admin")` and an unauthenticated request fell through to Allow. ([#16](https://github.com/praxis-proxy/policy/issues/16))
+
+- **Non-finite string amounts do not order-compare.** `"NaN"`, `"inf"`, and `"-Infinity"` parse as `f64` but every IEEE order test against them is false, so `args.amount > 10000: deny` allowed them. They are now non-numeric, the same as `"lots"`. ([#16](https://github.com/praxis-proxy/policy/issues/16))
+
+- **A handler result that cannot be read is an execution error.** Downcast failure used to be treated as Allow in both the serial and concurrent executors, so a deny the framework could not decode was dropped. `on_error: fail` now halts. ([#16](https://github.com/praxis-proxy/policy/issues/16))
 
 ### Fixed
 
