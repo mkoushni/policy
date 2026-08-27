@@ -145,7 +145,7 @@ pub struct TrustedIssuer {
 
     /// Expected audience(s). Tokens must carry at least one matching
     /// `aud` value. Empty vec disables audience checking only when
-    /// [`skip_audience_validation`] is set.
+    /// [`skip_audience_validation`](Self::skip_audience_validation) is set.
     pub audiences: Vec<String>,
 
     /// When true, `aud` is not checked. Produced only from config that
