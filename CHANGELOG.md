@@ -69,7 +69,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 - **`!=` on a missing attribute is true.** `subject.role != "admin": deny` did not fire when `role` was absent, because every missing comparison returned false, including `NotEq` — so it did not match `!(subject.role == "admin")` and an unauthenticated request fell through to Allow. ([#16](https://github.com/praxis-proxy/policy/issues/16))
 
-- **Non-finite string amounts do not order-compare.** `"NaN"`, `"inf"`, and `"-Infinity"` parse as `f64` but every IEEE order test against them is false, so `args.amount > 10000: deny` allowed them. They are now non-numeric, the same as `"lots"`. ([#16](https://github.com/praxis-proxy/policy/issues/16))
+- **A non-numeric or non-finite amount fails an order comparison closed.** `"NaN"`, `"Infinity"`, and `"lots"` made `args.amount > 10000: deny` Allow, because a failed comparison was `false` and skipped the rule. IEEE is the same trap for `NaN` and `-inf`; `inf > 10000` is true, so classifying non-finite as non-numeric also stopped `"Infinity"` from matching. The phase now Denies, and `!` cannot invert that into Allow. ([#16](https://github.com/praxis-proxy/policy/issues/16))
 
 - **A handler result that cannot be read is an execution error.** Downcast failure used to be treated as Allow in both the serial and concurrent executors, so a deny the framework could not decode was dropped. `on_error: fail` now halts. ([#16](https://github.com/praxis-proxy/policy/issues/16))
 

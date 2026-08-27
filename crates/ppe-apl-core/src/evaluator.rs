@@ -3,12 +3,17 @@
 
 // APL evaluator — walks the IR against an AttributeBag and returns a Decision.
 //
-// The evaluator is sync and infallible by design. Missing attributes resolve
-// to `false` for presence, equality, membership, and order; operator type
-// mismatches resolve to `false`. `!=` is the exception: an absent key is
-// not equal to a concrete value, so `NotEq` is true, matching `!(x == y)`.
-// A deny rule written as `subject.role != "admin"` therefore fires when
-// the role is missing rather than falling through to Allow.
+// The evaluator is sync. Missing attributes resolve to `false` for
+// presence, equality, membership, and order; operator type mismatches on
+// equality and membership resolve to `false`. `!=` is the exception: an
+// absent key is not equal to a concrete value, so `NotEq` is true,
+// matching `!(x == y)`. A deny rule written as `subject.role != "admin"`
+// therefore fires when the role is missing rather than falling through
+// to Allow.
+//
+// Order comparison on a *present* value that is not a finite number is
+// not a boolean. `false` skips a deny rule; `true` inverts under `!`.
+// The phase Denies instead, with a reason that says fail-closed.
 // The host drives the four phases separately by calling `evaluate_rules` once
 // per declared phase — phase orchestration lives in `praxis-policy-apl-runtime`.
 //
@@ -54,8 +59,18 @@ pub enum Decision {
 /// pick the right entry point for the effects in the rules.
 pub fn evaluate_rules(rules: &[Rule], bag: &AttributeBag) -> Decision {
     for rule in rules {
-        if !eval_expression(&rule.condition, bag) {
-            continue;
+        match eval_expression(&rule.condition, bag) {
+            Ok(false) => continue,
+            // The condition could not be evaluated. Skipping the rule
+            // would fall through to Allow; firing it as `true` would
+            // invert under `!`. Deny the phase.
+            Err(err) => {
+                return Decision::Deny {
+                    reason: Some(err.reason()),
+                    rule_source: rule.source.clone(),
+                };
+            },
+            Ok(true) => {},
         }
         for effect in &rule.effects {
             match effect {
@@ -79,38 +94,53 @@ pub fn evaluate_rules(rules: &[Rule], bag: &AttributeBag) -> Decision {
     Decision::Allow
 }
 
-fn eval_expression(expr: &Expression, bag: &AttributeBag) -> bool {
+fn eval_expression(expr: &Expression, bag: &AttributeBag) -> Result<bool, Unorderable> {
     match expr {
         Expression::Condition(c) => eval_condition(c, bag),
-        Expression::And(parts) => parts.iter().all(|e| eval_expression(e, bag)),
-        Expression::Or(parts) => parts.iter().any(|e| eval_expression(e, bag)),
-        Expression::Not(inner) => !eval_expression(inner, bag),
-        Expression::Always => true,
+        Expression::And(parts) => {
+            for e in parts {
+                if !eval_expression(e, bag)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        },
+        Expression::Or(parts) => {
+            for e in parts {
+                if eval_expression(e, bag)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        },
+        // `?` keeps Unorderable from inverting into a permit.
+        Expression::Not(inner) => Ok(!eval_expression(inner, bag)?),
+        Expression::Always => Ok(true),
     }
 }
 
-fn eval_condition(cond: &Condition, bag: &AttributeBag) -> bool {
+fn eval_condition(cond: &Condition, bag: &AttributeBag) -> Result<bool, Unorderable> {
     match cond {
         // An unresolvable interpolated path (a missing request value) is
         // treated as an absent key: `IsTrue`/`Exists`/`Comparison` are
         // false, but `IsFalse` is true (absent is falsy — keeps
         // `require(...)` fail-closed when the keyed lookup can't resolve).
-        Condition::IsTrue { key } => bag
+        Condition::IsTrue { key } => Ok(bag
             .resolve_key(key)
             .map(|k| bag.get_bool(&k).unwrap_or(false))
-            .unwrap_or(false),
-        Condition::IsFalse { key } => bag
+            .unwrap_or(false)),
+        Condition::IsFalse { key } => Ok(bag
             .resolve_key(key)
             .map(|k| !bag.get_bool(&k).unwrap_or(false))
-            .unwrap_or(true),
-        Condition::Exists { key } => bag
+            .unwrap_or(true)),
+        Condition::Exists { key } => Ok(bag
             .resolve_key(key)
             .map(|k| bag.contains(&k))
-            .unwrap_or(false),
+            .unwrap_or(false)),
         Condition::Comparison { key, op, value } => match bag.resolve_key(key) {
             Some(k) => eval_comparison(&k, *op, value, bag),
             // An unresolvable interpolated path is an absent key.
-            None => matches!(*op, CompareOp::NotEq),
+            None => Ok(matches!(*op, CompareOp::NotEq)),
         },
         Condition::InSet {
             value_key,
@@ -124,32 +154,65 @@ fn eval_condition(cond: &Condition, bag: &AttributeBag) -> bool {
                 },
                 None => false, // an interpolated key didn't resolve
             };
-            if *negate { !in_set } else { in_set }
+            Ok(if *negate { !in_set } else { in_set })
         },
     }
 }
 
-fn eval_comparison(key: &str, op: CompareOp, lit: &Literal, bag: &AttributeBag) -> bool {
+fn eval_comparison(
+    key: &str,
+    op: CompareOp,
+    lit: &Literal,
+    bag: &AttributeBag,
+) -> Result<bool, Unorderable> {
     let attr = match bag.get(key) {
         Some(v) => v,
         // Missing is false for every operator except `!=`. Treating
         // `NotEq` as false here broke duality with `!(x == y)` and let
         // `role != "admin": deny` fall through to Allow when `role` was
         // omitted.
-        None => return matches!(op, CompareOp::NotEq),
+        None => return Ok(matches!(op, CompareOp::NotEq)),
     };
 
     match op {
-        CompareOp::Contains => match (attr, lit) {
+        CompareOp::Contains => Ok(match (attr, lit) {
             (AttributeValue::StringSet(_), Literal::String(s)) => bag.set_contains(key, s),
             _ => false,
-        },
-        CompareOp::Eq => values_eq(attr, lit),
-        CompareOp::NotEq => !values_eq(attr, lit),
-        CompareOp::Gt => numeric_compare(attr, lit, OrderOp::Gt),
-        CompareOp::GtEq => numeric_compare(attr, lit, OrderOp::GtEq),
-        CompareOp::Lt => numeric_compare(attr, lit, OrderOp::Lt),
-        CompareOp::LtEq => numeric_compare(attr, lit, OrderOp::LtEq),
+        }),
+        CompareOp::Eq => Ok(values_eq(attr, lit)),
+        CompareOp::NotEq => Ok(!values_eq(attr, lit)),
+        CompareOp::Gt => order_compare(key, attr, lit, OrderOp::Gt),
+        CompareOp::GtEq => order_compare(key, attr, lit, OrderOp::GtEq),
+        CompareOp::Lt => order_compare(key, attr, lit, OrderOp::Lt),
+        CompareOp::LtEq => order_compare(key, attr, lit, OrderOp::LtEq),
+    }
+}
+
+fn order_compare(
+    key: &str,
+    attr: &AttributeValue,
+    lit: &Literal,
+    op: OrderOp,
+) -> Result<bool, Unorderable> {
+    numeric_compare(attr, lit, op).map_err(|()| Unorderable {
+        key: key.to_owned(),
+    })
+}
+
+/// An order operator was applied to a value that is not a finite number.
+/// There is no boolean that is safe to return: `false` skips a deny
+/// rule, `true` inverts under `!`. The phase Denies instead.
+#[derive(Debug)]
+struct Unorderable {
+    key: String,
+}
+
+impl Unorderable {
+    fn reason(&self) -> String {
+        format!(
+            "order comparison on `{}` failed (fail-closed): value is not a finite number",
+            self.key
+        )
     }
 }
 
@@ -190,41 +253,35 @@ fn values_eq(attr: &AttributeValue, lit: &Literal) -> bool {
     }
 }
 
-fn numeric_compare(attr: &AttributeValue, lit: &Literal, op: OrderOp) -> bool {
+fn numeric_compare(attr: &AttributeValue, lit: &Literal, op: OrderOp) -> Result<bool, ()> {
     // Integer pairs compare exactly, without going through f64 first. Above
     // 2^53 a double cannot represent every i64, so distinct integers collapse
     // onto the same value and an ordering test answers the wrong way. This is
     // the common shape in practice (`args.amount > 10000`), and it is the one
     // where an exact answer is available for free.
     if let (AttributeValue::Int(a), Literal::Int(b)) = (attr, lit) {
-        return match op {
+        return Ok(match op {
             OrderOp::Gt => a > b,
             OrderOp::GtEq => a >= b,
             OrderOp::Lt => a < b,
             OrderOp::LtEq => a <= b,
-        };
+        });
     }
 
     // Every other combination needs a common type, and f64 is it. Numeric-looking
     // strings are coerced — LLM tool arguments routinely arrive as strings
     // (e.g. `"amount": "25000"`), and a policy author writing
-    // `args.amount > 10000` plainly means a numeric comparison. A string
-    // that doesn't parse as a number is genuinely non-numeric → false
-    // (order operators don't apply).
-    let a = match coerce_f64_attr(attr) {
-        Some(a) => a,
-        None => return false,
-    };
-    let b = match coerce_f64_lit(lit) {
-        Some(b) => b,
-        None => return false,
-    };
-    match op {
+    // `args.amount > 10000` plainly means a numeric comparison. A present
+    // value that is not a finite number cannot be ordered: `Err` so the
+    // phase Denies rather than treating the comparison as false.
+    let a = coerce_f64_attr(attr).ok_or(())?;
+    let b = coerce_f64_lit(lit).ok_or(())?;
+    Ok(match op {
         OrderOp::Gt => a > b,
         OrderOp::GtEq => a >= b,
         OrderOp::Lt => a < b,
         OrderOp::LtEq => a <= b,
-    }
+    })
 }
 
 /// Coerce a bag attribute to `f64` for an order comparison: numbers pass
@@ -261,11 +318,10 @@ fn coerce_f64_lit(lit: &Literal) -> Option<f64> {
     }
 }
 
-/// `f64::from_str` accepts `NaN`, `inf`, and `-inf`. IEEE order tests
-/// against those are all false (`NaN > 10000` is false, `-inf > 10000`
-/// is false), so a string amount of `"NaN"` would slip past
-/// `args.amount > 10000: deny`. Non-finite is non-numeric, same as
-/// `"lots"`.
+/// `f64::from_str` accepts `NaN`, `inf`, and `-inf`. IEEE order is not
+/// a boolean we can return: `NaN > 10000` and `-inf > 10000` are false
+/// (a max-amount deny would skip), `inf > 10000` is true. Non-finite
+/// and non-numeric both fail the coerce so the phase Denies.
 fn finite_f64(f: f64) -> Option<f64> {
     f.is_finite().then_some(f)
 }
@@ -702,8 +758,17 @@ async fn dispatch_effect(
             // Predicate-gated body — replaces the historical
             // `Step::Rule`. Skip silently when the condition is false;
             // otherwise walk the body in order and halt on first Deny.
-            if !eval_expression(condition, bag) {
-                return EffectOutcome::Continue;
+            // An unorderable condition Denies: skipping would drop a
+            // gate that never finished evaluating.
+            match eval_expression(condition, bag) {
+                Ok(false) => return EffectOutcome::Continue,
+                Err(err) => {
+                    return EffectOutcome::Halt(Decision::Deny {
+                        reason: Some(err.reason()),
+                        rule_source: source.clone(),
+                    });
+                },
+                Ok(true) => {},
             }
             for inner in body {
                 match Box::pin(dispatch_effect(
@@ -960,10 +1025,12 @@ async fn dispatch_elicitation(
             // bind args — no RFC 9396 RAR.
             if let Some(scope_src) = &step.scope {
                 match crate::parser::parse_predicate(scope_src) {
-                    Ok(expr) => {
-                        if !eval_expression(&expr, bag) {
+                    Ok(expr) => match eval_expression(&expr, bag) {
+                        Ok(true) => {},
+                        Ok(false) => {
                             return fail(format!("elicitation scope not satisfied: `{scope_src}`"));
-                        }
+                        },
+                        Err(err) => return fail(err.reason()),
                     },
                     Err(e) => {
                         return fail(format!(
@@ -1493,7 +1560,18 @@ pub async fn evaluate_pipeline(
             Stage::Redact { condition } => {
                 let should_redact = match condition {
                     None => true,
-                    Some(expr) => eval_expression(expr, bag),
+                    Some(expr) => match eval_expression(expr, bag) {
+                        Ok(b) => b,
+                        Err(err) => {
+                            return PipelineEvaluation {
+                                outcome: FieldOutcome::Deny {
+                                    reason: err.reason(),
+                                    stage_index: idx,
+                                },
+                                taints,
+                            };
+                        },
+                    },
                 };
                 if should_redact {
                     current = serde_json::Value::String("[REDACTED]".into());
@@ -1676,6 +1754,20 @@ mod tests {
     use super::*;
     use crate::step::{DelegationInvoker, NoopDelegationInvoker};
     use std::collections::HashSet;
+
+    // Production `eval_*` return `Result` so an unorderable amount can
+    // Deny the phase. Tests that are not probing that path unwrap.
+    fn eval_condition(cond: &Condition, bag: &AttributeBag) -> bool {
+        super::eval_condition(cond, bag).expect("test condition is orderable")
+    }
+
+    fn eval_expression(expr: &Expression, bag: &AttributeBag) -> bool {
+        super::eval_expression(expr, bag).expect("test expression is orderable")
+    }
+
+    fn eval_comparison(key: &str, op: CompareOp, lit: &Literal, bag: &AttributeBag) -> bool {
+        super::eval_comparison(key, op, lit, bag).expect("test comparison is orderable")
+    }
 
     fn rule(condition: Expression, effect: Effect, source: &str) -> Rule {
         Rule::single(condition, effect, source)
@@ -2110,24 +2202,6 @@ mod tests {
             !eval_condition(&cmp(CompareOp::Gt, 25000), &bag),
             "\"25000\" > 25000 is false"
         );
-
-        // A genuinely non-numeric string still doesn't order-compare.
-        bag.set("args.amount", "lots");
-        assert!(
-            !eval_condition(&cmp(CompareOp::Gt, 10000), &bag),
-            "\"lots\" > 10000 is false"
-        );
-
-        // `parse::<f64>()` accepts these. IEEE order tests against them
-        // are all false, so without the finite filter they would slip
-        // past `args.amount > 10000: deny`.
-        for non_finite in ["NaN", "nan", "inf", "-inf", "Infinity", "-Infinity"] {
-            bag.set("args.amount", non_finite);
-            assert!(
-                !eval_condition(&cmp(CompareOp::Gt, 10000), &bag),
-                "{non_finite:?} must not order-compare"
-            );
-        }
     }
 
     #[test]
@@ -2177,6 +2251,128 @@ mod tests {
     }
 
     #[test]
+    fn non_numeric_amount_order_deny_fails_closed() {
+        // `args.amount > 10000: deny` that treats a failed order
+        // comparison as false Allows `"NaN"` and `"-Infinity"` (IEEE
+        // `>` is false) and `"Infinity"` / `"lots"` once they are
+        // classified as non-numeric. Fail closed: the phase Denies,
+        // including under `!(...)`, so there is no boolean that permits.
+        let rule = crate::parser::parse_rule("args.amount > 10000: deny", "test")
+            .expect("max-amount deny parses");
+        let negated = crate::parser::parse_rule("!(args.amount > 10000): deny", "test")
+            .expect("negated max-amount deny parses");
+
+        let amounts: [AttributeValue; 10] = [
+            "NaN".into(),
+            "nan".into(),
+            "inf".into(),
+            "-inf".into(),
+            "Infinity".into(),
+            "-Infinity".into(),
+            "lots".into(),
+            f64::NAN.into(),
+            f64::INFINITY.into(),
+            f64::NEG_INFINITY.into(),
+        ];
+        let mut bag = AttributeBag::new();
+        for amount in amounts {
+            bag.set("args.amount", amount.clone());
+            match evaluate_rules(std::slice::from_ref(&rule), &bag) {
+                Decision::Deny { reason, .. } => {
+                    let reason = reason.expect("fail-closed deny carries a reason");
+                    assert!(
+                        reason.contains("fail-closed"),
+                        "{amount:?}: reason must say fail-closed: {reason}"
+                    );
+                    assert!(
+                        reason.contains("args.amount"),
+                        "{amount:?}: reason must name the key: {reason}"
+                    );
+                },
+                d => panic!("{amount:?}: a non-numeric amount must deny, got {d:?}"),
+            }
+            match evaluate_rules(std::slice::from_ref(&negated), &bag) {
+                Decision::Deny { reason, .. } => {
+                    let reason = reason.expect("fail-closed deny carries a reason");
+                    assert!(
+                        reason.contains("fail-closed"),
+                        "!(...): {amount:?}: {reason}"
+                    );
+                },
+                d => panic!("!(...) {amount:?} must still deny, got {d:?}"),
+            }
+        }
+
+        bag.set("args.amount", "5000");
+        assert_eq!(
+            evaluate_rules(std::slice::from_ref(&rule), &bag),
+            Decision::Allow,
+            "a finite amount under the cap must still allow"
+        );
+
+        bag.set("args.amount", "25000");
+        match evaluate_rules(std::slice::from_ref(&rule), &bag) {
+            Decision::Deny { reason, .. } => assert!(
+                !reason.as_deref().is_some_and(|r| r.contains("fail-closed")),
+                "a numeric over-cap deny is the rule, not Unorderable: {reason:?}"
+            ),
+            d => panic!("\"25000\" > 10000 must deny, got {d:?}"),
+        }
+
+        // Missing stays false (F5): the cap does not fire.
+        assert_eq!(
+            evaluate_rules(std::slice::from_ref(&rule), &AttributeBag::new()),
+            Decision::Allow,
+            "a missing amount is not Unorderable"
+        );
+    }
+
+    #[tokio::test]
+    async fn when_unorderable_amount_is_fail_closed() {
+        // `Effect::When` is a second evaluation entry: treating
+        // Unorderable as false would skip the body and Allow.
+        let mut bag = AttributeBag::new();
+        bag.set("args.amount", "NaN");
+        let steps = vec![Effect::When {
+            condition: crate::parser::parse_predicate("args.amount > 10000")
+                .expect("predicate parses"),
+            body: vec![Effect::Deny {
+                reason: Some("over cap".into()),
+                code: None,
+            }],
+            source: "when.test".into(),
+        }];
+        match evaluate_effects(
+            &steps,
+            &mut bag,
+            &(Arc::new(FakePdp {
+                decision: Decision::Allow,
+            }) as Arc<dyn PdpResolver>),
+            &null_plugins(),
+            &noop_delegations(),
+            &noop_elicitations(),
+            crate::step::DispatchPhase::Pre,
+            &mut crate::route::RoutePayload::new(serde_json::Value::Null),
+        )
+        .await
+        .decision
+        {
+            Decision::Deny {
+                reason,
+                rule_source,
+            } => {
+                let reason = reason.expect("fail-closed deny carries a reason");
+                assert!(
+                    reason.contains("fail-closed"),
+                    "reason must say fail-closed: {reason}"
+                );
+                assert_eq!(rule_source, "when.test");
+            },
+            d => panic!("an unorderable When condition must deny, got {d:?}"),
+        }
+    }
+
+    #[test]
     fn string_equality_no_ordering() {
         let mut bag = AttributeBag::new();
         bag.set("subject.id", "alice");
@@ -2189,15 +2385,27 @@ mod tests {
             },
             &bag,
         ));
-        // Order operators on strings → false.
-        assert!(!eval_condition(
-            &Condition::Comparison {
+        // Order operators on a non-numeric string cannot be a boolean:
+        // `false` would skip a deny rule. The phase Denies instead.
+        let rule = rule(
+            Expression::Condition(Condition::Comparison {
                 key: "subject.id".into(),
                 op: CompareOp::Gt,
                 value: "alice".into(),
+            }),
+            deny("ordered strings"),
+            "test",
+        );
+        match evaluate_rules(&[rule], &bag) {
+            Decision::Deny { reason, .. } => {
+                let reason = reason.expect("fail-closed deny carries a reason");
+                assert!(
+                    reason.contains("fail-closed"),
+                    "reason must say fail-closed: {reason}"
+                );
             },
-            &bag,
-        ));
+            d => panic!("order on a non-numeric string must deny, got {d:?}"),
+        }
     }
 
     #[test]
