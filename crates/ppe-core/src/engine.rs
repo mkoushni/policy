@@ -25,7 +25,7 @@
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use hashbrown::HashMap;
 use tracing::{error, info, warn};
@@ -247,6 +247,22 @@ pub struct PolicyEngine {
     /// so callers can use 0 as a "never observed" sentinel.
     generation: AtomicU64,
 
+    /// Serialises writers on `runtime`. Every mutation is a load, clone,
+    /// store, so the lock has to span the whole sequence: a writer that clones
+    /// a snapshot another writer has already replaced publishes one missing
+    /// that change, and the losing call still returns `Ok`.
+    ///
+    /// Guards `()` because the data lives in the `ArcSwap`. Readers never take
+    /// it, so the invoke path is lock-free.
+    ///
+    /// Held across the copy-on-write in `mutate_runtime`,
+    /// `try_mutate_runtime`, and `load_config`, and released before the
+    /// routing cache is cleared. It is not reentrant, so no host-supplied
+    /// callback may run beneath it: `load_config` calls every
+    /// `PluginFactory::create` before taking it, and config visitors reach
+    /// `annotate_route` after `load_config` has returned, not during.
+    runtime_write: Mutex<()>,
+
     /// Tracks in-flight fire-and-forget background tasks across all
     /// invocations so `shutdown()` can wait for them to drain before
     /// returning. Without this, audit/telemetry tasks spawned by recent
@@ -276,6 +292,25 @@ pub struct PolicyEngine {
     /// plugin that needs one fails at `initialize_with` with a message
     /// naming the omission — see `crate::host::ServiceError`.
     http_transport: std::sync::OnceLock<Arc<dyn crate::http::HttpTransport>>,
+}
+
+/// Fold top-level `groups:` into `global.policies` and validate, the two
+/// steps `config::parse_config` applies to YAML. Every config-load entry
+/// point runs this, including the ones that take a `PolicyConfig` a host
+/// built in Rust: without it such a host got no duplicate-plugin-name
+/// check, no route-shape check, no hook-name check, and no group
+/// resolution, so its routes quietly lost the plugins and
+/// `authentication:` a group was meant to supply.
+///
+/// Idempotent. `merge_groups_into_policies` returns early once `groups:`
+/// is empty and validation only reads, so a path that already normalized
+/// before calling in can repeat the work safely. A repeat is a full
+/// `validate_config` walk rather than a single lookup, which is why this
+/// stays on the config-load paths and out of anything per-request.
+fn normalize_and_validate(mut config: PolicyConfig) -> Result<PolicyConfig, Box<PluginError>> {
+    crate::config::merge_groups_into_policies(&mut config);
+    crate::config::validate_config(&config)?;
+    Ok(config)
 }
 
 /// Emit warnings for YAML settings that the runtime doesn't currently
@@ -309,35 +344,86 @@ fn warn_on_inactive_settings(cfg: &PolicyConfig) {
     }
 }
 
-/// Instantiate every plugin in `plugin_configs` via the matching factory
-/// and register the resulting handlers into `target_registry`. Shared by
-/// `PolicyEngine::from_config` (fresh registry) and `load_config` (clone
-/// of the existing registry) so the instantiation loop lives in one place.
+/// Look up the factory for every entry in `plugin_configs`, in config
+/// order. Returns on the first `kind` with no registered factory.
 ///
-/// Returns on the first failure (factory missing, factory.create error, or
-/// duplicate-name registration). On error, `target_registry` is in a
-/// partial state — both callers discard it on failure (`load_config` builds
-/// the new registry on a clone and only swaps on Ok; `from_config` bails
-/// before publishing the snapshot).
-fn instantiate_plugins_into(
-    target_registry: &mut PluginRegistry,
+/// Split from `create_plugin_instances` so a caller can release the
+/// engine's `factories` lock before any factory runs — see that function
+/// for what happens if it doesn't. Resolving first also means an unknown
+/// `kind` is reported before any factory has run, so a rejected config
+/// leaves behind no half-built plugins.
+fn resolve_factories(
     plugin_configs: &[crate::plugin::PluginConfig],
     factories: &PluginFactoryRegistry,
+) -> Result<Vec<Arc<dyn crate::factory::PluginFactory>>, Box<PluginError>> {
+    plugin_configs
+        .iter()
+        .map(|plugin_config| {
+            factories.get(&plugin_config.kind).ok_or_else(|| {
+                Box::new(PluginError::Config {
+                    message: format!(
+                        "no factory registered for plugin kind '{}' (plugin '{}')",
+                        plugin_config.kind, plugin_config.name
+                    ),
+                })
+            })
+        })
+        .collect()
+}
+
+/// Create one plugin instance per entry in `plugin_configs`, using the
+/// factories `resolve_factories` returned for those same configs.
+///
+/// Must run with no engine lock held. `factory.create` is host code and is
+/// free to re-enter the engine: `register_handler`, `annotate_route` and
+/// `unregister_plugin` take `runtime_write`, `register_factory` takes the
+/// `factories` write side, and neither lock is reentrant, so a caller
+/// holding either across this function deadlocks against a factory that
+/// calls back. `RwLock` gives no guarantee for a recursive read either — a
+/// waiting writer can park a second `factories.read()` behind it.
+///
+/// Returns on the first factory that rejects its config; instances already
+/// created are dropped.
+fn create_plugin_instances(
+    plugin_configs: &[crate::plugin::PluginConfig],
+    factories: &[Arc<dyn crate::factory::PluginFactory>],
+) -> Result<Vec<crate::factory::PluginInstance>, Box<PluginError>> {
+    plugin_configs
+        .iter()
+        .zip(factories)
+        .map(|(plugin_config, factory)| factory.create(plugin_config))
+        .collect()
+}
+
+/// Register instances produced by `create_plugin_instances` into
+/// `target_registry`. `instances` is zipped against `plugin_configs`, so it
+/// has to be the slice that call returned for these same configs: a shorter
+/// one silently drops the tail, a reordered one pairs each plugin with the
+/// wrong config.
+///
+/// Borrows rather than consumes, and hands the registry `Arc` clones, so
+/// the caller keeps the last reference to every instance. That matters on
+/// the error path: `register_multi_handler` takes ownership and drops what
+/// it was given when it rejects a name, and the entries past the failure
+/// are never reached at all. Owning them here would run those plugins'
+/// `Drop` — host code — inside whatever lock the caller holds.
+///
+/// Returns on the first duplicate-name registration. On error,
+/// `target_registry` is in a partial state — both callers discard it on
+/// failure (`load_config` builds the new registry on a clone and only swaps
+/// on Ok; `from_config` bails before publishing the snapshot).
+fn register_instances_into(
+    target_registry: &mut PluginRegistry,
+    plugin_configs: &[crate::plugin::PluginConfig],
+    instances: &[crate::factory::PluginInstance],
 ) -> Result<(), Box<PluginError>> {
-    for plugin_config in plugin_configs {
-        let factory = factories
-            .get(&plugin_config.kind)
-            .ok_or_else(|| PluginError::Config {
-                message: format!(
-                    "no factory registered for plugin kind '{}' (plugin '{}')",
-                    plugin_config.kind, plugin_config.name
-                ),
-            })?;
-
-        let instance = factory.create(plugin_config)?;
-
+    for (plugin_config, instance) in plugin_configs.iter().zip(instances) {
         target_registry
-            .register_multi_handler(instance.plugin, plugin_config.clone(), instance.handlers)
+            .register_multi_handler(
+                Arc::clone(&instance.plugin),
+                plugin_config.clone(),
+                instance.handlers.clone(),
+            )
             .map_err(|msg| Box::new(PluginError::Config { message: msg }))?;
 
         info!(
@@ -386,6 +472,7 @@ impl PolicyEngine {
             route_cache_full_warned: AtomicBool::new(false),
             initialized: AtomicBool::new(false),
             generation: AtomicU64::new(0),
+            runtime_write: Mutex::new(()),
             task_tracker: tokio_util::task::TaskTracker::new(),
             visitors: RwLock::new(Vec::new()),
             http_transport: std::sync::OnceLock::new(),
@@ -397,14 +484,26 @@ impl PolicyEngine {
         self.runtime.load_full()
     }
 
+    /// Take the runtime writer lock, ignoring poisoning. A panic inside a
+    /// mutation closure leaves the `ArcSwap` holding whatever was last
+    /// published, which is a complete snapshot either way, so there is no
+    /// half-applied state for the next writer to inherit.
+    fn lock_runtime_writer(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.runtime_write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Apply a mutation to the runtime snapshot via copy-on-write.
     /// Clones the current snapshot, runs the closure on the clone, and
     /// atomically swaps it in. Concurrent readers continue using the old
-    /// snapshot; subsequent readers see the new one.
+    /// snapshot; subsequent readers see the new one. Writers serialise on
+    /// `runtime_write` for the length of the call.
     fn mutate_runtime<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut RuntimeSnapshot) -> R,
     {
+        let writer = self.lock_runtime_writer();
         let current = self.runtime.load_full();
         let mut next = (*current).clone();
         let result = f(&mut next);
@@ -413,24 +512,42 @@ impl PolicyEngine {
         // config_generation() — external cache consumers that observe a
         // higher generation are guaranteed to see the new snapshot.
         self.generation.fetch_add(1, Ordering::Release);
+        // Release before `current` falls out of scope. The store above
+        // usually leaves this the last reference to the old snapshot, and
+        // dropping it drops the registry, whose plugin `Drop` impls are host
+        // code: one that re-enters the engine would block on this lock.
+        drop(writer);
+        drop(current);
         result
     }
 
     /// Like `mutate_runtime` but the mutation can fail — the new snapshot
     /// is only published on `Ok`. On `Err`, the original snapshot is
-    /// untouched, so a partially-mutated clone is silently discarded.
+    /// untouched, so a partially-mutated clone is silently discarded. An
+    /// `Err` releases the writer lock without storing, so a rejected
+    /// mutation publishes nothing and holds up no other writer.
     fn try_mutate_runtime<F, T, E>(&self, f: F) -> Result<T, E>
     where
         F: FnOnce(&mut RuntimeSnapshot) -> Result<T, E>,
     {
+        let writer = self.lock_runtime_writer();
         let current = self.runtime.load_full();
         let mut next = (*current).clone();
-        let result = f(&mut next)?;
-        self.runtime.store(Arc::new(next));
-        // Same Release-ordered bump as mutate_runtime — only on Ok, since
-        // Err leaves the snapshot untouched.
-        self.generation.fetch_add(1, Ordering::Release);
-        Ok(result)
+        let result = f(&mut next);
+        if result.is_ok() {
+            self.runtime.store(Arc::new(next));
+            // Same Release-ordered bump as mutate_runtime — only on Ok, since
+            // Err leaves the snapshot untouched.
+            self.generation.fetch_add(1, Ordering::Release);
+        }
+        // Released before `next` and `current` fall out of scope, for the
+        // reason mutate_runtime releases early: both can hold the last
+        // reference to a plugin, and a `Drop` impl is host code. `next`
+        // survives to here on the `Err` path — no `?` above — so a rejected
+        // mutation drops whatever it built with the lock already gone.
+        drop(writer);
+        drop(current);
+        result
     }
 
     /// Monotonic counter that increments on every runtime snapshot swap
@@ -530,37 +647,61 @@ impl PolicyEngine {
     /// hook names from the config.
     /// # Errors
     ///
-    /// Returns `PluginError::Config` when a plugin's `kind` has no registered
-    /// factory, when a factory rejects the plugin's config, or when a
-    /// registration conflicts with one already present. The existing snapshot is
-    /// left in place, so a failed load does not disturb in-flight requests.
+    /// Returns `PluginError::Config` when the config fails validation, when a
+    /// plugin's `kind` has no registered factory, when a factory rejects the
+    /// plugin's config, or when a registration conflicts with one already
+    /// present. The existing snapshot is left in place, so a failed load does
+    /// not disturb in-flight requests.
     pub fn load_config(&self, policy_config: PolicyConfig) -> Result<(), Box<PluginError>> {
+        // Warn before validating: an operator whose config both sets an inactive
+        // knob and fails validation should see both, not just the refusal.
         warn_on_inactive_settings(&policy_config);
+        let policy_config = normalize_and_validate(policy_config)?;
+
+        // Resolve under the factories read lock, then drop it and
+        // instantiate holding nothing, per `create_plugin_instances`. A
+        // factory that registers something on its way through publishes it
+        // here, so the clone below picks it up rather than swapping a
+        // snapshot taken before it existed.
+        let factories = {
+            let registry = self
+                .factories
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            resolve_factories(&policy_config.plugins, &registry)?
+        };
+        let instances = create_plugin_instances(&policy_config.plugins, &factories)?;
 
         // Build the new snapshot from the current one — copy-on-write so
         // concurrent invokes keep using the existing config until we swap.
         // We can't use mutate_runtime here because we need to atomically
         // ALSO build a new executor + new cache cap from the same config —
-        // the snapshot fields are coupled.
-        let factories = self
-            .factories
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // the snapshot fields are coupled. Takes the writer lock by hand for
+        // the reason mutate_runtime takes it.
+        let writer = self.lock_runtime_writer();
+
         let current = self.runtime.load_full();
         let mut new_registry = current.registry.clone();
 
-        instantiate_plugins_into(&mut new_registry, &policy_config.plugins, &factories)?;
-
-        // Drop the factories read lock before taking other locks
-        // (route_cache write below) to avoid lock-ordering hazards.
-        drop(factories);
-
-        self.runtime
-            .store(Arc::new(snapshot_from_config(new_registry, policy_config)));
-        // Same generation bump as mutate_runtime — load_config doesn't
-        // go through that helper because it has to swap registry + executor
-        // + cache-cap atomically as one snapshot.
-        self.generation.fetch_add(1, Ordering::Release);
+        let registered =
+            register_instances_into(&mut new_registry, &policy_config.plugins, &instances);
+        if registered.is_ok() {
+            self.runtime
+                .store(Arc::new(snapshot_from_config(new_registry, policy_config)));
+            // Same generation bump as mutate_runtime — load_config doesn't
+            // go through that helper because it has to swap registry + executor
+            // + cache-cap atomically as one snapshot.
+            self.generation.fetch_add(1, Ordering::Release);
+        }
+        // Released before `instances`, `new_registry` and `current` fall out
+        // of scope, the same discipline try_mutate_runtime follows. A
+        // rejected load holds the only references to plugins the factories
+        // just built, and dropping one runs host `Drop` code that is free to
+        // re-enter the engine. No `?` above, so nothing unwinds past here
+        // still holding the lock.
+        drop(writer);
+        drop(current);
+        registered?;
 
         // Clear routing cache — config changed.
         self.clear_routing_cache();
@@ -628,8 +769,11 @@ impl PolicyEngine {
         // group's plugins + `authentication:`), never rejects the renamed
         // `identity:` key, and never validates references.
         crate::config::reject_renamed_identity_key(&raw)?;
-        crate::config::merge_groups_into_policies(&mut policy_config);
-        crate::config::validate_config(&policy_config)?;
+        // Visitors below read the normalized routes and plugin declarations, so
+        // this runs here rather than being left to `load_config`. Both steps
+        // are idempotent, so `load_config` repeating them is redundant work on
+        // a cold path rather than a behavior difference.
+        policy_config = normalize_and_validate(policy_config)?;
 
         // Snapshot the parsed routes + plugin declarations before
         // load_config moves the config — visitors get the typed
@@ -774,13 +918,17 @@ impl PolicyEngine {
     /// # Errors
     ///
     /// Returns `PluginError::Config` for the same reasons as
-    /// [`Self::load_config`]: an unknown plugin `kind`, a factory that rejects
-    /// its config, or a conflicting registration.
+    /// [`Self::load_config`]: a config that fails validation, an unknown plugin
+    /// `kind`, a factory that rejects its config, or a conflicting
+    /// registration.
     pub fn from_config(
         policy_config: PolicyConfig,
         factories: &PluginFactoryRegistry,
     ) -> Result<Self, Box<PluginError>> {
+        // Warn before validating: an operator whose config both sets an inactive
+        // knob and fails validation should see both, not just the refusal.
         warn_on_inactive_settings(&policy_config);
+        let policy_config = normalize_and_validate(policy_config)?;
 
         let engine = Self::new(PolicyEngineConfig {
             executor: ExecutorConfig::default(),
@@ -788,8 +936,10 @@ impl PolicyEngine {
         });
 
         // Instantiate into a fresh registry, then publish atomically.
+        let resolved = resolve_factories(&policy_config.plugins, factories)?;
+        let instances = create_plugin_instances(&policy_config.plugins, &resolved)?;
         let mut new_registry = PluginRegistry::new();
-        instantiate_plugins_into(&mut new_registry, &policy_config.plugins, factories)?;
+        register_instances_into(&mut new_registry, &policy_config.plugins, &instances)?;
 
         engine
             .runtime
@@ -1425,6 +1575,27 @@ impl PolicyEngine {
         });
     }
 
+    /// Remove a route annotation for a specific hook. No-op when no
+    /// annotation exists for the key. Bumps the generation so downstream
+    /// caches invalidate.
+    pub fn remove_route_annotation(
+        &self,
+        entity_type: &str,
+        entity_name: &str,
+        scope: Option<&str>,
+        hook_name: &str,
+    ) {
+        let key = AnnotationKey {
+            entity_type: entity_type.to_owned(),
+            entity_name: entity_name.to_owned(),
+            scope: scope.map(str::to_owned),
+            hook_name: hook_name.to_owned(),
+        };
+        self.mutate_runtime(|snap| {
+            snap.route_annotations.remove(&key);
+        });
+    }
+
     /// Filter hook entries based on route resolution, with caching.
     ///
     /// When routing is enabled and extensions.meta provides entity
@@ -2032,6 +2203,7 @@ mod tests {
     use super::*;
     use crate::context::PluginContext;
     use crate::error::PluginViolation;
+    use crate::hooks::metadata::{HookMetadata, register_hook_metadata};
     use crate::plugin::{OnError, PluginMode};
     use async_trait::async_trait;
 
@@ -2141,6 +2313,36 @@ mod tests {
 
     // -- Helpers --
 
+    /// The fixtures declare `test_hook`, which this crate does not
+    /// dispatch, so its metadata has to be registered the way a host
+    /// registers its own.
+    ///
+    /// No test calls this directly. Every helper that builds or parses a
+    /// fixture config calls it, so a test is registered by producing its
+    /// config. The registry is process-wide, so a test relying on a
+    /// separate call passed beside the tests that made one and failed
+    /// when run alone.
+    fn register_fixture_hooks() {
+        register_hook_metadata(TestHook::NAME, HookMetadata::permissive());
+    }
+
+    /// Parse fixture YAML into a validated config.
+    ///
+    /// Registration has to precede the parse, not just the load:
+    /// validation reads the registry, so an unregistered `test_hook` is
+    /// refused here.
+    fn parse_fixture_config(yaml: &str) -> Result<PolicyConfig, Box<PluginError>> {
+        register_fixture_hooks();
+        crate::config::parse_config(yaml)
+    }
+
+    /// Load fixture YAML into `engine`, registering first for the same
+    /// reason [`parse_fixture_config`] does.
+    fn load_fixture_yaml(engine: &Arc<PolicyEngine>, yaml: &str) -> Result<(), Box<PluginError>> {
+        register_fixture_hooks();
+        engine.load_config_yaml(yaml)
+    }
+
     fn make_config(name: &str, priority: i32, mode: PluginMode) -> PluginConfig {
         make_config_with_on_error(name, priority, mode, OnError::Fail)
     }
@@ -2151,6 +2353,9 @@ mod tests {
         mode: PluginMode,
         on_error: OnError,
     ) -> PluginConfig {
+        // The config below names `test_hook`, so its metadata has to
+        // exist by the time a load validates it.
+        register_fixture_hooks();
         PluginConfig {
             name: name.to_owned(),
             kind: "test".to_owned(),
@@ -2640,6 +2845,319 @@ mod tests {
         assert!(INVOKE_COUNT.load(Ordering::SeqCst) >= n);
         // Late registration is now visible.
         assert_eq!(mgr.plugin_count(), 2);
+    }
+
+    /// N OS threads register N distinct plugins at the same instant, and all N
+    /// have to survive. A registration lost to a concurrent one still returns
+    /// `Ok`, so the count is the only thing that catches it.
+    ///
+    /// The barrier is load-bearing: it lines every thread up on the same
+    /// snapshot, which is what makes the loss reliable rather than occasional.
+    /// So are the real threads. The sibling test above runs on
+    /// `current_thread`, where a load and a store cannot interleave, so
+    /// nothing here survives being rewritten as `tokio::spawn`.
+    #[test]
+    fn concurrent_registration_loses_no_plugins() {
+        let mgr = Arc::new(PolicyEngine::default());
+        let n = 16_usize;
+        let barrier = std::sync::Barrier::new(n);
+
+        std::thread::scope(|s| {
+            for i in 0..n {
+                let mgr = Arc::clone(&mgr);
+                let barrier = &barrier;
+                s.spawn(move || {
+                    let cfg = make_config(&format!("p{i}"), 10, PluginMode::Sequential);
+                    let plugin: Arc<AllowPlugin> = Arc::new(AllowPlugin { cfg: cfg.clone() });
+                    barrier.wait();
+                    mgr.register_handler::<TestHook, _>(plugin, cfg)
+                        .expect("registration must succeed");
+                });
+            }
+        });
+
+        assert_eq!(
+            mgr.plugin_count(),
+            n,
+            "every registration that returned Ok must be present in the snapshot",
+        );
+        assert_eq!(
+            mgr.config_generation(),
+            n as u64,
+            "generation bumps exactly once per published mutation",
+        );
+    }
+
+    /// A factory that reaches back into the engine on its way through
+    /// `create`, once per lock a host factory can plausibly hit:
+    /// `register_handler` takes `runtime_write`, `register_factory` takes
+    /// the `factories` write side. The shape of a host plugin that installs
+    /// a companion handler and the factory for its own sub-kind while being
+    /// built.
+    struct ReentrantFactory {
+        engine: std::sync::Weak<PolicyEngine>,
+    }
+
+    impl crate::factory::PluginFactory for ReentrantFactory {
+        fn create(
+            &self,
+            config: &PluginConfig,
+        ) -> Result<crate::factory::PluginInstance, Box<PluginError>> {
+            let engine = self.engine.upgrade().expect("engine outlives the factory");
+            let side_cfg = make_config(
+                &format!("{}_companion", config.name),
+                10,
+                PluginMode::Sequential,
+            );
+            let side: Arc<AllowPlugin> = Arc::new(AllowPlugin {
+                cfg: side_cfg.clone(),
+            });
+            engine
+                .register_handler::<TestHook, _>(side, side_cfg)
+                .expect("re-entrant registration must succeed");
+            engine.register_factory("test/reentrant_spawned", Box::new(AllowPluginFactory));
+            AllowPluginFactory.create(config)
+        }
+    }
+
+    /// Neither `runtime_write` nor the `factories` `RwLock` is reentrant, so
+    /// a factory that calls back into the engine deadlocks against either
+    /// one `load_config` is still holding while it runs `create`. The load
+    /// runs on its own thread so the timeout reports that as a failure
+    /// instead of hanging the test binary.
+    ///
+    /// The count also pins the ordering that makes the fix correct — the
+    /// registry is cloned after the factories run, so what a factory
+    /// registered mid-create is in the published snapshot, not overwritten
+    /// by it.
+    #[test]
+    fn load_config_holds_no_lock_across_factory_create() {
+        let engine = Arc::new(PolicyEngine::default());
+        engine.register_factory(
+            "test/reentrant",
+            Box::new(ReentrantFactory {
+                engine: Arc::downgrade(&engine),
+            }),
+        );
+
+        let yaml = r"
+plugins:
+  - name: main_plugin
+    kind: test/reentrant
+    hooks: [test_hook]
+    mode: sequential
+    priority: 10
+";
+        let policy_config = parse_fixture_config(yaml).unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let loader = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            let _ = done_tx.send(loader.load_config(policy_config).is_ok());
+        });
+
+        let loaded = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("load_config deadlocked against a re-entrant factory");
+        assert!(loaded, "load_config must succeed");
+
+        assert_eq!(
+            engine.plugin_count(),
+            2,
+            "both the configured plugin and the one its factory registered \
+             must be in the published snapshot",
+        );
+    }
+
+    /// An annotation handler whose `Drop` reaches back into the engine.
+    /// Host annotation handlers own host resources, so their teardown is
+    /// host code like any other callback.
+    struct DropReentrantHandler {
+        cfg: PluginConfig,
+        engine: std::sync::Weak<PolicyEngine>,
+    }
+
+    #[async_trait]
+    impl Plugin for DropReentrantHandler {
+        fn config(&self) -> &PluginConfig {
+            &self.cfg
+        }
+        async fn initialize(&self) -> Result<(), Box<PluginError>> {
+            Ok(())
+        }
+        async fn shutdown(&self) -> Result<(), Box<PluginError>> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl crate::registry::AnyHookHandler for DropReentrantHandler {
+        async fn invoke(
+            &self,
+            _payload: &dyn crate::prelude::PluginPayload,
+            _extensions: &Extensions,
+            _ctx: &mut PluginContext,
+        ) -> Result<Box<dyn std::any::Any + Send + Sync>, Box<PluginError>> {
+            Err(Box::new(PluginError::Config {
+                message: "this handler exists to be dropped, not invoked".to_owned(),
+            }))
+        }
+
+        fn hook_type_name(&self) -> &'static str {
+            "test_hook"
+        }
+    }
+
+    impl Drop for DropReentrantHandler {
+        fn drop(&mut self) {
+            let Some(engine) = self.engine.upgrade() else {
+                return;
+            };
+            // Any mutating call reaches `runtime_write`; this one is a
+            // no-op on a key that was never annotated.
+            engine.remove_route_annotation("tool", "never_annotated", None, "test_hook");
+        }
+    }
+
+    /// A discarded annotation drops the handler the old snapshot held, and
+    /// that teardown is host code. `runtime_write` has to be released
+    /// before the old snapshot falls out of scope, or a handler whose
+    /// `Drop` calls back blocks on the lock its own release is holding.
+    ///
+    /// `remove_route_annotation` is the reachable path: the closure drops
+    /// the entry from the clone while the snapshot being replaced still
+    /// mirrors it, so the last reference goes with that snapshot, inside
+    /// `mutate_runtime`.
+    #[test]
+    fn a_dropped_annotation_handler_can_re_enter_the_engine() {
+        let engine = Arc::new(PolicyEngine::default());
+        let cfg = make_config("annotated", 10, PluginMode::Sequential);
+        let handler = Arc::new(DropReentrantHandler {
+            cfg: cfg.clone(),
+            engine: Arc::downgrade(&engine),
+        });
+
+        engine.annotate_route("tool", "t1", None, "test_hook", handler, cfg);
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let remover = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            // Drops the sole remaining reference — the annotation the line
+            // above published — and with it the handler.
+            remover.remove_route_annotation("tool", "t1", None, "test_hook");
+            let _ = done_tx.send(());
+        });
+
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a re-entrant handler Drop deadlocked against runtime_write");
+    }
+
+    /// Builds plugins whose `Drop` re-enters the engine, so a load that is
+    /// rejected after instantiation has host teardown to run.
+    struct DropReentrantFactory {
+        engine: std::sync::Weak<PolicyEngine>,
+    }
+
+    impl crate::factory::PluginFactory for DropReentrantFactory {
+        fn create(
+            &self,
+            config: &PluginConfig,
+        ) -> Result<crate::factory::PluginInstance, Box<PluginError>> {
+            let plugin = Arc::new(DropReentrantHandler {
+                cfg: config.clone(),
+                engine: self.engine.clone(),
+            });
+            Ok(crate::factory::PluginInstance {
+                plugin: Arc::clone(&plugin) as Arc<dyn Plugin>,
+                handlers: vec![("test_hook", plugin)],
+            })
+        }
+    }
+
+    /// A name conflict rejects the load with the factories' plugins already
+    /// built, and `load_config` holds the only references to them: the
+    /// registry drops what it refused, the entries past the conflict are
+    /// never registered, and the partial clone drops unpublished. All of
+    /// that is host `Drop` code, so none of it may run under
+    /// `runtime_write`.
+    ///
+    /// The config collides with a plugin registered beforehand rather than
+    /// with itself — `parse_config` rejects a name repeated inside one
+    /// document, so an in-file duplicate never reaches the registry. The
+    /// conflict lands on the first entry, leaving one instance refused by
+    /// the registry and one never reached.
+    #[test]
+    fn a_rejected_load_drops_its_plugins_outside_the_writer_lock() {
+        let engine = Arc::new(PolicyEngine::default());
+        engine.register_factory(
+            "test/drop_reentrant",
+            Box::new(DropReentrantFactory {
+                engine: Arc::downgrade(&engine),
+            }),
+        );
+
+        let taken = make_config("taken", 5, PluginMode::Sequential);
+        let sitting: Arc<AllowPlugin> = Arc::new(AllowPlugin { cfg: taken.clone() });
+        engine
+            .register_handler::<TestHook, _>(sitting, taken)
+            .expect("the conflicting name has to be registered first");
+
+        let yaml = r"
+plugins:
+  - name: taken
+    kind: test/drop_reentrant
+    hooks: [test_hook]
+    mode: sequential
+    priority: 10
+  - name: never_reached
+    kind: test/drop_reentrant
+    hooks: [test_hook]
+    mode: sequential
+    priority: 20
+";
+        let policy_config = parse_fixture_config(yaml).unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let loader = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            let _ = done_tx.send(loader.load_config(policy_config).is_err());
+        });
+
+        let rejected = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a rejected load deadlocked dropping its own plugins");
+        assert!(rejected, "a conflicting plugin name must reject the load");
+        assert_eq!(
+            engine.plugin_count(),
+            1,
+            "a rejected load publishes nothing, leaving the earlier plugin",
+        );
+    }
+
+    /// A rejected mutation must publish nothing and leave the generation
+    /// alone, so a downstream cache keyed on the generation does not evict
+    /// and rebuild over a registration that never happened.
+    #[test]
+    fn failed_registration_publishes_nothing() {
+        let mgr = PolicyEngine::default();
+        let cfg = make_config("dupe", 10, PluginMode::Sequential);
+        let plugin: Arc<AllowPlugin> = Arc::new(AllowPlugin { cfg: cfg.clone() });
+        mgr.register_handler::<TestHook, _>(plugin, cfg.clone())
+            .expect("first registration must succeed");
+
+        let generation_after_first = mgr.config_generation();
+
+        let dupe: Arc<AllowPlugin> = Arc::new(AllowPlugin { cfg: cfg.clone() });
+        mgr.register_handler::<TestHook, _>(dupe, cfg)
+            .expect_err("a duplicate name must be rejected");
+
+        assert_eq!(mgr.plugin_count(), 1, "the rejected plugin must not appear");
+        assert_eq!(
+            mgr.config_generation(),
+            generation_after_first,
+            "a failed mutation must not bump the generation",
+        );
     }
 
     #[tokio::test]
@@ -4066,7 +4584,7 @@ routes:
       - target
 "#
             );
-            let policy_config = crate::config::parse_config(&yaml).unwrap();
+            let policy_config = parse_fixture_config(&yaml).unwrap();
 
             let mgr = PolicyEngine::default();
             let counter = StdArc::new(AtomicUsize::new(0));
@@ -4295,6 +4813,140 @@ routes:
         }
     }
 
+    // -- Every load path normalizes and validates --
+
+    /// A config as a host would hand it over in Rust: deserialized but
+    /// not put through `parse_config`, so nothing has normalized or
+    /// validated it yet. Registers the fixture hooks, since the load it
+    /// is handed to validates it.
+    fn unvalidated_config(yaml: &str) -> PolicyConfig {
+        register_fixture_hooks();
+        serde_yaml::from_str(yaml).expect("deserialize")
+    }
+
+    fn allow_factories() -> PluginFactoryRegistry {
+        let mut factories = PluginFactoryRegistry::new();
+        factories.register("test/allow", Box::new(AllowPluginFactory));
+        factories
+    }
+
+    const VALID_YAML: &str = r#"
+plugins:
+  - name: allow_plugin
+    kind: test/allow
+    hooks: [test_hook]
+    mode: sequential
+"#;
+
+    const DUPLICATE_NAME_YAML: &str = r#"
+plugins:
+  - name: twice
+    kind: test/allow
+    hooks: [test_hook]
+  - name: twice
+    kind: test/allow
+    hooks: [test_hook]
+"#;
+
+    /// A route joining a top-level `groups:` bundle. Resolving the group
+    /// is what gives the route the group's plugins; skipping the merge
+    /// leaves the route with an unknown-group reference.
+    const GROUP_YAML: &str = r#"
+plugin_settings:
+  routing_enabled: true
+plugins:
+  - name: allow_plugin
+    kind: test/allow
+    hooks: [test_hook]
+groups:
+  privileged:
+    plugins: [allow_plugin]
+routes:
+  - tool: secret_tool
+    groups: [privileged]
+    plugins: [allow_plugin]
+"#;
+
+    #[test]
+    fn a_valid_config_loads_through_every_path() {
+        parse_fixture_config(VALID_YAML).expect("parse_config");
+
+        // A fresh engine per path: re-loading the same plugin name onto
+        // one engine is a registration conflict, unrelated to validation.
+        let via_yaml = Arc::new(PolicyEngine::default());
+        via_yaml.register_factory("test/allow", Box::new(AllowPluginFactory));
+        load_fixture_yaml(&via_yaml, VALID_YAML).expect("load_config_yaml");
+
+        let via_typed = Arc::new(PolicyEngine::default());
+        via_typed.register_factory("test/allow", Box::new(AllowPluginFactory));
+        via_typed
+            .load_config(unvalidated_config(VALID_YAML))
+            .expect("load_config");
+
+        PolicyEngine::from_config(unvalidated_config(VALID_YAML), &allow_factories())
+            .expect("from_config");
+    }
+
+    #[test]
+    fn a_duplicate_plugin_name_is_rejected_on_every_path() {
+        let mgr = Arc::new(PolicyEngine::default());
+        mgr.register_factory("test/allow", Box::new(AllowPluginFactory));
+
+        // Every path refuses before any plugin is instantiated, so one
+        // engine serves all of them.
+        for err in [
+            parse_fixture_config(DUPLICATE_NAME_YAML)
+                .map(|_| ())
+                .unwrap_err(),
+            load_fixture_yaml(&mgr, DUPLICATE_NAME_YAML).unwrap_err(),
+            mgr.load_config(unvalidated_config(DUPLICATE_NAME_YAML))
+                .unwrap_err(),
+            PolicyEngine::from_config(unvalidated_config(DUPLICATE_NAME_YAML), &allow_factories())
+                .map(|_| ())
+                .unwrap_err(),
+        ] {
+            assert!(
+                err.to_string().contains("duplicate plugin name"),
+                "unexpected error: {err}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_group_block_resolves_through_the_programmatic_paths() {
+        let mgr = Arc::new(PolicyEngine::default());
+        mgr.register_factory("test/allow", Box::new(AllowPluginFactory));
+
+        // Before the merge, `groups:` is a separate map and the route
+        // joins a group `global.policies` does not hold, so validation
+        // catches it. Both paths now merge first and accept it.
+        mgr.load_config(unvalidated_config(GROUP_YAML))
+            .expect("load_config resolves groups");
+        assert!(
+            mgr.load_runtime()
+                .policy_config
+                .as_ref()
+                .expect("config")
+                .global
+                .policies
+                .contains_key("privileged"),
+        );
+
+        let from_config =
+            PolicyEngine::from_config(unvalidated_config(GROUP_YAML), &allow_factories())
+                .expect("from_config resolves groups");
+        assert!(
+            from_config
+                .load_runtime()
+                .policy_config
+                .as_ref()
+                .expect("config")
+                .global
+                .policies
+                .contains_key("privileged"),
+        );
+    }
+
     #[tokio::test]
     async fn test_from_config_creates_manager() {
         let yaml = r#"
@@ -4308,7 +4960,7 @@ plugins:
 plugin_settings:
   plugin_timeout: 60
 "#;
-        let policy_config = crate::config::parse_config(yaml).unwrap();
+        let policy_config = parse_fixture_config(yaml).unwrap();
 
         let mut factories = PluginFactoryRegistry::new();
         factories.register("test/allow", Box::new(AllowPluginFactory));
@@ -4330,7 +4982,7 @@ plugins:
     mode: sequential
     priority: 10
 "#;
-        let policy_config = crate::config::parse_config(yaml).unwrap();
+        let policy_config = parse_fixture_config(yaml).unwrap();
 
         let mut factories = PluginFactoryRegistry::new();
         factories.register("test/deny", Box::new(DenyPluginFactory));
@@ -4359,7 +5011,7 @@ plugins:
     kind: unknown/type
     hooks: [test_hook]
 "#;
-        let policy_config = crate::config::parse_config(yaml).unwrap();
+        let policy_config = parse_fixture_config(yaml).unwrap();
         let factories = PluginFactoryRegistry::new(); // empty — no factories
 
         let result = PolicyEngine::from_config(policy_config, &factories);
@@ -4384,7 +5036,7 @@ plugins:
     mode: sequential
     priority: 10
 "#;
-        let policy_config = crate::config::parse_config(yaml).unwrap();
+        let policy_config = parse_fixture_config(yaml).unwrap();
 
         let mut factories = PluginFactoryRegistry::new();
         factories.register("test/allow", Box::new(AllowPluginFactory));
@@ -4428,7 +5080,7 @@ plugins:
 routes:
   - tool: get_compensation
 "#;
-        let policy_config = crate::config::parse_config(yaml).unwrap();
+        let policy_config = parse_fixture_config(yaml).unwrap();
         let mut factories = PluginFactoryRegistry::new();
         factories.register("test/allow", Box::new(AllowPluginFactory));
 
@@ -4496,7 +5148,7 @@ routes:
 "#;
         let mgr = Arc::new(PolicyEngine::default());
         mgr.register_factory("test/deny", Box::new(DenyPluginFactory));
-        mgr.load_config_yaml(yaml).expect("config must load");
+        load_fixture_yaml(&mgr, yaml).expect("config must load");
 
         let ext = Extensions {
             meta: Some(Arc::new(crate::hooks::payload::MetaExtension {
@@ -4561,7 +5213,7 @@ routes:
         let mgr = Arc::new(PolicyEngine::default());
         let recorder = Arc::new(RecordingVisitor::default());
         mgr.register_visitor(recorder.clone());
-        mgr.load_config_yaml(yaml).expect("config must load");
+        load_fixture_yaml(&mgr, yaml).expect("config must load");
 
         let seen = recorder.bundles.lock().unwrap();
         assert!(
@@ -4588,7 +5240,7 @@ routes:
   - tool: get_compensation
   - tool: send_email
 "#;
-        let policy_config = crate::config::parse_config(yaml).unwrap();
+        let policy_config = parse_fixture_config(yaml).unwrap();
         let mut factories = PluginFactoryRegistry::new();
         factories.register("test/allow", Box::new(AllowPluginFactory));
 
@@ -4641,7 +5293,7 @@ plugins:
 routes:
   - tool: get_compensation
 "#;
-        let policy_config = crate::config::parse_config(yaml).unwrap();
+        let policy_config = parse_fixture_config(yaml).unwrap();
         let mut factories = PluginFactoryRegistry::new();
         factories.register("test/allow", Box::new(AllowPluginFactory));
 
@@ -4682,7 +5334,7 @@ plugins:
 routes:
   - tool: get_compensation
 "#;
-        let policy_config = crate::config::parse_config(yaml).unwrap();
+        let policy_config = parse_fixture_config(yaml).unwrap();
         let mut factories = PluginFactoryRegistry::new();
         factories.register("test/allow", Box::new(AllowPluginFactory));
 
@@ -4758,7 +5410,7 @@ routes:
   - tool: b
   - tool: c
 "#;
-        let policy_config = crate::config::parse_config(yaml).unwrap();
+        let policy_config = parse_fixture_config(yaml).unwrap();
         let mut factories = PluginFactoryRegistry::new();
         factories.register("test/allow", Box::new(AllowPluginFactory));
 
@@ -4831,7 +5483,7 @@ plugins:
 routes:
   - tool: get_compensation
 "#;
-        let policy_config = crate::config::parse_config(yaml).unwrap();
+        let policy_config = parse_fixture_config(yaml).unwrap();
         let mut factories = PluginFactoryRegistry::new();
         factories.register("test/allow", Box::new(AllowPluginFactory));
 
@@ -4878,7 +5530,7 @@ plugins:
 routes:
   - tool: get_compensation
 "#;
-        let policy_config = crate::config::parse_config(yaml).unwrap();
+        let policy_config = parse_fixture_config(yaml).unwrap();
         let mut factories = PluginFactoryRegistry::new();
         factories.register("test/allow", Box::new(AllowPluginFactory));
 
@@ -4937,7 +5589,7 @@ routes:
           config:
             max_requests: 10
 "#;
-        let policy_config = crate::config::parse_config(yaml).unwrap();
+        let policy_config = parse_fixture_config(yaml).unwrap();
 
         // Use register_factory + load_config so engine owns factories
         let mgr = PolicyEngine::default();
@@ -5217,7 +5869,7 @@ routes:
           config:
             max_requests: 10
 "#;
-        let policy_config = crate::config::parse_config(yaml).unwrap();
+        let policy_config = parse_fixture_config(yaml).unwrap();
 
         let mgr = PolicyEngine::default();
         mgr.register_factory("test/init_tracking", Box::new(InitTrackingFactory));
@@ -5354,7 +6006,7 @@ routes:
                 log: Arc::clone(&log),
             }),
         );
-        mgr.load_config(crate::config::parse_config(yaml).unwrap())
+        mgr.load_config(parse_fixture_config(yaml).unwrap())
             .unwrap();
         (mgr, log)
     }
@@ -5490,7 +6142,7 @@ routes:
           config:
             something: changed
 "#;
-        let policy_config = crate::config::parse_config(yaml).unwrap();
+        let policy_config = parse_fixture_config(yaml).unwrap();
 
         let mgr = PolicyEngine::default();
         mgr.register_factory("test/error_on_invoke", Box::new(ErrorOnInvokeFactory));
@@ -5535,7 +6187,7 @@ plugins:
 plugin_settings:
   plugin_timeout: 45
 "#;
-        let policy_config = crate::config::parse_config(yaml).unwrap();
+        let policy_config = parse_fixture_config(yaml).unwrap();
 
         let mgr = PolicyEngine::default();
         mgr.register_factory("test/allow", Box::new(AllowPluginFactory));
@@ -5617,7 +6269,7 @@ routes:
     plugins:
       - rate_limiter
 "#;
-        let policy_config = crate::config::parse_config(yaml).unwrap();
+        let policy_config = parse_fixture_config(yaml).unwrap();
         let mgr = PolicyEngine::default();
         mgr.register_factory("test/allow", Box::new(AllowPluginFactory));
         mgr.register_factory("test/deny", Box::new(DenyPluginFactory));
@@ -5669,7 +6321,7 @@ plugins:
     mode: sequential
     priority: 20
 "#;
-        let policy_config = crate::config::parse_config(yaml).unwrap();
+        let policy_config = parse_fixture_config(yaml).unwrap();
         let mgr = PolicyEngine::default();
         mgr.register_factory("test/allow", Box::new(AllowPluginFactory));
         mgr.register_factory("test/deny", Box::new(DenyPluginFactory));
@@ -5715,7 +6367,7 @@ routes:
     plugins:
       - denier
 "#;
-        let policy_config = crate::config::parse_config(yaml).unwrap();
+        let policy_config = parse_fixture_config(yaml).unwrap();
         let mgr = PolicyEngine::default();
         mgr.register_factory("test/allow", Box::new(AllowPluginFactory));
         mgr.register_factory("test/deny", Box::new(DenyPluginFactory));
@@ -5775,7 +6427,7 @@ routes:
     plugins:
       - fallback_plugin
 "#;
-        let policy_config = crate::config::parse_config(yaml).unwrap();
+        let policy_config = parse_fixture_config(yaml).unwrap();
         let mgr = PolicyEngine::default();
         mgr.register_factory("test/allow", Box::new(AllowPluginFactory));
         mgr.register_factory("test/deny", Box::new(DenyPluginFactory));
@@ -5834,7 +6486,7 @@ plugins:
 routes:
   - tool: get_compensation
 "#;
-        let policy_config = crate::config::parse_config(yaml).unwrap();
+        let policy_config = parse_fixture_config(yaml).unwrap();
         let mgr = PolicyEngine::default();
         mgr.register_factory("test/allow", Box::new(AllowPluginFactory));
         mgr.register_factory("test/deny", Box::new(DenyPluginFactory));
@@ -5899,7 +6551,7 @@ routes:
       tags: [pii]
   - tool: send_email
 "#;
-        let policy_config = crate::config::parse_config(yaml).unwrap();
+        let policy_config = parse_fixture_config(yaml).unwrap();
         let mgr = PolicyEngine::default();
         mgr.register_factory("test/allow", Box::new(AllowPluginFactory));
         mgr.register_factory("test/deny", Box::new(DenyPluginFactory));
@@ -6257,8 +6909,7 @@ plugin_settings:
   parallel_execution_within_band: true
   fail_on_plugin_error: true
 "#;
-        mgr.load_config_yaml(yaml)
-            .expect("inactive settings warn, they do not fail the load");
+        load_fixture_yaml(&mgr, yaml).expect("inactive settings warn, they do not fail the load");
     }
 
     /// `groups:` at the top level and `global.policies:` are two spellings of
@@ -6306,7 +6957,7 @@ global:
         let mgr = Arc::new(PolicyEngine::default());
         let recorder = Arc::new(BundleRecorder::default());
         mgr.register_visitor(recorder.clone());
-        mgr.load_config_yaml(yaml).expect("config must load");
+        load_fixture_yaml(&mgr, yaml).expect("config must load");
 
         let seen = recorder.seen.lock().unwrap();
         assert!(
@@ -6398,9 +7049,8 @@ global:
         ] {
             let mgr = Arc::new(PolicyEngine::default());
             mgr.register_visitor(Arc::new(Refuser(section)));
-            let err = mgr
-                .load_config_yaml(yaml)
-                .expect_err("a refusing visitor must abort the load");
+            let err =
+                load_fixture_yaml(&mgr, yaml).expect_err("a refusing visitor must abort the load");
             let msg = err.to_string();
             assert!(
                 msg.contains("refuser"),
@@ -6437,7 +7087,7 @@ plugins:
     kind: test/allow
     hooks: [test_hook]
 "#;
-        mgr.load_config_yaml(yaml).expect("config must load");
+        load_fixture_yaml(&mgr, yaml).expect("config must load");
         let mut names = mgr.plugin_names();
         names.sort();
         assert_eq!(names, vec!["first".to_owned(), "second".to_owned()]);
