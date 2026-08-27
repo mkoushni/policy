@@ -44,7 +44,7 @@ use std::sync::{Arc, RwLock};
 use praxis_policy_core::delegation::HOOK_TOKEN_DELEGATE;
 use praxis_policy_core::elicitation::HOOK_ELICIT;
 use praxis_policy_core::engine::PolicyEngine;
-use praxis_policy_core::hooks::{HookPhase, lookup_hook_metadata};
+use praxis_policy_core::hooks::{HookMetadata, HookPhase, lookup_hook_metadata};
 use praxis_policy_core::plugin::OnError;
 use praxis_policy_core::registry::HookEntry;
 
@@ -60,7 +60,7 @@ use praxis_policy_apl_core::rules::{CompiledRoute, Effect};
 /// Replaces the prior `step_entry` / `field_entry` slot model, which
 /// used a brittle naming heuristic to classify hooks and silently
 /// collapsed plugins with multiple step-context hooks (e.g. both
-/// `tool_pre_invoke` and `tool_post_invoke`) to a single entry.
+/// `cmf.tool_pre_invoke` and `cmf.tool_post_invoke`) to a single entry.
 #[derive(Clone)]
 pub struct RoutePluginEntry {
     /// The plugin this entry dispatches to.
@@ -89,6 +89,10 @@ impl RoutePluginEntry {
     /// Returns `None` when the plugin has no hook matching the
     /// context — caller surfaces this as `PluginError::Dispatch`
     /// with the requested context in the message.
+    ///
+    /// A hook with no metadata entry falls back to
+    /// [`HookMetadata::permissive`], which matches any context, so a
+    /// plugin registered under a name nobody described still dispatches.
     pub fn pick_entry(
         &self,
         requested_entity_type: Option<&str>,
@@ -97,7 +101,9 @@ impl RoutePluginEntry {
         self.entries_by_hook
             .iter()
             .find(|(hook_name, _)| {
-                lookup_hook_metadata(hook_name).matches(requested_entity_type, requested_phase)
+                lookup_hook_metadata(hook_name)
+                    .unwrap_or_else(HookMetadata::permissive)
+                    .matches(requested_entity_type, requested_phase)
             })
             .map(|(_, entry)| entry)
     }

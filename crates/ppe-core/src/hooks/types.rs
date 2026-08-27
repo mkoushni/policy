@@ -9,8 +9,9 @@
 //
 // The framework does not prescribe a fixed set of hook points. Each
 // host places `invoke_hook()` calls at sites appropriate to its
-// processing pipeline. The constants below cover the standard
-// MCP/CMF lifecycle but hosts may register additional types.
+// processing pipeline. The names PPE itself dispatches live with the
+// modules that own them, declared by `define_hooks!`; the enumerations
+// here are projections over the table those declarations build.
 
 use std::fmt;
 
@@ -24,12 +25,12 @@ use serde::{Deserialize, Serialize};
 /// # Examples
 ///
 /// ```
+/// use praxis_policy_core::cmf::constants::HOOK_CMF_TOOL_PRE_INVOKE;
 /// use praxis_policy_core::hooks::HookType;
-/// use praxis_policy_core::hooks::types::hook_names;
 ///
-/// // Use a built-in name constant
-/// let hook = HookType::new(hook_names::TOOL_PRE_INVOKE);
-/// assert_eq!(hook.as_str(), "tool_pre_invoke");
+/// // Use a dispatched hook's name constant
+/// let hook = HookType::new(HOOK_CMF_TOOL_PRE_INVOKE);
+/// assert_eq!(hook.as_str(), "cmf.tool_pre_invoke");
 ///
 /// // Define a custom hook
 /// let custom = HookType::new("generation_pre_call");
@@ -69,91 +70,27 @@ impl From<String> for HookType {
     }
 }
 
-/// Legacy hook names — typed payloads (`ToolPreInvokePayload`, etc.).
-pub mod hook_names {
-    // Tool lifecycle
-    /// Hook name `tool_pre_invoke`.
-    pub const TOOL_PRE_INVOKE: &str = "tool_pre_invoke";
-    /// Hook name `tool_post_invoke`.
-    pub const TOOL_POST_INVOKE: &str = "tool_post_invoke";
-
-    // Prompt lifecycle
-    /// Hook name `prompt_pre_fetch`.
-    pub const PROMPT_PRE_FETCH: &str = "prompt_pre_fetch";
-    /// Hook name `prompt_post_fetch`.
-    pub const PROMPT_POST_FETCH: &str = "prompt_post_fetch";
-
-    // Resource lifecycle
-    /// Hook name `resource_pre_fetch`.
-    pub const RESOURCE_PRE_FETCH: &str = "resource_pre_fetch";
-    /// Hook name `resource_post_fetch`.
-    pub const RESOURCE_POST_FETCH: &str = "resource_post_fetch";
-
-    // Identity and delegation
-    /// Hook name `identity_resolve`.
-    pub const IDENTITY_RESOLVE: &str = "identity_resolve";
-    /// Hook name `token_delegate`.
-    pub const TOKEN_DELEGATE: &str = "token_delegate";
-}
-
-/// CMF hook names — `MessagePayload` wrapping a CMF Message.
-/// The `cmf.` prefix lets legacy and CMF plugins coexist at the
-/// same interception point. The gateway fires both at each event.
-pub mod cmf_hook_names {
-    // Tool lifecycle
-    /// Hook name `cmf.tool_pre_invoke`.
-    pub const TOOL_PRE_INVOKE: &str = "cmf.tool_pre_invoke";
-    /// Hook name `cmf.tool_post_invoke`.
-    pub const TOOL_POST_INVOKE: &str = "cmf.tool_post_invoke";
-
-    // LLM lifecycle (CMF only — no legacy equivalent)
-    /// Hook name `cmf.llm_input`.
-    pub const LLM_INPUT: &str = "cmf.llm_input";
-    /// Hook name `cmf.llm_output`.
-    pub const LLM_OUTPUT: &str = "cmf.llm_output";
-
-    // Prompt lifecycle
-    /// Hook name `cmf.prompt_pre_fetch`.
-    pub const PROMPT_PRE_FETCH: &str = "cmf.prompt_pre_fetch";
-    /// Hook name `cmf.prompt_post_fetch`.
-    pub const PROMPT_POST_FETCH: &str = "cmf.prompt_post_fetch";
-
-    // Resource lifecycle
-    /// Hook name `cmf.resource_pre_fetch`.
-    pub const RESOURCE_PRE_FETCH: &str = "cmf.resource_pre_fetch";
-    /// Hook name `cmf.resource_post_fetch`.
-    pub const RESOURCE_POST_FETCH: &str = "cmf.resource_post_fetch";
-}
-
-/// Returns all built-in hook types with their canonical string values.
+/// Returns all built-in hook types, projected from the hook metadata
+/// table.
 ///
-/// Called once during `PolicyEngine` initialization to populate the
-/// hook registry. Hosts add their own hook types after this.
+/// Derived rather than written out: a hand-maintained copy drifted from
+/// the table for months, and because nothing read it there was nothing
+/// to fail. Adding a hook to the authority extends this with no second
+/// edit.
 pub fn builtin_hook_types() -> Vec<HookType> {
-    vec![
-        // Legacy (typed payloads)
-        HookType::new("tool_pre_invoke"),
-        HookType::new("tool_post_invoke"),
-        HookType::new("prompt_pre_fetch"),
-        HookType::new("prompt_post_fetch"),
-        HookType::new("resource_pre_fetch"),
-        HookType::new("resource_post_fetch"),
-        HookType::new("identity_resolve"),
-        HookType::new("token_delegate"),
-        // CMF (MessagePayload)
-        HookType::new("cmf.tool_pre_invoke"),
-        HookType::new("cmf.tool_post_invoke"),
-        HookType::new("cmf.llm_input"),
-        HookType::new("cmf.llm_output"),
-        HookType::new("cmf.prompt_pre_fetch"),
-        HookType::new("cmf.prompt_post_fetch"),
-        HookType::new("cmf.resource_pre_fetch"),
-        HookType::new("cmf.resource_post_fetch"),
-    ]
+    crate::hooks::metadata::BUILTIN_HOOK_METADATA
+        .iter()
+        .map(|(name, _)| HookType::new(*name))
+        .collect()
 }
 
-/// Look up a hook type by name. Returns the canonical instance if
-/// it matches a built-in, otherwise creates a new custom `HookType`.
+/// Wrap a hook name, built-in or custom, in a [`HookType`].
+///
+/// `HookType` owns its string and compares by value, so a built-in name and
+/// a custom one produce equivalent values and there is nothing to canonicalize.
+/// An earlier version scanned the metadata table to return "the canonical
+/// instance", which allocated the same string either way; validating the name
+/// is [`crate::config`]'s job, not this function's.
 pub fn hook_type_from_str(name: &str) -> HookType {
     HookType::new(name)
 }
@@ -173,8 +110,8 @@ mod tests {
 
     #[test]
     fn test_hook_type_equality() {
-        let a = HookType::new("tool_pre_invoke");
-        let b = HookType::new("tool_pre_invoke");
+        let a = HookType::new("cmf.tool_pre_invoke");
+        let b = HookType::new("cmf.tool_pre_invoke");
         assert_eq!(a, b);
     }
 
@@ -191,9 +128,60 @@ mod tests {
     }
 
     #[test]
-    fn test_builtin_hook_types_count() {
-        let builtins = builtin_hook_types();
-        // 8 legacy + 8 CMF
-        assert_eq!(builtins.len(), 16);
+    fn the_enumeration_names_the_hooks_that_dispatch() {
+        // Anchored on names, not on the table's own length or key order:
+        // comparing a projection to the thing it projects cannot fail. Every
+        // name here was wrong in the hand-maintained list this replaced, so
+        // the old list would fail this test.
+        let derived: Vec<String> = builtin_hook_types()
+            .iter()
+            .map(|h| h.as_str().to_owned())
+            .collect();
+        let has = |name: &str| derived.iter().any(|d| d == name);
+        for expected in [
+            // Absent from the old list entirely.
+            "cmf.http_request",
+            "cmf.http_response",
+            "elicit",
+            // The old list spelled the prompt pair `_fetch`.
+            "cmf.prompt_pre_invoke",
+            "cmf.prompt_post_invoke",
+            // The old list spelled these with underscores.
+            "identity.resolve",
+            "token.delegate",
+        ] {
+            assert!(has(expected), "{expected} is not enumerated");
+        }
+        for gone in [
+            "tool_pre_invoke",
+            "identity_resolve",
+            "cmf.prompt_pre_fetch",
+            "cmf.prompt_post_fetch",
+        ] {
+            assert!(!has(gone), "{gone} is still enumerated");
+        }
+    }
+
+    #[test]
+    fn every_enumerated_hook_resolves_in_the_registry() {
+        // The projection and the registry are both fed by the table, so a
+        // name that enumerates but does not resolve means one of the two
+        // stopped reading it.
+        for hook in builtin_hook_types() {
+            assert!(
+                crate::hooks::lookup_hook_metadata(hook.as_str()).is_some(),
+                "{hook} is enumerated but absent from the registry",
+            );
+        }
+    }
+
+    #[test]
+    fn hook_type_from_str_wraps_builtin_and_custom_names_alike() {
+        let builtin = crate::cmf::constants::HOOK_CMF_TOOL_PRE_INVOKE;
+        assert_eq!(hook_type_from_str(builtin).as_str(), builtin);
+        assert_eq!(
+            hook_type_from_str("host.custom_hook").as_str(),
+            "host.custom_hook",
+        );
     }
 }
