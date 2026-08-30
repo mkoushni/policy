@@ -3,7 +3,7 @@
 
 // `ValkeySessionStoreFactory` — the `SessionStoreFactory` that lets the
 // praxis-policy-apl-runtime visitor build a `ValkeySessionStore` from a
-// `global.apl.session_store: { kind: valkey, ... }` block. Mirrors the
+// `global.session_store: { kind: valkey, ... }` block. Mirrors the
 // PDP factories (CelPdpFactory, CedarDirectPdpFactory).
 
 use std::sync::Arc;

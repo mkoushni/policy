@@ -6,15 +6,16 @@
 // Parses the config format that combines global settings, plugin
 // declarations, and per-entity routes into a single YAML document.
 //
-// Supports two modes controlled by `plugin_settings.routing_enabled`:
-//   - false (default, backward compatible): plugins declare their
-//     own conditions for when they fire.
-//   - true: per-entity routing rules determine which plugins fire,
-//     with plugin selection via policy groups and meta.tags.
+// Supports two dispatch modes, selected by `engine_settings.dispatch`:
+//   - `hooks` (default): each plugin declares the hooks it fires at
+//     and its own `conditions:` for when it fires.
+//   - `policy`: a policy step names the plugin it invokes, with
+//     `routes:`, `groups:`, and `global:` scoping the policy.
 //
-// The two modes are mutually exclusive. When routing is disabled,
-// the routes and global sections are ignored. When routing is
-// enabled, conditions on individual plugins are ignored.
+// The two modes are mutually exclusive and each rejects the other's
+// keys by name. Hook mode rejects `routes:`, `groups:`, `global:`, and
+// `global.defaults:`; policy mode rejects a per-plugin `conditions:`
+// and a `plugins:` activation list at any scope.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -30,65 +31,120 @@ use crate::plugin::PluginConfig;
 
 /// Top-level PPE configuration.
 ///
-/// Parsed from a single YAML file. Plugin scoping mode is controlled
-/// by `plugin_settings.routing_enabled` — if absent or false, plugins
-/// use their own `conditions:` field (backward compatible). If true,
-/// the `routes:` and `global:` sections take over.
+/// Parsed from a single YAML file. Plugin scoping is controlled by
+/// `engine_settings.dispatch` — under `policy` (the default) the `routes:`
+/// and `global:` sections decide. Under `hooks` plugins use their own
+/// `conditions:` field. Each mode rejects the other's keys at load, so a
+/// document is legal in one mode only.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PolicyConfig {
-    /// Global configuration — policies, defaults.
-    /// Only used when `plugin_settings.routing_enabled` is true.
+    /// Global configuration: always-on policy and per-entity defaults.
+    /// Requires `engine_settings.dispatch: policy`; a load error under
+    /// `hooks`, which resolves none of it.
     #[serde(default)]
     pub global: GlobalConfig,
-
-    /// Directories to scan for plugin modules.
-    #[serde(default)]
-    pub plugin_dirs: Vec<String>,
 
     /// Plugin declarations.
     #[serde(default)]
     pub plugins: Vec<PluginConfig>,
 
-    /// Named policy bundles a route can join, keyed by group name. The
-    /// canonical, top-level spelling — lines up with `global:` (always-on
-    /// defaults) and `routes:` (per-entity policy) as the third concern.
+    /// Named policy bundles a route can join, keyed by group name. The only
+    /// spelling: it lines up with `global:` (always-on defaults) and `routes:`
+    /// (per-entity policy) as the third concern.
     ///
-    /// Superset-compatible with the older `global.policies:` location, which
-    /// stays accepted as a deprecated alias: at parse time both are merged
-    /// into one bundle map (`global.policies`, the internal store the
-    /// resolvers read), with entries here winning on a name collision.
+    /// Parsing folds these into [`GlobalConfig::bundles`], the internal store
+    /// every resolver reads, so a resolver sees one map rather than a document
+    /// field and a nested one.
     #[serde(default)]
     pub groups: HashMap<String, PolicyGroup>,
 
     /// Per-entity routing rules.
-    /// Only used when `plugin_settings.routing_enabled` is true.
+    /// Requires `engine_settings.dispatch: policy`; a load error under
+    /// `hooks`, which resolves none of them.
     #[serde(default)]
     pub routes: Vec<RouteEntry>,
 
-    /// Global plugin settings (timeout, error behavior, routing mode).
+    /// Engine-wide settings (timeout, error behavior, dispatch mode).
     #[serde(default)]
-    pub plugin_settings: PluginSettings,
+    pub engine_settings: EngineSettings,
 }
 
 impl PolicyConfig {
-    /// Whether route-based plugin selection is enabled.
-    pub fn routing_enabled(&self) -> bool {
-        self.plugin_settings.routing_enabled
+    /// Which dispatch mode this configuration selects.
+    #[must_use]
+    pub fn dispatch_mode(&self) -> DispatchMode {
+        self.engine_settings.dispatch
     }
 }
 
-/// Global plugin settings.
+/// What decides which plugins fire on a request.
 ///
-/// Controls executor behavior and routing mode. All fields have
-/// sensible defaults — a missing `plugin_settings:` section is valid.
+/// The YAML spellings are `policy` and `hooks`. `policy` is the default: a
+/// config that says nothing is read as asking for the mode where a policy
+/// decides, rather than the one where every declared plugin fires on every
+/// request the hooks it declares cover.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchMode {
+    /// A policy step names the plugin it invokes. `routes:`, `groups:`, and
+    /// `global:` scope the policy, and a per-plugin `conditions:` is rejected.
+    #[default]
+    Policy,
+
+    /// Each plugin's own `conditions:` field decides when it fires, and
+    /// `routes:`, `groups:`, and `global:` are rejected.
+    Hooks,
+}
+
+impl DispatchMode {
+    /// Whether route and global policy drive dispatch.
+    #[must_use]
+    pub fn is_policy(self) -> bool {
+        matches!(self, Self::Policy)
+    }
+}
+
+/// Accept only `policy` and `hooks`, naming both when the value is anything
+/// else. A lenient parse would read a stale `dispatch: true` as a mode.
+impl<'de> Deserialize<'de> for DispatchMode {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ModeVisitor;
+
+        impl serde::de::Visitor<'_> for ModeVisitor {
+            type Value = DispatchMode;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("`policy` or `hooks`")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<DispatchMode, E> {
+                match value {
+                    "policy" => Ok(DispatchMode::Policy),
+                    "hooks" => Ok(DispatchMode::Hooks),
+                    other => Err(E::custom(format!(
+                        "unknown `dispatch` mode `{other}`, expected `policy` or `hooks`"
+                    ))),
+                }
+            }
+        }
+
+        deserializer.deserialize_str(ModeVisitor)
+    }
+}
+
+/// Engine-wide settings.
+///
+/// Controls executor behavior and the dispatch mode. All fields have
+/// sensible defaults — a missing `engine_settings:` section is valid.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PluginSettings {
-    /// Enable route-based plugin selection.
-    /// When false (default), plugins use their own `conditions:` field.
-    /// When true, the `routes:` and `global:` sections determine which
-    /// plugins fire per entity.
+pub struct EngineSettings {
+    /// What decides which plugins fire: `policy` or `hooks`. The mode
+    /// decides which half of the document is legal.
+    /// Under `policy` (the default) the `routes:` and `global:` sections
+    /// determine which plugins fire per entity. Under `hooks` plugins use
+    /// their own `conditions:` field.
     #[serde(default)]
-    pub routing_enabled: bool,
+    pub dispatch: DispatchMode,
 
     /// Default timeout per plugin in seconds.
     #[serde(default = "default_timeout")]
@@ -98,15 +154,9 @@ pub struct PluginSettings {
     #[serde(default = "default_true")]
     pub short_circuit_on_deny: bool,
 
-    /// Whether plugins can execute in parallel within a mode band.
-    #[serde(default)]
-    pub parallel_execution_within_band: bool,
-
-    /// Whether to halt the pipeline on any plugin error.
-    #[serde(default)]
-    pub fail_on_plugin_error: bool,
-
     /// Maximum number of entries in the routing cache.
+    ///
+    /// Policy mode only: hook mode resolves no routes, so nothing is cached.
     ///
     /// When the cache reaches this size, new resolutions are computed
     /// normally but not memoized — the cache rejects further inserts
@@ -119,14 +169,12 @@ pub struct PluginSettings {
     pub route_cache_max_entries: usize,
 }
 
-impl Default for PluginSettings {
+impl Default for EngineSettings {
     fn default() -> Self {
         Self {
-            routing_enabled: false,
+            dispatch: DispatchMode::Policy,
             plugin_timeout: 30,
             short_circuit_on_deny: true,
-            parallel_execution_within_band: false,
-            fail_on_plugin_error: false,
             route_cache_max_entries: default_route_cache_max_entries(),
         }
     }
@@ -146,15 +194,19 @@ fn default_true() -> bool {
 
 /// Global configuration — applies across all routes.
 ///
-/// Only used when routing is enabled. Contains named policy groups
-/// (including the reserved `all` group) and per-entity-type defaults.
+/// Policy mode only. Carries the policy bundles top-level `groups:` declares
+/// (including the reserved `all` bundle) and the per-entity-type defaults.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GlobalConfig {
-    /// Named policy groups. The reserved name `all` is applied to
-    /// every request unconditionally. Other groups are inherited
-    /// by routes via `meta.tags`.
-    #[serde(default)]
-    pub policies: HashMap<String, PolicyGroup>,
+    /// The policy bundles top-level `groups:` declares, keyed by group name.
+    /// The reserved name `all` is applied to every request unconditionally.
+    /// Other bundles are inherited by routes via `meta.tags`.
+    ///
+    /// Not a YAML key. Parsing fills it from [`PolicyConfig::groups`], so a
+    /// document declares bundles in one place and every resolver reads them
+    /// from one place.
+    #[serde(skip)]
+    pub bundles: HashMap<String, PolicyGroup>,
 
     /// Per-entity-type default policy groups. Keys are `tool`, `resource`,
     /// `prompt`, `llm`, and `http`; anything else is rejected at load, since a
@@ -164,18 +216,15 @@ pub struct GlobalConfig {
 
     /// Global authentication dispatch list (YAML key `authentication:`).
     /// Inherited by every route as the first layer of identity
-    /// resolution. Routes can append to it (additive, the default) or
-    /// replace it (with `authentication.replace_inherited: true` on the
-    /// route).
+    /// resolution. A route appends to it (additive, the default) or
+    /// replaces it with `authentication.replace_inherited: true`, and the
+    /// entity default or a tag bundle the route joins can replace it the same
+    /// way.
     ///
     /// Same YAML shape as the route-level `authentication:` block — see
-    /// `RouteEntry.identity` for the accepted forms.
-    #[serde(
-        default,
-        rename = "authentication",
-        deserialize_with = "deserialize_route_identity"
-    )]
-    pub identity: Option<crate::identity::RouteIdentityConfig>,
+    /// `RouteEntry.authentication` for the accepted forms.
+    #[serde(default, deserialize_with = "deserialize_route_identity")]
+    pub authentication: Option<crate::identity::RouteIdentityConfig>,
 }
 
 /// A named policy group — plugins to activate and optional metadata.
@@ -191,24 +240,32 @@ pub struct PolicyGroup {
     #[serde(default)]
     pub metadata: HashMap<String, String>,
 
-    /// Plugin references to activate when this group matches.
+    /// The bundle's activation list, which no mode accepts any more: policy
+    /// mode rejects the list shape, and hook mode rejects `groups:` itself. The
+    /// field is what the `plugins:` override *mapping* deserializes through, so
+    /// it stays and stays empty. A bundle-wide plugin is a `run(name)` step
+    /// under the bundle's `authorization:`.
     #[serde(default, deserialize_with = "deserialize_plugin_refs")]
     pub plugins: Vec<PluginRouteRef>,
 
-    /// Authentication dispatch list contributed by this tag bundle
-    /// (YAML key `authentication:`). Inherited by routes that carry this
-    /// tag in `meta.tags`, stacked between the global authentication
-    /// (first) and the route's own authentication (last). Same YAML shape
-    /// as the route-level `authentication:` block.
-    #[serde(
-        default,
-        rename = "authentication",
-        deserialize_with = "deserialize_route_identity"
-    )]
-    pub identity: Option<crate::identity::RouteIdentityConfig>,
+    /// Authentication dispatch list contributed by this section (YAML key
+    /// `authentication:`). Under `groups.<name>:` it is inherited by routes
+    /// carrying that tag; under `global.defaults.<entity>:` by every route of
+    /// that entity type. Either way it stacks between the global
+    /// authentication (first) and the route's own authentication (last). Same
+    /// YAML shape as the route-level `authentication:` block.
+    #[serde(default, deserialize_with = "deserialize_route_identity")]
+    pub authentication: Option<crate::identity::RouteIdentityConfig>,
 }
 
-/// A reference to a plugin in a route or policy group.
+/// A reference in a `plugins:` activation list, the shape no scope accepts any
+/// more.
+///
+/// Policy mode rejects the list at every scope that could write one, and hook
+/// mode rejects those scopes outright, so nothing fills a `Vec` of these from
+/// YAML. Kept as the deserialization target the `plugins:` override mapping
+/// folds to an empty `Vec` through, and as the type a host building a
+/// [`PolicyConfig`] in Rust still names.
 ///
 /// ```yaml
 /// plugins:
@@ -248,22 +305,18 @@ impl PluginRouteRef {
     }
 }
 
-/// Deserialize a `plugins:` field that may take either of two YAML
-/// shapes, so the `apl:` wrapper is genuinely optional everywhere.
+/// Deserialize a `plugins:` field that may take either of two YAML shapes.
 ///
 /// - A **sequence** is the structural activation list — each item is a
 ///   [`PluginRouteRef`] (bare name or single-key override map). It
-///   deserializes into the `Vec` as usual.
-/// - A **mapping** is the APL per-plugin *override* form, written
-///   directly on the section when the `apl:` wrapper is omitted (e.g.
+///   deserializes into the `Vec` as usual, and `reject_mode_conflicts` has
+///   already refused it at every scope a document can write one.
+/// - A **mapping** is the APL per-plugin *override* form (e.g.
 ///   `plugins: { audit: { on_error: ignore } }`). It is **not** a
 ///   structural activation list: the override map is consumed
 ///   separately by the APL visitor straight from the raw YAML, so here
-///   it deserializes to an empty `Vec`. This mirrors the explicit
-///   `apl: { plugins: {...} }` wrapper form, where the map never
-///   reaches this field at all — keeping the two forms behaviorally
-///   identical (the map supplies overrides; policy steps still do the
-///   activating).
+///   it deserializes to an empty `Vec`. The map supplies overrides;
+///   policy steps still do the activating.
 ///
 /// Null / absent → empty `Vec` (same as `#[serde(default)]`).
 fn deserialize_plugin_refs<'de, D>(deserializer: D) -> Result<Vec<PluginRouteRef>, D::Error>
@@ -313,8 +366,8 @@ pub struct RouteEntry {
     pub llm: Option<StringOrList>,
 
     /// Match generic HTTP requests by path, and optionally by method.
-    /// Requires `plugin_settings.routing_enabled: true`, which defaults to
-    /// false and leaves the route inert until it is set, like every other
+    /// Requires `engine_settings.dispatch: policy`, which is not the
+    /// default, so the route stays inert until it is set, like every other
     /// route selector. See [`HttpSelector`] for the three shapes.
     #[serde(default)]
     pub http: Option<HttpSelector>,
@@ -340,22 +393,19 @@ pub struct RouteEntry {
     #[serde(default)]
     pub groups: Option<StringOrList>,
 
-    /// Conditional match expression — carried but not evaluated
-    /// during static resolution. Evaluated at runtime when payload
-    /// data is available (future: APL evaluator).
-    #[serde(default)]
-    pub when: Option<String>,
-
-    /// Plugin references to activate for this route.
+    /// The route's activation list, which no mode accepts any more: policy mode
+    /// rejects the list shape, and hook mode rejects `routes:` itself. The field
+    /// is what the `plugins:` override *mapping* deserializes through, so it
+    /// stays and stays empty. A route's plugin is a `run(name)` step under the
+    /// route's `authorization:`.
     #[serde(default, deserialize_with = "deserialize_plugin_refs")]
     pub plugins: Vec<PluginRouteRef>,
 
     /// Authentication dispatch list for this route (YAML key
     /// `authentication:`). **Hook-specific**: applies ONLY to the
-    /// `identity.resolve` hook, independent of the `plugins:` block above
-    /// (which is hook-agnostic and means different things depending on
-    /// whether APL is annotating the route — `authentication:` always
-    /// means "these plugins fire on identity.resolve in this order").
+    /// `identity.resolve` hook. The one structural dispatch list policy mode
+    /// keeps, now that the `plugins:` activation list above is gone: it always
+    /// means "these plugins fire on identity.resolve in this order".
     ///
     /// Accepts two YAML shapes; both deserialize to the same IR.
     /// See `crate::identity::route_config::RouteIdentityConfig`.
@@ -372,20 +422,16 @@ pub struct RouteEntry {
     ///   steps:
     ///     - legacy-basic-auth
     /// ```
-    #[serde(
-        default,
-        rename = "authentication",
-        deserialize_with = "deserialize_route_identity"
-    )]
-    pub identity: Option<crate::identity::RouteIdentityConfig>,
+    #[serde(default, deserialize_with = "deserialize_route_identity")]
+    pub authentication: Option<crate::identity::RouteIdentityConfig>,
 }
 
 /// Deserialize the `authentication:` block in a `RouteEntry`. Accepts either a YAML
 /// list (treated as additive — `replace_inherited: false`) or a
 /// YAML map with `replace_inherited: bool?` + `steps: [...]`. Each
 /// step is either a bare plugin name (string) or a map with
-/// `name:` + optional `on_error:` / `config:`. Produces friendlier
-/// error messages than `#[serde(untagged)]` would.
+/// `name:` + optional `config:`. Produces friendlier error messages
+/// than `#[serde(untagged)]` would.
 fn deserialize_route_identity<'de, D>(
     deserializer: D,
 ) -> Result<Option<crate::identity::RouteIdentityConfig>, D::Error>
@@ -409,7 +455,7 @@ where
             let replace_inherited =
                 match map.get(serde_yaml::Value::String("replace_inherited".to_owned())) {
                     Some(v) => v.as_bool().ok_or_else(|| {
-                        D::Error::custom("`identity.replace_inherited` must be a boolean")
+                        D::Error::custom("`authentication.replace_inherited` must be a boolean")
                     })?,
                     None => false,
                 };
@@ -446,9 +492,11 @@ where
     }))
 }
 
-/// Parse one identity step from raw YAML. Accepts either a bare
-/// plugin name (string) or a map with `name:` + optional
-/// `on_error:` / `config:` (and any forward-compat extras).
+/// Parse one authentication step from raw YAML. Accepts either a bare
+/// plugin name (string) or a map with `name:` + optional `config:`.
+///
+/// The map form carries a closed key set. It used to flatten anything else
+/// into a forward-compat bag, which swallowed a typo and a removed key alike.
 fn parse_identity_step(
     raw: serde_yaml::Value,
     index: usize,
@@ -459,7 +507,7 @@ fn parse_identity_step(
         serde_yaml::Value::String(name) => {
             if name.is_empty() {
                 return Err(format!(
-                    "identity step [{index}] plugin name cannot be empty"
+                    "authentication step [{index}] plugin name cannot be empty"
                 ));
             }
             Ok(RouteIdentityStep {
@@ -467,38 +515,42 @@ fn parse_identity_step(
                 ..Default::default()
             })
         },
-        serde_yaml::Value::Mapping(_) => {
-            // Lean on serde's derived Deserialize for the map shape —
-            // `RouteIdentityStep` already handles `name` / `on_error` /
-            // `config_override` and flattens extras into `extra`.
-            // Translate the operator-facing key `config` → IR field
+        serde_yaml::Value::Mapping(map) => {
+            let unknown = unknown_keys_in(ConfigScope::AuthenticationStep, &map, &[]);
+            if !unknown.is_empty() {
+                return Err(format!(
+                    "authentication step [{index}] has {}",
+                    unknown_keys_message(ConfigScope::AuthenticationStep, &unknown)
+                ));
+            }
+            // Lean on serde's derived Deserialize for the map shape, and
+            // translate the operator-facing key `config` to the IR field
             // `config_override` (the IR uses a more explicit name to
             // distinguish from the plugin's runtime config).
+            // `deny_unknown_fields` keeps this shape from drifting away from
+            // the table above, which is what reports a bad key.
             #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
             struct StepYaml {
                 name: String,
                 #[serde(default)]
-                on_error: Option<String>,
-                #[serde(default)]
                 config: Option<serde_json::Value>,
-                #[serde(default, flatten)]
-                extra: std::collections::HashMap<String, serde_json::Value>,
             }
-            let parsed: StepYaml =
-                serde_yaml::from_value(raw).map_err(|e| format!("identity step [{index}]: {e}"))?;
+            let parsed: StepYaml = serde_yaml::from_value(serde_yaml::Value::Mapping(map))
+                .map_err(|e| format!("authentication step [{index}]: {e}"))?;
             if parsed.name.is_empty() {
-                return Err(format!("identity step [{index}] `name:` cannot be empty"));
+                return Err(format!(
+                    "authentication step [{index}] `name:` cannot be empty"
+                ));
             }
             Ok(RouteIdentityStep {
                 name: parsed.name,
                 config_override: parsed.config,
-                on_error: parsed.on_error,
-                extra: parsed.extra,
             })
         },
         _ => Err(format!(
-            "identity step [{index}] must be a plugin name (string) or a map \
-             with `name:` (and optional `on_error:` / `config:`)"
+            "authentication step [{index}] must be a plugin name (string) or a \
+             map with `name:` (and optional `config:`)"
         )),
     }
 }
@@ -638,8 +690,8 @@ impl StringOrList {
 /// reuse [`Pattern`]: the segment-boundary reading is the host router's, and a
 /// glob dialect here would disagree with it.
 ///
-/// Nothing here resolves until `plugin_settings.routing_enabled: true` is set.
-/// It defaults to false, and an `http:` route declared without it is reported
+/// Nothing here resolves until `engine_settings.dispatch: policy` is set.
+/// It is not the default, and an `http:` route declared without it is reported
 /// at load rather than left to be discovered.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
@@ -918,171 +970,509 @@ pub fn load_config(path: &Path) -> Result<PolicyConfig, Box<PluginError>> {
 /// Parse a PPE config from a YAML string.
 /// # Errors
 ///
-/// Returns `PluginError::Config` when the YAML does not deserialize, when it
-/// carries a renamed legacy key, and when a route carries a key nothing reads.
-/// Those two are rejected rather than ignored: an unknown field is dropped
-/// silently, so a stale `identity:` block would leave its authentication steps
-/// unrun and a misspelled selector would leave a route matching nothing, both
-/// of which fail open.
+/// Returns `PluginError::Config` when the YAML does not deserialize, and when
+/// the document, a route, or a section above it carries a key nothing reads.
+/// An unrecognized key is rejected rather than ignored: the typed parse drops
+/// one silently, so a stale `identity:` block would leave its authentication
+/// steps unrun and a misspelled selector would leave a route matching nothing,
+/// both of which fail open.
 pub fn parse_config(yaml: &str) -> Result<PolicyConfig, Box<PluginError>> {
-    // Scan the raw YAML for renamed legacy keys before the typed parse:
-    // `RouteEntry` / `GlobalConfig` / `PolicyGroup` silently ignore unknown
-    // fields, so a stale `identity:` would otherwise be dropped and its
-    // authentication steps never run — a fail-open.
+    // Every key check runs on the raw YAML, before the typed parse: the config
+    // structs drop an unknown field, so a removed `policy:` block would
+    // otherwise vanish and leave no authorization enforced, a fail-open.
     let raw: serde_yaml::Value = serde_yaml::from_str(yaml).map_err(|e| PluginError::Config {
         message: format!("failed to parse config YAML: {e}"),
     })?;
-    reject_renamed_identity_key(&raw)?;
+    reject_unknown_document_keys(&raw)?;
+    reject_unknown_engine_settings_keys(&raw)?;
     // No visitor is registered on this path, so only praxis-policy-core's own
     // route keys are accepted. A host whose visitor reads route keys of its
     // own loads through `PolicyEngine::load_config_yaml`, which unions them in.
     reject_unknown_route_keys(&raw, &[])?;
+    reject_unknown_section_keys(&raw, &[])?;
+    reject_mode_conflicts(&raw)?;
     let mut config: PolicyConfig =
         serde_yaml::from_value(raw).map_err(|e| PluginError::Config {
             message: format!("failed to parse config YAML: {e}"),
         })?;
-    merge_groups_into_policies(&mut config);
+    fold_groups_into_bundles(&mut config);
     validate_config(&config)?;
     Ok(config)
 }
 
-/// Fold the canonical top-level `groups:` bundles into the internal
-/// `global.policies` map (the deprecated alias location), so every resolver
-/// can keep reading a single map. Top-level entries win on a name collision
-/// — the canonical spelling takes precedence over the deprecated one.
-pub(crate) fn merge_groups_into_policies(config: &mut PolicyConfig) {
+/// Move the top-level `groups:` bundles into [`GlobalConfig::bundles`], the
+/// internal store every resolver reads.
+///
+/// `groups:` is the only YAML input, so the two-sided merge this used to
+/// perform is gone. It extends rather than assigns because the store is a public
+/// field: a host that built its `PolicyConfig` in Rust and filled the store
+/// directly keeps what it put there, and a name declared on both sides resolves
+/// to `groups:`.
+pub(crate) fn fold_groups_into_bundles(config: &mut PolicyConfig) {
     if config.groups.is_empty() {
         return;
     }
-    for (name, group) in std::mem::take(&mut config.groups) {
-        config.global.policies.insert(name, group);
+    config
+        .global
+        .bundles
+        .extend(std::mem::take(&mut config.groups));
+}
+
+/// The removed config keys, mapped to what to write instead.
+///
+/// The key sets are closed, so every one of these is already rejected as an
+/// unknown key. This table is what turns that rejection into guidance: the
+/// unknown-key error names the replacement spelling for a key that has one,
+/// and says nothing extra for a key that never worked. Each replacement is
+/// written as a phrase, backticks included, because several of them are more
+/// than one spelling.
+const REPLACED_KEYS: [(&str, &str); 10] = [
+    ("policy", "`authorization.pre_invocation`"),
+    ("post_policy", "`authorization.post_invocation`"),
+    ("identity", "`authentication`"),
+    ("policies", "the top-level `groups:` block"),
+    (
+        "plugin_settings",
+        "`engine_settings`, whose `routing_enabled: true` is now `dispatch: policy`",
+    ),
+    ("when", "a `when:` / `do:` step under `authorization:`"),
+    (
+        "plugin_dirs",
+        "`register_factory()` plus a declaration in the `plugins:` block",
+    ),
+    (
+        "parallel_execution_within_band",
+        "`mode: concurrent` on the individual plugin",
+    ),
+    (
+        "fail_on_plugin_error",
+        "`on_error: fail` on the individual plugin",
+    ),
+    (
+        "on_error",
+        "the `on_error:` of the plugin's own `plugins:` declaration",
+    ),
+];
+
+/// What replaced `key`, or `None` when nothing did.
+fn replacement_for(key: &str) -> Option<&'static str> {
+    REPLACED_KEYS
+        .iter()
+        .find_map(|(old, new)| (*old == key).then_some(*new))
+}
+
+/// What a config key is for.
+///
+/// The role decides how an entry is used, not just whether the key is
+/// accepted. The APL runtime assembles a section's synthetic policy block from
+/// the policy-language keys alone, so a table that recorded only scope and
+/// owner would have it copying structural keys into the block it hands the
+/// compiler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyRole {
+    /// A typed field of the scope's own struct, or a block praxis-policy-core
+    /// carries for another crate to model.
+    Structural,
+
+    /// A policy-language term, compiled by praxis-policy-apl-core.
+    AplTerm,
+
+    /// PPE wiring: PDPs, the session store, attribute files. Only the
+    /// top-level `global:` block acts on these; elsewhere they are inert.
+    EngineWiring,
+
+    /// Accepted in two shapes with a different role in each, so the value
+    /// decides. `plugins:` is the only one: a mapping carries per-plugin APL
+    /// overrides, and a sequence is the activation list `reject_mode_conflicts`
+    /// refuses.
+    ShapeConditional,
+}
+
+/// Which crate reads a config key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyOwner {
+    /// praxis-policy-core's typed config model.
+    Core,
+
+    /// The APL runtime: its visitor, its compiler, or both.
+    Apl,
+
+    /// Both crates, one shape each.
+    Shared,
+}
+
+/// One accepted config key: its spelling, what it is for, and who reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigKey {
+    /// The YAML spelling.
+    pub name: &'static str,
+
+    /// What the key is for.
+    pub role: KeyRole,
+
+    /// Which crate reads it.
+    pub owner: KeyOwner,
+}
+
+const fn structural_key(name: &'static str, owner: KeyOwner) -> ConfigKey {
+    ConfigKey {
+        name,
+        role: KeyRole::Structural,
+        owner,
     }
 }
 
-/// Reject the pre-rename `identity:` key (now `authentication:`) at every
-/// scope it could appear — `global`, `global.policies.<name>`,
-/// `global.defaults.<name>`, and each `routes[]` entry — so a stale config
-/// fails loudly rather than silently dropping its authentication steps.
-pub(crate) fn reject_renamed_identity_key(raw: &serde_yaml::Value) -> Result<(), Box<PluginError>> {
-    fn renamed(scope: &str) -> Box<PluginError> {
-        Box::new(PluginError::Config {
-            message: format!(
-                "in `{scope}`: config field `identity` was renamed to `authentication` — update your config"
+const fn apl_term_key(name: &'static str) -> ConfigKey {
+    ConfigKey {
+        name,
+        role: KeyRole::AplTerm,
+        owner: KeyOwner::Apl,
+    }
+}
+
+const fn wiring_key(name: &'static str) -> ConfigKey {
+    ConfigKey {
+        name,
+        role: KeyRole::EngineWiring,
+        owner: KeyOwner::Apl,
+    }
+}
+
+const fn shape_conditional_key(name: &'static str) -> ConfigKey {
+    ConfigKey {
+        name,
+        role: KeyRole::ShapeConditional,
+        owner: KeyOwner::Shared,
+    }
+}
+
+/// The authorization term a section accepts, in the order a synthetic policy
+/// block copies it.
+///
+/// A section is `global:`, `global.defaults.<entity>:`, `groups.<name>:`, or a
+/// `routes[]` entry, and every one of them accepts it, so this is one table the
+/// scope tables share rather than four copies that can drift. `authorization`
+/// is the `{ pre_invocation, post_invocation }` form and the only place the two
+/// phase lists appear; praxis-policy-apl-core un-nests it, so the nesting lives
+/// in exactly one place.
+const SECTION_APL_KEYS: &[ConfigKey] = &[apl_term_key("authorization")];
+
+/// The field pipeline terms, accepted on every section but `global:`.
+///
+/// A field pipeline names one field of the payload a route carries, so the
+/// scope has to reach a payload for the name to mean anything. `global:` covers
+/// every entity route at once and has no payload of its own, which is why it
+/// takes neither.
+const FIELD_STAGE_KEYS: &[ConfigKey] = &[apl_term_key("args"), apl_term_key("result")];
+
+/// The engine wiring keys, accepted under `global:` and nowhere else. A PDP,
+/// the session store, and the static attribute tree are process-global, so a
+/// declaration at another scope is a load error rather than a warning.
+///
+/// They travel with [`SECTION_APL_KEYS`] into a section's policy block because
+/// that block is where the APL visitor reads them from; it strips them again
+/// before the policy compiler sees them.
+const GLOBAL_WIRING_KEYS: &[ConfigKey] = &[
+    wiring_key("pdp"),
+    wiring_key("session_store"),
+    wiring_key("attribute_files"),
+];
+
+/// The keys a config document carries at top level, the [`PolicyConfig`]
+/// fields.
+const DOCUMENT_KEYS: &[ConfigKey] = &[
+    structural_key("global", KeyOwner::Core),
+    structural_key("plugins", KeyOwner::Core),
+    structural_key("groups", KeyOwner::Core),
+    structural_key("routes", KeyOwner::Core),
+    structural_key("engine_settings", KeyOwner::Core),
+];
+
+/// The structural keys the `global:` block carries, the [`GlobalConfig`] fields
+/// plus the `response:` block the APL runtime reads out of band.
+const GLOBAL_STRUCTURAL_KEYS: &[ConfigKey] = &[
+    structural_key("defaults", KeyOwner::Core),
+    structural_key("authentication", KeyOwner::Core),
+    structural_key("response", KeyOwner::Apl),
+];
+
+/// The structural keys a policy bundle carries, the [`PolicyGroup`] fields plus
+/// the `response:` block the APL runtime reads out of band.
+///
+/// Shared by two scopes because both deserialize to `PolicyGroup`:
+/// `groups.<name>:` and `global.defaults.<entity>:`. A unit that needs the two
+/// to differ splits the table.
+const BUNDLE_STRUCTURAL_KEYS: &[ConfigKey] = &[
+    structural_key("description", KeyOwner::Core),
+    structural_key("metadata", KeyOwner::Core),
+    shape_conditional_key("plugins"),
+    structural_key("authentication", KeyOwner::Core),
+    structural_key("response", KeyOwner::Apl),
+];
+
+/// The structural keys a `routes[]` entry carries, the [`RouteEntry`] fields
+/// plus the `response:` block the APL runtime reads out of band.
+///
+/// Larger than the typed fields on purpose: a route shares its mapping with
+/// the orchestrator blocks the typed struct deliberately ignores, so
+/// `deny_unknown_fields` would reject every APL-annotated route in the tree.
+/// The policy terms and `response:` are those blocks.
+const ROUTE_STRUCTURAL_KEYS: &[ConfigKey] = &[
+    structural_key("tool", KeyOwner::Core),
+    structural_key("resource", KeyOwner::Core),
+    structural_key("prompt", KeyOwner::Core),
+    structural_key("llm", KeyOwner::Core),
+    structural_key("http", KeyOwner::Core),
+    structural_key("meta", KeyOwner::Core),
+    structural_key("groups", KeyOwner::Core),
+    shape_conditional_key("plugins"),
+    structural_key("authentication", KeyOwner::Core),
+    structural_key("response", KeyOwner::Apl),
+];
+
+/// The keys the `engine_settings:` block carries, the [`EngineSettings`] fields.
+///
+/// [`EngineSettings`] drops an unknown field, so a setting the runtime never
+/// honored used to load clean and warn. The table is what makes it a load error
+/// naming its per-plugin replacement.
+const ENGINE_SETTINGS_KEYS: &[ConfigKey] = &[
+    structural_key("dispatch", KeyOwner::Core),
+    structural_key("plugin_timeout", KeyOwner::Core),
+    structural_key("short_circuit_on_deny", KeyOwner::Core),
+    structural_key("route_cache_max_entries", KeyOwner::Core),
+];
+
+/// The keys one map-form step of an `authentication:` block carries.
+///
+/// A step used to flatten every other key into a forward-compat bag, so a typo
+/// and a removed `on_error:` both vanished into it. The step's failure handling
+/// is the plugin declaration's, not the step's.
+const AUTHENTICATION_STEP_KEYS: &[ConfigKey] = &[
+    structural_key("name", KeyOwner::Core),
+    structural_key("config", KeyOwner::Core),
+];
+
+/// A config scope: one mapping shape the loader reads, with one key table each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigScope {
+    /// The document itself, a [`PolicyConfig`].
+    Document,
+
+    /// The top-level `global:` block.
+    Global,
+
+    /// One `global.defaults.<entity>:` block.
+    EntityDefault,
+
+    /// One `groups.<name>:` bundle.
+    Group,
+
+    /// One `routes[]` entry.
+    Route,
+
+    /// The top-level `engine_settings:` block.
+    EngineSettings,
+
+    /// One map-form step of an `authentication:` block, at any scope.
+    AuthenticationStep,
+}
+
+impl ConfigScope {
+    /// Every scope, for a walk over the whole key model.
+    pub const ALL: [Self; 7] = [
+        Self::Document,
+        Self::Global,
+        Self::EntityDefault,
+        Self::Group,
+        Self::Route,
+        Self::EngineSettings,
+        Self::AuthenticationStep,
+    ];
+
+    /// The scope's YAML path, for a diagnostic.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Document => "(document)",
+            Self::Global => "global",
+            Self::EntityDefault => "global.defaults.<entity>",
+            Self::Group => "groups.<name>",
+            Self::Route => "routes[]",
+            Self::EngineSettings => "engine_settings",
+            Self::AuthenticationStep => "an authentication step",
+        }
+    }
+
+    /// The keys this scope accepts: its structural keys, then the shared
+    /// authorization term, then the field pipeline terms every scope but
+    /// `global:` takes, then the wiring keys `global:` alone carries.
+    ///
+    /// Every scope is enforced, by the checks [`parse_config`] runs.
+    pub fn keys(self) -> impl Iterator<Item = &'static ConfigKey> {
+        type Table = &'static [ConfigKey];
+        let (structural, terms, fields, wiring): (Table, Table, Table, Table) = match self {
+            Self::Document => (DOCUMENT_KEYS, &[], &[], &[]),
+            Self::Global => (
+                GLOBAL_STRUCTURAL_KEYS,
+                SECTION_APL_KEYS,
+                &[],
+                GLOBAL_WIRING_KEYS,
             ),
-        })
+            Self::EntityDefault | Self::Group => (
+                BUNDLE_STRUCTURAL_KEYS,
+                SECTION_APL_KEYS,
+                FIELD_STAGE_KEYS,
+                &[],
+            ),
+            Self::Route => (
+                ROUTE_STRUCTURAL_KEYS,
+                SECTION_APL_KEYS,
+                FIELD_STAGE_KEYS,
+                &[],
+            ),
+            Self::EngineSettings => (ENGINE_SETTINGS_KEYS, &[], &[], &[]),
+            Self::AuthenticationStep => (AUTHENTICATION_STEP_KEYS, &[], &[], &[]),
+        };
+        structural.iter().chain(terms).chain(fields).chain(wiring)
     }
-    if let Some(global) = raw.get("global") {
-        if global.get("identity").is_some() {
-            return Err(renamed("global"));
-        }
-        for section in ["policies", "defaults"] {
-            if let Some(map) = global.get(section).and_then(|m| m.as_mapping()) {
-                for (name, group) in map {
-                    if group.get("identity").is_some() {
-                        let n = name.as_str().unwrap_or("?");
-                        return Err(renamed(&format!("global.{section}.{n}")));
-                    }
-                }
-            }
-        }
-    }
-    // Same guard for the canonical top-level `groups:` bundle location.
-    if let Some(map) = raw.get("groups").and_then(|m| m.as_mapping()) {
-        for (name, group) in map {
-            if group.get("identity").is_some() {
-                let n = name.as_str().unwrap_or("?");
-                return Err(renamed(&format!("groups.{n}")));
-            }
-        }
-    }
-    if let Some(routes) = raw.get("routes").and_then(|r| r.as_sequence()) {
-        for (i, route) in routes.iter().enumerate() {
-            if route.get("identity").is_some() {
-                return Err(renamed(&format!("routes[{i}]")));
-            }
-        }
-    }
-    Ok(())
 }
 
-/// Legacy APL config keys, mapped to their replacements.
+/// The keys a section's synthetic policy block copies verbatim, in the order it
+/// copies them: the policy terms plus the wiring keys, which the APL visitor
+/// reads out of that block at `global:` scope.
 ///
-/// The one table for these names. A parse that meets an unrecognized key drops
-/// it, and a dropped `policy:` block leaves no authorization enforced, so every
-/// scope that reads route or policy YAML rejects these loudly rather than
-/// letting one through unread.
-pub const RENAMED_APL_KEYS: [(&str, &str); 2] = [
-    (
-        "policy",
-        "authorization.pre_invocation (or flat pre_invocation)",
-    ),
-    (
-        "post_policy",
-        "authorization.post_invocation (or flat post_invocation)",
-    ),
-];
-
-/// The rename message for a legacy APL key written directly in `yaml`, or
-/// `None` when it carries none. Shared so every scope that checks reports the
-/// rename in the same words.
-#[must_use]
-pub fn renamed_apl_key_message(scope: &str, yaml: &serde_yaml::Value) -> Option<String> {
-    let map = yaml.as_mapping()?;
-    RENAMED_APL_KEYS.iter().find_map(|(old, new)| {
-        map.contains_key(serde_yaml::Value::String((*old).to_owned()))
-            .then(|| {
-                format!(
-                    "in `{scope}`: config field `{old}` was renamed to `{new}` — update your config"
-                )
-            })
-    })
+/// This is the constructive set, not an accept set. It is the union over the
+/// section scopes, so it lists the field pipeline terms `global:` itself
+/// rejects. `response:` is absent because it is a sibling of the policy terms
+/// rather than one of them, and `plugins:` is absent because only its mapping
+/// shape belongs in the block, which the caller decides from the value.
+pub fn section_apl_block_keys() -> impl Iterator<Item = &'static ConfigKey> {
+    SECTION_APL_KEYS
+        .iter()
+        .chain(FIELD_STAGE_KEYS)
+        .chain(GLOBAL_WIRING_KEYS)
 }
 
-/// The route keys a configuration may carry.
+/// The engine wiring keys the top-level `global:` block carries. Read from a
+/// section's policy block, and stripped from it before the policy compiler runs.
+pub fn global_wiring_keys() -> impl Iterator<Item = &'static ConfigKey> {
+    GLOBAL_WIRING_KEYS.iter()
+}
+
+/// The keys in `map` that `scope` does not accept, in declaration order.
 ///
-/// Larger than [`RouteEntry`]'s typed fields on purpose: a route shares its
-/// mapping with the orchestrator blocks the typed struct deliberately ignores,
-/// so `deny_unknown_fields` would reject every APL-annotated route in the tree.
-/// `apl:` and `response:` are those blocks; the rest are the APL terms an
-/// operator may write flat on the route with no `apl:` wrapper.
-const KNOWN_ROUTE_KEYS: &[&str] = &[
-    // Typed `RouteEntry` fields.
-    "tool",
-    "resource",
-    "prompt",
-    "llm",
-    "http",
-    "meta",
-    "groups",
-    "when",
-    "plugins",
-    "authentication",
-    // Orchestrator blocks praxis-policy-core carries but does not model.
-    "apl",
-    "response",
-    // APL terms accepted flat on a route, without the `apl:` wrapper.
-    "pre_invocation",
-    "post_invocation",
-    "authorization",
-    "args",
-    "result",
-    "pdp",
-    "session_store",
-];
+/// A non-string key is left to the typed parse to report; every scope here
+/// deserializes to a struct, so a non-string key fails there with a better
+/// message than this check could give.
+fn unknown_keys_in<'a>(
+    scope: ConfigScope,
+    map: &'a serde_yaml::Mapping,
+    extra: &[&str],
+) -> Vec<&'a str> {
+    map.keys()
+        .filter_map(serde_yaml::Value::as_str)
+        .filter(|key| !scope.keys().any(|known| known.name == *key) && !extra.contains(key))
+        .collect()
+}
+
+/// The tail of an unknown-key error: the keys, then what the scope accepts,
+/// then the replacement for each key that has one.
+///
+/// Shared so a route and a section report a typo in the same words. The
+/// replacement clauses are what a removed key gets over a misspelled one: the
+/// closed key set makes both loud, and [`REPLACED_KEYS`] is what still says
+/// where the removed one's contents belong.
+fn unknown_keys_message(scope: ConfigScope, unknown: &[&str]) -> String {
+    let label = if unknown.len() == 1 { "key" } else { "keys" };
+    let mut message = format!(
+        "unknown {label} `{}`; {} accepts {}",
+        unknown.join("`, `"),
+        scope.label(),
+        scope
+            .keys()
+            .map(|known| known.name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    for key in unknown {
+        if let Some(replacement) = replacement_for(key) {
+            message.push_str(&format!(". `{key}` was replaced by {replacement}"));
+        }
+    }
+    message
+}
+
+/// Reject the top-level keys nothing reads, naming every one of them.
+///
+/// The accept set is [`ConfigScope::Document`]'s table. [`PolicyConfig`] drops
+/// an unknown field, so a stale `plugin_settings:` used to load clean with every
+/// engine setting discarded, `dispatch:` included, leaving the config in the
+/// default mode rather than the one it declared.
+///
+/// # Errors
+///
+/// Returns `PluginError::Config` naming every unrecognized top-level key.
+pub(crate) fn reject_unknown_document_keys(
+    raw: &serde_yaml::Value,
+) -> Result<(), Box<PluginError>> {
+    let Some(map) = raw.as_mapping() else {
+        return Ok(()); // Shape is the typed parse's to report.
+    };
+    let unknown = unknown_keys_in(ConfigScope::Document, map, &[]);
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    Err(Box::new(PluginError::Config {
+        message: format!(
+            "config document has {}",
+            unknown_keys_message(ConfigScope::Document, &unknown)
+        ),
+    }))
+}
+
+/// Reject the `engine_settings:` keys nothing reads, naming every one of them.
+///
+/// The accept set is [`ConfigScope::EngineSettings`]'s table. [`EngineSettings`]
+/// drops an unknown field, so a setting the runtime never honored loaded clean
+/// and left an operator to read a warning for the behavior they asked for and
+/// did not get.
+///
+/// # Errors
+///
+/// Returns `PluginError::Config` naming every unrecognized key in the block.
+pub(crate) fn reject_unknown_engine_settings_keys(
+    raw: &serde_yaml::Value,
+) -> Result<(), Box<PluginError>> {
+    let Some(map) = raw
+        .get("engine_settings")
+        .and_then(serde_yaml::Value::as_mapping)
+    else {
+        return Ok(()); // Absent, or a shape the typed parse reports.
+    };
+    let unknown = unknown_keys_in(ConfigScope::EngineSettings, map, &[]);
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    Err(Box::new(PluginError::Config {
+        message: format!(
+            "`engine_settings` has {}",
+            unknown_keys_message(ConfigScope::EngineSettings, &unknown)
+        ),
+    }))
+}
 
 /// Reject the route keys nothing reads, naming every one of them and the route.
 ///
-/// An unknown field is dropped by the typed parse, so a misspelled selector
-/// used to load clean and leave the route matching nothing. A key from
-/// [`RENAMED_APL_KEYS`] gets the rename message instead, since that is the more
-/// specific answer, so that check runs first. `extra_route_keys` carries the
-/// keys registered visitors consume, so a host orchestrator reading a key
+/// The accept set is [`ConfigScope::Route`]'s table. An unknown field is
+/// dropped by the typed parse, so a misspelled selector used to load clean and
+/// leave the route matching nothing. `extra_route_keys` carries the keys
+/// registered visitors consume, so a host orchestrator reading a key
 /// praxis-policy-core has never heard of stays loadable.
 ///
 /// # Errors
 ///
-/// Returns `PluginError::Config` naming the renamed key, or every unrecognized
-/// key on the first route carrying one, with that route's index.
+/// Returns `PluginError::Config` naming every unrecognized key on the first
+/// route carrying one, with that route's index.
 pub(crate) fn reject_unknown_route_keys(
     raw: &serde_yaml::Value,
     extra_route_keys: &[&str],
@@ -1094,36 +1484,87 @@ pub(crate) fn reject_unknown_route_keys(
         let Some(map) = route.as_mapping() else {
             continue; // Shape is the typed parse's to report.
         };
-        // A renamed key is also an unrecognized one, so this runs first or the
-        // operator gets sent hunting a typo instead of performing a rename.
-        if let Some(message) = renamed_apl_key_message(&format!("routes[{i}]"), route) {
-            return Err(Box::new(PluginError::Config { message }));
+        if map.keys().any(|key| key.as_str().is_none()) {
+            return Err(Box::new(PluginError::Config {
+                message: format!("route {i} has a key that is not a string"),
+            }));
         }
-        let mut unknown: Vec<&str> = Vec::new();
-        for key in map.keys() {
-            let Some(key) = key.as_str() else {
-                return Err(Box::new(PluginError::Config {
-                    message: format!("route {i} has a key that is not a string"),
-                }));
-            };
-            if KNOWN_ROUTE_KEYS.contains(&key) || extra_route_keys.contains(&key) {
-                continue;
-            }
-            unknown.push(key);
-        }
+        let unknown = unknown_keys_in(ConfigScope::Route, map, extra_route_keys);
         if !unknown.is_empty() {
             // Every bad key at once: one load reports the whole list rather
             // than one key per attempt.
-            let label = if unknown.len() == 1 { "key" } else { "keys" };
             return Err(Box::new(PluginError::Config {
                 message: format!(
-                    "route {i} has unknown {label} `{}`; a route accepts {}",
-                    unknown.join("`, `"),
-                    KNOWN_ROUTE_KEYS.join(", ")
+                    "route {i} has {}",
+                    unknown_keys_message(ConfigScope::Route, &unknown)
                 ),
             }));
         }
     }
+    Ok(())
+}
+
+/// Reject the keys nothing reads in the sections above a route: `global:`, each
+/// `global.defaults.<entity>:`, and each bundle under `groups:`.
+///
+/// The same fail-open as a route's: [`GlobalConfig`] and [`PolicyGroup`] drop an
+/// unknown field, so a misspelled `authorizaton:` at global scope left every
+/// route unguarded and reported nothing. `extra_keys` carries the keys
+/// registered visitors consume, the same list a route accepts, so an
+/// orchestrator's own block stays loadable wherever it writes it.
+///
+/// # Errors
+///
+/// Returns `PluginError::Config` naming every unrecognized key in the first
+/// section carrying one, with that section's path.
+pub(crate) fn reject_unknown_section_keys(
+    raw: &serde_yaml::Value,
+    extra_keys: &[&str],
+) -> Result<(), Box<PluginError>> {
+    fn check(
+        path: &str,
+        scope: ConfigScope,
+        yaml: &serde_yaml::Value,
+        extra: &[&str],
+    ) -> Result<(), Box<PluginError>> {
+        let Some(map) = yaml.as_mapping() else {
+            return Ok(()); // Shape is the typed parse's to report.
+        };
+        let unknown = unknown_keys_in(scope, map, extra);
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        Err(Box::new(PluginError::Config {
+            message: format!("`{path}` has {}", unknown_keys_message(scope, &unknown)),
+        }))
+    }
+
+    fn check_bundles(
+        prefix: &str,
+        scope: ConfigScope,
+        bundles: Option<&serde_yaml::Value>,
+        extra: &[&str],
+    ) -> Result<(), Box<PluginError>> {
+        let Some(map) = bundles.and_then(serde_yaml::Value::as_mapping) else {
+            return Ok(());
+        };
+        for (name, bundle) in map {
+            let name = name.as_str().unwrap_or("?");
+            check(&format!("{prefix}.{name}"), scope, bundle, extra)?;
+        }
+        Ok(())
+    }
+
+    if let Some(global) = raw.get("global") {
+        check("global", ConfigScope::Global, global, extra_keys)?;
+        check_bundles(
+            "global.defaults",
+            ConfigScope::EntityDefault,
+            global.get("defaults"),
+            extra_keys,
+        )?;
+    }
+    check_bundles("groups", ConfigScope::Group, raw.get("groups"), extra_keys)?;
     Ok(())
 }
 
@@ -1146,6 +1587,211 @@ fn edit_distance(a: &str, b: &str) -> usize {
         prev = cur;
     }
     prev.last().copied().unwrap_or(0)
+}
+
+/// The dispatch mode the raw document declares, or `None` when `dispatch:`
+/// carries a value that is neither spelling.
+///
+/// A `None` is the typed parse's to report, so the mode checks skip rather
+/// than guess which half of the document is legal. An explicit null is one of
+/// those: `serde(default)` fills in only for an absent key, so a present null
+/// reaches `DispatchMode`'s own `Deserialize` and is refused there by name.
+fn declared_dispatch_mode(raw: &serde_yaml::Value) -> Option<DispatchMode> {
+    match raw.get("engine_settings").and_then(|s| s.get("dispatch")) {
+        None => Some(DispatchMode::default()),
+        Some(value) => match value.as_str() {
+            Some("policy") => Some(DispatchMode::Policy),
+            Some("hooks") => Some(DispatchMode::Hooks),
+            _ => None,
+        },
+    }
+}
+
+/// The document keys that only mean something under `dispatch: policy`.
+const POLICY_MODE_DOCUMENT_KEYS: [&str; 3] = ["global", "groups", "routes"];
+
+/// Reject the keys the declared dispatch mode does not accept, naming the key
+/// and the mode.
+///
+/// The two modes are mutually exclusive, and each used to ignore the other's
+/// keys silently: a `routes:` block under hook dispatch resolved nothing, and a
+/// per-plugin `conditions:` under policy dispatch was never consulted. Both are
+/// load errors now, so a config that asks for one mode's behavior in the other's
+/// spelling says so at load rather than running inert.
+///
+/// # Errors
+///
+/// Returns `PluginError::Config` naming the offending key and the mode that
+/// rejects it.
+pub(crate) fn reject_mode_conflicts(raw: &serde_yaml::Value) -> Result<(), Box<PluginError>> {
+    let Some(mode) = declared_dispatch_mode(raw) else {
+        return Ok(()); // The value is the typed parse's to report.
+    };
+    match mode {
+        DispatchMode::Hooks => reject_policy_keys_in_hook_mode(raw),
+        DispatchMode::Policy => {
+            reject_activation_lists_in_policy_mode(raw)?;
+            reject_plugin_conditions_in_policy_mode(raw)
+        },
+    }
+}
+
+/// Reject `routes:`, `groups:`, `global:`, and `global.defaults:` under
+/// `dispatch: hooks`, which resolves none of them.
+///
+/// `global.defaults:` is named on its own so the message points at the block an
+/// operator wrote and not only at its parent.
+fn reject_policy_keys_in_hook_mode(raw: &serde_yaml::Value) -> Result<(), Box<PluginError>> {
+    let mut found: Vec<&str> = POLICY_MODE_DOCUMENT_KEYS
+        .into_iter()
+        .filter(|key| raw.get(*key).is_some())
+        .collect();
+    if raw.get("global").and_then(|g| g.get("defaults")).is_some() {
+        found.push("global.defaults");
+    }
+    if found.is_empty() {
+        return Ok(());
+    }
+    let label = if found.len() == 1 { "key" } else { "keys" };
+    Err(Box::new(PluginError::Config {
+        message: format!(
+            "`engine_settings.dispatch: hooks` does not accept the {label} `{}`, which only \
+             `dispatch: policy` resolves; under `hooks` a plugin fires at the hooks its own \
+             `hooks:` declares, narrowed by its own `conditions:`",
+            found.join("`, `")
+        ),
+    }))
+}
+
+/// Reject a `plugins:` activation list at every scope that can write one under
+/// `dispatch: policy`: a route, a bundle under `groups:` including the reserved
+/// `all`, and a `global.defaults.<entity>:` entry.
+///
+/// The mapping shape stays valid: it overrides `config`, `capabilities`, and
+/// `on_error` for a plugin a policy step already invokes, which is a different
+/// construct that happens to share the key.
+fn reject_activation_lists_in_policy_mode(raw: &serde_yaml::Value) -> Result<(), Box<PluginError>> {
+    fn reject(path: &str, section: &serde_yaml::Value) -> Result<(), Box<PluginError>> {
+        if !matches!(section.get("plugins"), Some(serde_yaml::Value::Sequence(_))) {
+            return Ok(());
+        }
+        Err(Box::new(PluginError::Config {
+            message: format!(
+                "`{path}` declares a `plugins:` activation list, which \
+                 `engine_settings.dispatch: policy` does not accept; a policy invokes a plugin \
+                 with a `run(name)` step under `authorization:`, and a step under \
+                 `global.authorization:` reaches every route. A `plugins:` mapping stays valid \
+                 here, overriding `config`, `capabilities`, and `on_error` for a plugin a step \
+                 names"
+            ),
+        }))
+    }
+
+    fn reject_bundles(
+        prefix: &str,
+        bundles: Option<&serde_yaml::Value>,
+    ) -> Result<(), Box<PluginError>> {
+        let Some(map) = bundles.and_then(serde_yaml::Value::as_mapping) else {
+            return Ok(());
+        };
+        for (name, bundle) in map {
+            let name = name.as_str().unwrap_or("?");
+            reject(&format!("{prefix}.{name}"), bundle)?;
+        }
+        Ok(())
+    }
+
+    if let Some(routes) = raw.get("routes").and_then(serde_yaml::Value::as_sequence) {
+        for (i, route) in routes.iter().enumerate() {
+            reject(&format!("routes[{i}]"), route)?;
+        }
+    }
+    reject_bundles("groups", raw.get("groups"))?;
+    reject_bundles(
+        "global.defaults",
+        raw.get("global").and_then(|g| g.get("defaults")),
+    )
+}
+
+/// Reject a per-plugin `conditions:` under `dispatch: policy`, where a policy
+/// decides dispatch and nothing consults the condition.
+///
+/// `priority:` is deliberately not rejected beside it: the registry orders every
+/// hook's entries by trusted priority in both modes, so a policy-mode config's
+/// `priority:` still decides what runs first.
+fn reject_plugin_conditions_in_policy_mode(
+    raw: &serde_yaml::Value,
+) -> Result<(), Box<PluginError>> {
+    let Some(plugins) = raw.get("plugins").and_then(serde_yaml::Value::as_sequence) else {
+        return Ok(());
+    };
+    for plugin in plugins {
+        if plugin.get("conditions").is_none() {
+            continue;
+        }
+        let name = plugin
+            .get("name")
+            .and_then(serde_yaml::Value::as_str)
+            .unwrap_or("?");
+        return Err(Box::new(PluginError::Config {
+            message: format!(
+                "plugin '{name}' declares `conditions:`, which `engine_settings.dispatch: policy` \
+                 does not accept; a policy decides dispatch there, so the condition is never \
+                 consulted. Narrow the policy that names the plugin, or write \
+                 `engine_settings.dispatch: hooks` to keep the condition"
+            ),
+        }));
+    }
+    Ok(())
+}
+
+/// Reject a policy-mode config that declares plugins and nothing that could
+/// reach them, for a host with no orchestrator to decide it better.
+///
+/// A policy invokes a plugin from a step, and every scope a step can be written
+/// in is one of `routes:`, `groups:`, or `global:`. A config with none of the
+/// three and a non-empty `plugins:` list has no spelling left that reaches a
+/// plugin, so every declared plugin is inert and no request is governed by
+/// anything.
+///
+/// `has_visitor` turns this off, and it has to. praxis-policy-core does not
+/// model `global.authorization:`, so a config whose only scope is that block
+/// looks scope-less from here while an orchestrator compiles a step out of it
+/// and reaches the plugin — the chain-wide replacement for an activation list.
+/// A visitor also reports the same fault better: per plugin, and for configs
+/// this cannot see, such as one declaring routes that still name nothing.
+/// Without a visitor no other check runs at all, and a policy-mode config is
+/// then inert in a way nothing would say out loud.
+///
+/// # Errors
+///
+/// Returns `PluginError::Config` naming the unreachable plugins.
+pub(crate) fn reject_policy_mode_with_nothing_to_dispatch(
+    config: &PolicyConfig,
+    has_visitor: bool,
+) -> Result<(), Box<PluginError>> {
+    if has_visitor || !config.dispatch_mode().is_policy() || config.plugins.is_empty() {
+        return Ok(());
+    }
+    let declares_a_policy_scope = !config.routes.is_empty()
+        || !config.groups.is_empty()
+        || !config.global.bundles.is_empty()
+        || !config.global.defaults.is_empty()
+        || config.global.authentication.is_some();
+    if declares_a_policy_scope {
+        return Ok(());
+    }
+    let names: Vec<&str> = config.plugins.iter().map(|p| p.name.as_str()).collect();
+    Err(Box::new(PluginError::Config {
+        message: format!(
+            "`engine_settings.dispatch: policy` is the default, and this config declares \
+             plugins (`{}`) with no `routes:`, `groups:`, or `global:` block to invoke them \
+             from, so none of them can ever run. Write a `run(name)` step under an \
+             `authorization:` block, or `engine_settings.dispatch: hooks` to fire each plugin \
+             at the hooks its own `hooks:` declares",
+            names.join("`, `")
+        ),
+    }))
 }
 
 /// The dispatched hook name closest to `name`, or `None` when nothing is
@@ -1232,9 +1878,11 @@ fn reject_reserved_route_names(config: &PolicyConfig) -> Result<(), Box<PluginEr
 /// Validate a parsed config for structural correctness.
 ///
 /// This checks declared hook names plus the *structural* plugin activation
-/// lists (`route.plugins` / `policy_group.plugins` sequences). It deliberately
-/// does NOT validate APL plugin references — neither `plugin(...)` / `run(...)`
-/// policy steps nor the APL per-plugin override *map* (which
+/// lists (`route.plugins` / `policy_group.plugins` sequences), which no document
+/// can fill any more — `reject_mode_conflicts` refuses the shape, so the walk
+/// guards a host that built its [`PolicyConfig`] in Rust. It deliberately
+/// does NOT validate APL plugin references, neither `run(...)` policy steps
+/// nor the APL per-plugin override *map* (which
 /// [`deserialize_plugin_refs`] folds into an empty structural `Vec`, leaving
 /// it for the APL visitor to consume). Those are resolved and validated at
 /// dispatch-plan build time, where an unknown or unreferenced plugin is logged
@@ -1253,7 +1901,7 @@ pub(crate) fn validate_config(config: &PolicyConfig) -> Result<(), Box<PluginErr
         }
     }
 
-    if config.routing_enabled() {
+    if config.dispatch_mode().is_policy() {
         let plugin_names: HashSet<&str> = config.plugins.iter().map(|p| p.name.as_str()).collect();
 
         // A `global.defaults` key that names no entity type never applies to
@@ -1361,13 +2009,13 @@ pub(crate) fn validate_config(config: &PolicyConfig) -> Result<(), Box<PluginErr
             // Validate the first-class `groups:` membership field: a value
             // naming no defined group is a typo, and silently ignoring it
             // can leave the route without the `authentication:` the group
-            // would have supplied. `meta.tags` stays permissive — tags are
+            // would have supplied. `meta.tags` stays permissive: tags are
             // an open-ended, host-injectable substrate, not all of which
-            // name groups. Runs after `merge_groups_into_policies`, so
-            // top-level `groups:` are already folded into `global.policies`.
+            // name groups. Runs after `fold_groups_into_bundles`, so
+            // top-level `groups:` are already folded into the bundle store.
             if let Some(groups) = &route.groups {
                 for name in groups.as_names() {
-                    if !config.global.policies.contains_key(name) {
+                    if !config.global.bundles.contains_key(name) {
                         return Err(Box::new(PluginError::Config {
                             message: format!("route {i} joins unknown group '{name}'"),
                         }));
@@ -1376,7 +2024,7 @@ pub(crate) fn validate_config(config: &PolicyConfig) -> Result<(), Box<PluginErr
             }
         }
 
-        for (group_name, group) in &config.global.policies {
+        for (group_name, group) in &config.global.bundles {
             for plugin_ref in &group.plugins {
                 if !plugin_names.contains(plugin_ref.name()) {
                     return Err(Box::new(PluginError::Config {
@@ -1398,6 +2046,11 @@ pub(crate) fn validate_config(config: &PolicyConfig) -> Result<(), Box<PluginErr
 /// gap, empty when there is nothing to report. Only `http:` routes are
 /// examined, so a configuration that declares none is never reported on.
 ///
+/// One gap is left to report. The routing-off report that sat beside it is
+/// gone: `routes:` is a load error under `dispatch: hooks`, so a config
+/// carrying an `http:` route is in policy mode by construction and the branch
+/// had no reachable input.
+///
 /// Kept separate from emission so a test reads the findings rather than a log
 /// line. [`crate::engine`] emits these once per config load.
 pub(crate) fn http_routing_gaps(config: &PolicyConfig) -> Vec<String> {
@@ -1408,17 +2061,6 @@ pub(crate) fn http_routing_gaps(config: &PolicyConfig) -> Vec<String> {
         .collect();
     if selectors.is_empty() {
         return Vec::new();
-    }
-    // Inert beats uncovered: with routing off no route resolves at all, so
-    // naming the missing catch-all on top of it would send an operator to the
-    // wrong line of their config.
-    if !config.routing_enabled() {
-        return vec![format!(
-            "config declares `http:` routes (count={}) but \
-             `plugin_settings.routing_enabled` is false, which is the default, so none of them \
-             resolves and every request is governed by the global policy",
-            selectors.len(),
-        )];
     }
     if selectors.iter().copied().any(is_http_catch_all) {
         return Vec::new();
@@ -1456,7 +2098,6 @@ const SELECTOR_KEYS: &[&str] = &[
 const SPECIFICITY_EXACT_NAME: usize = 1000;
 const SPECIFICITY_NAME_LIST: usize = 500;
 const SPECIFICITY_GLOB: usize = 300;
-const SPECIFICITY_WHEN_ONLY: usize = 10;
 const SPECIFICITY_WILDCARD: usize = 0;
 
 /// Specificity for an `http:` selector. An `http:` route only ever competes
@@ -1464,8 +2105,8 @@ const SPECIFICITY_WILDCARD: usize = 0;
 /// buckets above are left alone.
 ///
 /// An exact path outranks every prefix, however long, and among prefixes the
-/// longer one wins. The per-character weight sits above the scope, `method:`,
-/// and `when:` bonuses so prefix length decides before any tiebreaker does.
+/// longer one wins. The per-character weight sits above the scope and `method:`
+/// bonuses so prefix length decides before any tiebreaker does.
 const SPECIFICITY_EXACT_PATH: usize = usize::MAX / 2;
 const SPECIFICITY_PATH_PREFIX_STEP: usize = 1000;
 
@@ -1486,7 +2127,7 @@ const SPECIFICITY_SCOPE_MATCH: usize = 100;
 /// Score a single entity matcher (tool / resource / prompt / llm) against
 /// a request entity name, returning the specificity bucket if it matches
 /// or `None` if it doesn't (or the matcher is absent). Replaces four
-/// copy-pasted match arms in `resolve_plugins_for_entity`.
+/// copy-pasted match arms in the entity resolver.
 fn score_entity_match(matcher: Option<&StringOrList>, entity_name: &str) -> Option<usize> {
     let matcher = matcher?;
     if !matcher.matches(entity_name) {
@@ -1609,8 +2250,13 @@ fn score_http_match(selector: &HttpSelector, path: &str, method: Option<&str>) -
 /// discoverable spelling for the common "join this bundle" case — it
 /// desugars here into the same tag set the resolvers already match against
 /// bundle names, so tags stay the single substrate (runtime-injectable and
-/// metadata-bearing). Both membership resolvers iterate this so neither can
-/// forget one of the two spellings.
+/// metadata-bearing).
+///
+/// One reader is left, [`authentication_layers`]. The other went with the
+/// activation lists, and the orchestrator that layers a bundle's
+/// `authorization:` reads `meta.tags` directly, so a route joining a bundle
+/// through `groups:` inherits its authentication steps but not its policy. That
+/// gap predates this and is not closed here.
 fn route_static_tags(route: &RouteEntry) -> impl Iterator<Item = &str> {
     let meta_tags = route
         .meta
@@ -1822,111 +2468,166 @@ pub struct MatchedRoute<'a> {
     pub name: String,
 }
 
-/// Resolve which plugins should fire for a given entity.
+/// The plugins a request activates structurally, with no policy consulted.
 ///
-/// When routing is disabled, returns all plugin names. When enabled, collects
-/// plugins from the `all` group, the entity type's defaults, the matched route's
-/// groups (via merged tags), and the route itself.
+/// Under `dispatch: hooks` that is every declared plugin, which the executor
+/// then narrows by each plugin's own `conditions:`.
 ///
-/// The caller matches the route once with [`resolve_route`] and passes the
-/// result in. `entity_type` is still needed on its own, because the entity
-/// type's defaults apply whether or not a route matched.
+/// **Under `dispatch: policy` it is nothing, and can be nothing.** The four
+/// activation lists it used to fold — the `all` bundle, the entity type's
+/// defaults, the bundles a route joins by tag, and the route's own `plugins:` —
+/// are load errors in that mode, because a policy invokes a plugin with a
+/// `run(name)` step. A step under `global.authorization:` is what reaches every
+/// route, and that path runs through the APL route handler rather than here.
 ///
-/// `request_tags` comes from the host's `MetaExtension` on the request.
-pub fn resolve_plugins_for_entity(
-    config: &PolicyConfig,
-    entity_type: &str,
-    matched: Option<&MatchedRoute<'_>>,
-    request_tags: &HashSet<String>,
-) -> Vec<ResolvedPlugin> {
-    if !config.routing_enabled() {
-        return config
-            .plugins
-            .iter()
-            .map(|p| ResolvedPlugin {
-                name: p.name.clone(),
-                config_overrides: None,
-                when: None,
-            })
-            .collect();
+/// The entity type and the matched route are gone from the signature with those
+/// lists: nothing left in either branch reads them.
+pub fn resolve_plugins_for_entity(config: &PolicyConfig) -> Vec<ResolvedPlugin> {
+    if config.dispatch_mode().is_policy() {
+        return Vec::new();
     }
+    config
+        .plugins
+        .iter()
+        .map(|p| ResolvedPlugin {
+            name: p.name.clone(),
+            config_overrides: None,
+        })
+        .collect()
+}
 
-    let mut resolved = Vec::new();
+/// One layer of `authentication:` steps and where it came from.
+///
+/// The resolver and the load-time drop report both fold this sequence, so
+/// what an operator is told matches what dispatch does by construction.
+struct AuthenticationLayer<'a> {
+    /// The layer's source, for a report that has to name it.
+    source: AuthenticationSource<'a>,
+    /// The block the layer contributes, flag included.
+    config: &'a crate::identity::RouteIdentityConfig,
+}
 
-    // 1. Always include plugins from the "all" policy group
-    if let Some(all_group) = config.global.policies.get("all") {
-        collect_plugin_refs(&all_group.plugins, &mut resolved, None);
+/// Where an `authentication:` layer is declared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthenticationSource<'a> {
+    /// The `global.authentication:` block, inherited by every route.
+    Global,
+    /// A `global.defaults.<entity>:` block, named by the entity type it
+    /// covers.
+    EntityDefault(&'a str),
+    /// A tag bundle's block, named by the bundle.
+    Bundle(&'a str),
+    /// The route's own block.
+    Route,
+}
+
+impl AuthenticationSource<'_> {
+    /// How a report names the layer. `Global` and `Route` never appear in one,
+    /// so they are named for completeness rather than for a caller.
+    fn label(self) -> String {
+        match self {
+            Self::Global => "global".to_owned(),
+            Self::EntityDefault(entity_type) => format!("global.defaults.{entity_type}"),
+            Self::Bundle(tag) => format!("groups.{tag}"),
+            Self::Route => "the route".to_owned(),
+        }
     }
+}
 
-    // 2. Include plugins from matching defaults
-    if let Some(default_group) = config.global.defaults.get(entity_type) {
-        collect_plugin_refs(&default_group.plugins, &mut resolved, None);
+/// The `authentication:` layers that apply to a route, in the order they
+/// stack: global, the entity type's default, each tag bundle the route joins,
+/// then the route.
+///
+/// That is the order the policy layers stack in, and the two chains have to
+/// agree: a `global.defaults.<entity>:` block contributing its policy but not
+/// its authentication would be a key accepted and honored by half.
+///
+/// Bundle order is `meta.tags` in declaration order followed by `groups:` in
+/// declaration order, which is what [`route_static_tags`] yields. That order is
+/// what makes `replace_inherited:` well defined at bundle scope: which bundle
+/// replaces, and which bundles survive after it, are both readable from the
+/// document rather than from a map's iteration order.
+///
+/// **Static tags only, deliberately.** A bundle a request joins by a tag the
+/// host injected at runtime contributes no authentication steps, because
+/// threading the request's tags in would be a signature change past this work's
+/// edge. Nothing else reads runtime tags any more either, so the asymmetry the
+/// note used to record is gone with the activation lists.
+fn authentication_layers<'a>(
+    config: &'a PolicyConfig,
+    route: Option<&'a RouteEntry>,
+) -> Vec<AuthenticationLayer<'a>> {
+    let mut layers: Vec<AuthenticationLayer<'a>> = Vec::new();
+    if let Some(global_identity) = config.global.authentication.as_ref() {
+        layers.push(AuthenticationLayer {
+            source: AuthenticationSource::Global,
+            config: global_identity,
+        });
     }
-
-    // 3. Layer the matched route: its groups and tags, then its own plugins.
-    if let Some(route) = matched.map(|m| m.route) {
-        // Merge tags: route's static membership (meta.tags + groups: sugar)
-        // + host's runtime tags.
-        let mut merged_tags: HashSet<String> = request_tags.clone();
+    if let Some(route) = route {
+        if let Some((entity_type, _)) = route_entity_identity(route)
+            && let Some(default) = config.global.defaults.get(entity_type)
+            && let Some(default_identity) = default.authentication.as_ref()
+        {
+            layers.push(AuthenticationLayer {
+                source: AuthenticationSource::EntityDefault(entity_type),
+                config: default_identity,
+            });
+        }
         for tag in route_static_tags(route) {
-            merged_tags.insert(tag.to_owned());
-        }
-
-        // Include plugins from all matching policy groups (merged tags)
-        for tag in &merged_tags {
-            if tag == "all" {
-                continue; // already handled above
-            }
-            if let Some(group) = config.global.policies.get(tag.as_str()) {
-                collect_plugin_refs(&group.plugins, &mut resolved, None);
+            if let Some(bundle) = config.global.bundles.get(tag)
+                && let Some(bundle_identity) = bundle.authentication.as_ref()
+            {
+                layers.push(AuthenticationLayer {
+                    source: AuthenticationSource::Bundle(tag),
+                    config: bundle_identity,
+                });
             }
         }
-
-        // Include route-level plugins, carrying the route's when clause
-        collect_plugin_refs(&route.plugins, &mut resolved, route.when.as_deref());
-    }
-
-    // Deduplicate by name, preserving order. Later overrides win.
-    let mut seen = HashSet::new();
-    let mut deduped = Vec::new();
-    for rp in resolved.into_iter().rev() {
-        if seen.insert(rp.name.clone()) {
-            deduped.push(rp);
+        if let Some(route_identity) = route.authentication.as_ref() {
+            layers.push(AuthenticationLayer {
+                source: AuthenticationSource::Route,
+                config: route_identity,
+            });
         }
     }
-    deduped.reverse();
-    deduped
+    layers
 }
 
 /// Resolve the identity-resolve dispatch list for a specific
-/// entity. Hook-specific counterpart to [`resolve_plugins_for_entity`]
-/// — consults the global `authentication:` block, tag-bundle
+/// entity. The one structural dispatch list policy mode keeps
+/// — consults the global `authentication:` block, the entity type's
+/// `global.defaults.<entity>.authentication:` block, tag-bundle
 /// `authentication:` blocks, and the route's own `authentication:` block
 /// to determine which plugins fire on the `identity.resolve` hook for
 /// this route.
 ///
 /// # Inheritance / merge order
 ///
-/// Layers are stacked **global → tag bundles → route**, in that
-/// order. Within tags, the order is determined by the request's
-/// `meta.tags` (which combines static route tags + runtime request
-/// tags). Each layer is appended to the running list unless the
-/// **route's** block has `replace_inherited: true`, in which case
-/// inherited layers (global + tags) are dropped and only the route's
-/// steps remain. Tag-bundle `replace_inherited` is parsed but not
-/// honored — only the route layer can opt out of inheritance.
+/// Layers stack **global → entity default → tag bundles → route**, the order
+/// `authentication_layers` yields, which is the order the policy layers stack
+/// in. Each layer appends to the running list, and a layer whose block sets
+/// `replace_inherited: true` drops everything accumulated before it first. The
+/// flag is honored at every scope it can be written at: a route's drops every
+/// inherited layer, and an entity default's or a bundle's drops what came
+/// before it while the layers after it still append.
+///
+/// A flag set above the route removes authentication from a route whose own
+/// author never wrote it, so `dropped_inherited_authentication` names every
+/// route that loses steps that way, once per config load.
 ///
 /// Order matters: returned plugins fire in the order they were
 /// merged. The first plugin's resolved `IdentityPayload` flows into
 /// the second plugin's input via the executor's Sequential-phase
-/// semantics, so global identity contributions land first, then
-/// tag-bundle, then route-specific overrides / additions.
+/// semantics, so global identity contributions land first, then the
+/// entity default's, then tag-bundle, then route-specific overrides /
+/// additions.
 ///
 /// Per-step `config_override` is surfaced as
 /// `ResolvedPlugin.config_overrides` so the standard
 /// `filter_entries_by_route` override pathway
-/// (`create_override_instance`) applies — same mechanism the
-/// `plugins:` block uses.
+/// (`create_override_instance`) applies. It is the only input to that pathway
+/// now that no scope carries a `plugins:` activation list.
 ///
 /// Returns an empty `Vec` when no layer contributed any steps
 /// (e.g. anonymous routes that explicitly opt out via
@@ -1935,46 +2636,15 @@ pub fn resolve_identity_plugins_for_route(
     config: &PolicyConfig,
     matched: Option<&MatchedRoute<'_>>,
 ) -> Vec<ResolvedPlugin> {
-    // Route-level block is the override authority. No matched route means
-    // there's no route to inherit identity FOR (still consult global identity
-    // though, since the host might be doing per-route hook routing on the
-    // entity type alone with no specific route).
-    let route = matched.map(|m| m.route);
-    let route_identity = route.and_then(|r| r.identity.as_ref());
-
-    // Check the override flag before doing any inheritance work —
-    // if the route opts out, inherited layers are dropped.
-    let replace_inherited = route_identity
-        .map(|id| id.replace_inherited)
-        .unwrap_or(false);
-
+    // No matched route means there is no route to inherit identity FOR (the
+    // global layer still applies, since the host might be doing per-route hook
+    // routing on the entity type alone with no specific route).
     let mut steps: Vec<crate::identity::RouteIdentityStep> = Vec::new();
-
-    if !replace_inherited {
-        // Global layer first — applies to every route.
-        if let Some(global_identity) = config.global.identity.as_ref() {
-            steps.extend(global_identity.steps.iter().cloned());
+    for layer in authentication_layers(config, matched.map(|m| m.route)) {
+        if layer.config.replace_inherited {
+            steps.clear();
         }
-
-        // Tag-bundle layers next. Walk the route's static membership tags
-        // (meta.tags + groups: sugar, via `route_static_tags`). Runtime tags
-        // would compose here too, but resolve_* currently doesn't take them as
-        // a parameter for identity — symmetry with the existing `plugins:`
-        // resolver would extend the signature; deferred until needed.
-        if let Some(route) = route {
-            for tag in route_static_tags(route) {
-                if let Some(bundle) = config.global.policies.get(tag)
-                    && let Some(bundle_identity) = bundle.identity.as_ref()
-                {
-                    steps.extend(bundle_identity.steps.iter().cloned());
-                }
-            }
-        }
-    }
-
-    // Route layer last (or only, when replace_inherited).
-    if let Some(id) = route_identity {
-        steps.extend(id.steps.iter().cloned());
+        steps.extend(layer.config.steps.iter().cloned());
     }
 
     steps
@@ -1990,12 +2660,86 @@ pub fn resolve_identity_plugins_for_route(
                 wrapper.insert("config".to_owned(), cfg.clone());
                 serde_json::Value::Object(wrapper)
             }),
-            when: None,
         })
         .collect()
 }
 
-/// A resolved plugin with optional config overrides and when clause.
+/// A route whose inherited `authentication:` steps a tag bundle dropped.
+///
+/// Kept separate from emission so a test reads the finding rather than a log
+/// line, the way [`http_routing_gaps`] is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DroppedAuthentication {
+    /// The affected route, named by the entity it selects.
+    pub route: String,
+    /// The section whose `replace_inherited: true` did the dropping, as
+    /// [`AuthenticationSource::label`] names it.
+    pub declared_in: String,
+    /// The step names the route no longer runs, in the order they stacked.
+    pub dropped: Vec<String>,
+}
+
+/// Every route whose inherited `authentication:` steps a section above it
+/// drops with `replace_inherited: true`, one finding per route.
+///
+/// A route's own flag is not reported: that drop is written in the route being
+/// affected, so its author can see it. A bundle's or an entity default's is
+/// written somewhere else entirely, and it is the route's author who ends up
+/// with a route that authenticates less than the document in front of them
+/// says. A route setting its own flag is silent for the same reason: the
+/// route's block replaces whatever the sections above left, so nothing is lost
+/// that the route did not discard itself.
+///
+/// Reports the first such section, since that is the one whose removal reaches
+/// back past the route's own tags to the global layer.
+pub(crate) fn dropped_inherited_authentication(
+    config: &PolicyConfig,
+) -> Vec<DroppedAuthentication> {
+    let mut findings: Vec<DroppedAuthentication> = Vec::new();
+    for (i, route) in config.routes.iter().enumerate() {
+        if route
+            .authentication
+            .as_ref()
+            .is_some_and(|id| id.replace_inherited)
+        {
+            continue;
+        }
+        let mut steps: Vec<&str> = Vec::new();
+        for layer in authentication_layers(config, Some(route)) {
+            // Global cannot drop anything: it stacks first, so nothing has
+            // accumulated by the time its flag is read. Route is the author's
+            // own choice, handled above. What is left is the sections between.
+            let declared_away_from_the_route = matches!(
+                layer.source,
+                AuthenticationSource::EntityDefault(_) | AuthenticationSource::Bundle(_)
+            );
+            if declared_away_from_the_route && layer.config.replace_inherited && !steps.is_empty() {
+                findings.push(DroppedAuthentication {
+                    route: route_display_name(route, i),
+                    declared_in: layer.source.label(),
+                    dropped: steps.iter().map(|s| (*s).to_owned()).collect(),
+                });
+                break;
+            }
+            if layer.config.replace_inherited {
+                steps.clear();
+            }
+            steps.extend(layer.config.steps.iter().map(|s| s.name.as_str()));
+        }
+    }
+    findings
+}
+
+/// How a report names a route: the entity type and the names it selects on, or
+/// its position when it selects nothing.
+fn route_display_name(route: &RouteEntry, index: usize) -> String {
+    match route_entity_identity(route) {
+        Some((entity_type, names)) => format!("{entity_type}:{}", names.join(",")),
+        None => format!("routes[{index}]"),
+    }
+}
+
+/// A resolved plugin with optional config overrides.
 #[derive(Debug, Clone)]
 pub struct ResolvedPlugin {
     /// Plugin name.
@@ -2003,24 +2747,6 @@ pub struct ResolvedPlugin {
 
     /// Config overrides from the route.
     pub config_overrides: Option<serde_json::Value>,
-
-    /// When clause from the route — carried but not evaluated here.
-    pub when: Option<String>,
-}
-
-/// Collect plugin refs into the resolved list.
-fn collect_plugin_refs(
-    refs: &[PluginRouteRef],
-    resolved: &mut Vec<ResolvedPlugin>,
-    route_when: Option<&str>,
-) {
-    for plugin_ref in refs {
-        resolved.push(ResolvedPlugin {
-            name: plugin_ref.name().to_owned(),
-            config_overrides: plugin_ref.overrides().cloned(),
-            when: route_when.map(String::from),
-        });
-    }
 }
 
 /// Find the best matching route for a request, with the name it resolved to.
@@ -2046,12 +2772,7 @@ pub fn resolve_route<'a>(
             continue;
         };
 
-        let when_bonus = if route.when.is_some() {
-            SPECIFICITY_WHEN_ONLY
-        } else {
-            0
-        };
-        let total = base_specificity.saturating_add(scope_bonus + when_bonus);
+        let total = base_specificity.saturating_add(scope_bonus);
 
         if best.as_ref().is_none_or(|(s, _)| total > *s) {
             best = Some((total, MatchedRoute { route, name }));
@@ -2104,20 +2825,19 @@ mod tests {
         HashSet::new()
     }
 
-    /// Match once, then layer, which is what the engine does. Keeps the
-    /// resolution call sites below reading as one step.
-    fn plugins_for(
+    /// The name the route table resolves for a request, or `None` when nothing
+    /// matched. Route matching outlived the activation lists it used to feed.
+    fn matched_name(
         config: &PolicyConfig,
         entity_type: &str,
         entity_name: &str,
         request_scope: Option<&str>,
-        request_tags: &HashSet<String>,
-    ) -> Vec<ResolvedPlugin> {
-        let matched = resolve_route(
+    ) -> Option<String> {
+        resolve_route(
             config,
             RouteQuery::named(entity_type, entity_name).with_scope(request_scope),
-        );
-        resolve_plugins_for_entity(config, entity_type, matched.as_ref(), request_tags)
+        )
+        .map(|matched| matched.name)
     }
 
     /// The identity-hook counterpart of `plugins_for`.
@@ -2147,13 +2867,13 @@ plugins:
       max_requests: 100
 "#;
         let config = parse_config(yaml).unwrap();
-        assert!(!config.routing_enabled());
+        assert_eq!(config.dispatch_mode(), DispatchMode::Policy);
         assert_eq!(config.plugins.len(), 1);
         assert_eq!(config.plugins[0].name, "rate_limiter");
     }
 
     #[test]
-    fn test_no_plugin_settings_defaults_routing_disabled() {
+    fn test_no_engine_settings_defaults_to_policy_dispatch() {
         let yaml = r#"
 plugins:
   - name: test
@@ -2161,19 +2881,18 @@ plugins:
     hooks: [cmf.tool_pre_invoke]
 "#;
         let config = parse_config(yaml).unwrap();
-        assert!(!config.routing_enabled());
-        assert_eq!(config.plugin_settings.plugin_timeout, 30);
+        assert_eq!(config.dispatch_mode(), DispatchMode::Policy);
+        assert_eq!(config.engine_settings.plugin_timeout, 30);
     }
 
     #[test]
-    fn test_routing_enabled() {
+    fn test_policy_dispatch() {
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
-global:
-  policies:
-    all:
-      plugins: [identity]
+engine_settings:
+  dispatch: policy
+groups:
+  all:
+    authentication: [identity]
 plugins:
   - name: identity
     kind: builtin
@@ -2184,7 +2903,98 @@ routes:
       tags: [pii]
 "#;
         let config = parse_config(yaml).unwrap();
-        assert!(config.routing_enabled());
+        assert_eq!(config.dispatch_mode(), DispatchMode::Policy);
+        // Serialize is derived while Deserialize is hand-written, so the two
+        // spellings have to be checked against each other.
+        assert_eq!(
+            serde_yaml::to_string(&DispatchMode::Policy).unwrap().trim(),
+            "policy"
+        );
+        assert_eq!(
+            serde_yaml::to_string(&DispatchMode::Hooks).unwrap().trim(),
+            "hooks"
+        );
+    }
+
+    /// `dispatch: hooks` written out loads the same way as leaving the block
+    /// off: every declared plugin resolves.
+    #[test]
+    fn explicit_hook_dispatch_resolves_every_declared_plugin() {
+        let yaml = r#"
+engine_settings:
+  dispatch: hooks
+plugins:
+  - name: first
+    kind: builtin
+    hooks: [cmf.tool_pre_invoke]
+  - name: second
+    kind: builtin
+    hooks: [cmf.tool_pre_invoke]
+"#;
+        let config = parse_config(yaml).expect("hook dispatch loads");
+        assert_eq!(config.dispatch_mode(), DispatchMode::Hooks);
+        let resolved = resolve_plugins_for_entity(&config);
+        assert_eq!(
+            resolved.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["first", "second"],
+            "hook mode resolves every declared plugin, and the executor narrows \
+             them by each plugin's own conditions",
+        );
+    }
+
+    /// A misspelled mode names both accepted spellings rather than being read
+    /// leniently as one of them.
+    #[test]
+    fn an_unknown_dispatch_mode_is_rejected_naming_both() {
+        let err = parse_config(
+            r#"
+engine_settings:
+  dispatch: plicy
+plugins: []
+"#,
+        )
+        .expect_err("a misspelled mode must not load");
+        let message = err.to_string();
+        assert!(message.contains("plicy"), "{message}");
+        assert!(message.contains("policy"), "{message}");
+        assert!(message.contains("hooks"), "{message}");
+    }
+
+    /// The mode used to be a boolean, so a stale `true` must fail rather than
+    /// coerce to a mode.
+    #[test]
+    fn a_boolean_dispatch_value_is_rejected() {
+        let err = parse_config(
+            r#"
+engine_settings:
+  dispatch: true
+plugins: []
+"#,
+        )
+        .expect_err("a boolean must not coerce to a mode");
+        let message = err.to_string();
+        assert!(
+            message.contains("policy") && message.contains("hooks"),
+            "{message}"
+        );
+    }
+
+    /// `PolicyConfig` drops an unknown field, so the pre-rename key has to be
+    /// rejected by name. Otherwise a config asking for route dispatch loads in
+    /// hook mode with its whole settings block discarded.
+    #[test]
+    fn the_pre_rename_plugin_settings_key_is_rejected() {
+        let err = parse_config(
+            r#"
+plugin_settings:
+  routing_enabled: true
+plugins: []
+"#,
+        )
+        .expect_err("the pre-rename key must not load silently");
+        let message = err.to_string();
+        assert!(message.contains("engine_settings"), "{message}");
+        assert!(message.contains("dispatch: policy"), "{message}");
     }
 
     #[test]
@@ -2337,8 +3147,8 @@ plugins:
     #[test]
     fn test_route_requires_one_entity_matcher() {
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - meta:
@@ -2355,8 +3165,8 @@ routes:
     #[test]
     fn test_route_rejects_multiple_entity_matchers() {
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - tool: get_compensation
@@ -2370,51 +3180,138 @@ routes:
         );
     }
 
+    /// A config built in Rust rather than parsed can still fill an activation
+    /// list, so the reference walk stays. YAML no longer reaches it: the list
+    /// shape is refused before validation runs.
     #[test]
     fn test_route_unknown_plugin_rejected() {
-        let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+        let mut config = parse_config(
+            r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: known
     kind: builtin
     hooks: [cmf.tool_pre_invoke]
 routes:
   - tool: get_compensation
-    plugins:
-      - unknown
-"#;
+"#,
+        )
+        .expect("the parsed half of the fixture is legal");
+        config.routes[0]
+            .plugins
+            .push(PluginRouteRef::Name("unknown".to_owned()));
         assert!(
-            parse_config(yaml)
+            validate_config(&config)
                 .unwrap_err()
                 .to_string()
                 .contains("unknown plugin 'unknown'")
         );
     }
 
+    /// The bundle-scoped half of the same walk, reached the same way.
     #[test]
     fn test_policy_group_unknown_plugin_rejected() {
-        let yaml = r#"
-plugin_settings:
-  routing_enabled: true
-global:
-  policies:
-    all:
-      plugins: [nonexistent]
+        let mut config = parse_config(
+            r#"
+engine_settings:
+  dispatch: policy
+groups:
+  all:
+    description: the reserved bundle
 plugins: []
 routes: []
-"#;
+"#,
+        )
+        .expect("the parsed half of the fixture is legal");
+        config
+            .global
+            .bundles
+            .get_mut("all")
+            .expect("the bundle folded into the store")
+            .plugins
+            .push(PluginRouteRef::Name("nonexistent".to_owned()));
         assert!(
-            parse_config(yaml)
+            validate_config(&config)
                 .unwrap_err()
                 .to_string()
                 .contains("unknown plugin 'nonexistent'")
         );
     }
 
+    /// The backstop that catches a policy-mode config nothing could dispatch
+    /// from, for a host with no orchestrator to catch it better.
+    #[test]
+    fn plugins_with_no_policy_scope_are_rejected_without_a_visitor() {
+        let config = parse_config(
+            r#"
+plugins:
+  - name: audit-log
+    kind: builtin
+    hooks: [cmf.tool_pre_invoke]
+"#,
+        )
+        .expect("nothing here is a key error; the fault is that nothing reaches it");
+        let message = reject_policy_mode_with_nothing_to_dispatch(&config, false)
+            .expect_err("no scope can name the plugin")
+            .to_string();
+        assert!(message.contains("audit-log"), "{message}");
+        assert!(
+            message.contains("dispatch: hooks"),
+            "the message names the mode that keeps today's behavior: {message}"
+        );
+    }
+
+    /// And it stands down for a host that has one. praxis-policy-core cannot see
+    /// `global.authorization:`, so a config whose only scope is that block looks
+    /// scope-less from here while an orchestrator reaches the plugin from it.
+    #[test]
+    fn a_visitor_takes_the_scope_check_over_from_the_backstop() {
+        let config = parse_config(
+            r#"
+plugins:
+  - name: audit-log
+    kind: builtin
+    hooks: [cmf.tool_pre_invoke]
+global:
+  authorization:
+    pre_invocation:
+      - "run(audit-log)"
+"#,
+        )
+        .expect("an orchestrator's key on a section is not a typo");
+        assert!(
+            config.routes.is_empty() && config.groups.is_empty(),
+            "the shape under test is one with no scope praxis-policy-core models"
+        );
+        reject_policy_mode_with_nothing_to_dispatch(&config, true)
+            .expect("the visitor sees the step this cannot, so it decides");
+    }
+
+    /// Hook dispatch fires each plugin at the hooks it declares, so a config
+    /// with no policy scope is what that mode expects rather than a fault.
+    #[test]
+    fn hook_dispatch_needs_no_policy_scope() {
+        let config = parse_config(
+            r#"
+engine_settings:
+  dispatch: hooks
+plugins:
+  - name: audit-log
+    kind: builtin
+    hooks: [cmf.tool_pre_invoke]
+"#,
+        )
+        .expect("the config is legal in hook mode");
+        reject_policy_mode_with_nothing_to_dispatch(&config, false)
+            .expect("nothing needs a scope to name it here");
+    }
+
     #[test]
     fn test_resolve_conditions_mode_returns_all() {
         let yaml = r#"
+engine_settings:
+  dispatch: hooks
 plugins:
   - name: a
     kind: builtin
@@ -2424,28 +3321,23 @@ plugins:
     hooks: [cmf.tool_post_invoke]
 "#;
         let config = parse_config(yaml).unwrap();
-        let resolved = plugins_for(&config, "tool", "anything", None, &no_tags());
+        let resolved = resolve_plugins_for_entity(&config);
         let names: Vec<&str> = resolved.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b"]);
     }
 
+    /// A tag bundle's activation list is rejected like every other one, so a
+    /// route joining the bundle cannot inherit plugins from it.
     #[test]
-    fn test_resolve_routes_inherits_policy_groups() {
+    fn a_bundles_plugins_list_is_rejected_in_policy_mode() {
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
-global:
-  policies:
-    all:
-      plugins:
-        - identity
-    pii:
-      plugins:
-        - apl_policy
+engine_settings:
+  dispatch: policy
+groups:
+  pii:
+    plugins:
+      - apl_policy
 plugins:
-  - name: identity
-    kind: builtin
-    hooks: [identity.resolve]
   - name: apl_policy
     kind: builtin
     hooks: [cmf.tool_pre_invoke]
@@ -2454,23 +3346,24 @@ routes:
     meta:
       tags: [pii]
 "#;
-        let config = parse_config(yaml).unwrap();
-        let resolved = plugins_for(&config, "tool", "get_compensation", None, &no_tags());
-        let names: Vec<&str> = resolved.iter().map(|r| r.name.as_str()).collect();
-        assert!(names.contains(&"identity"));
-        assert!(names.contains(&"apl_policy"));
+        let message = parse_config(yaml)
+            .expect_err("a bundle cannot activate a plugin in policy mode")
+            .to_string();
+        assert!(message.contains("groups.pii"), "{message}");
+        assert!(message.contains("run(name)"), "{message}");
     }
 
+    /// The reserved `all` bundle is the chain-wide activation this work
+    /// removes, so its list is rejected by the same check under its own name.
     #[test]
-    fn test_resolve_no_matching_route_gets_all_only() {
+    fn the_reserved_all_bundles_plugins_list_is_rejected_in_policy_mode() {
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
-global:
-  policies:
-    all:
-      plugins:
-        - identity
+engine_settings:
+  dispatch: policy
+groups:
+  all:
+    plugins:
+      - identity
 plugins:
   - name: identity
     kind: builtin
@@ -2478,44 +3371,45 @@ plugins:
 routes:
   - tool: get_compensation
 "#;
-        let config = parse_config(yaml).unwrap();
-        let resolved = plugins_for(&config, "tool", "unknown_tool", None, &no_tags());
-        let names: Vec<&str> = resolved.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, vec!["identity"]);
+        let message = parse_config(yaml)
+            .expect_err("the `all` bundle cannot activate a plugin in policy mode")
+            .to_string();
+        assert!(message.contains("groups.all"), "{message}");
+        assert!(
+            message.contains("global.authorization"),
+            "the message names what replaces chain-wide activation: {message}"
+        );
     }
 
     #[test]
     fn test_exact_match_beats_glob() {
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
-plugins:
-  - name: specific
-    kind: builtin
-    hooks: [cmf.tool_pre_invoke]
-  - name: general
-    kind: builtin
-    hooks: [cmf.tool_pre_invoke]
+engine_settings:
+  dispatch: policy
+plugins: []
 routes:
   - tool: "hr-*"
-    plugins:
-      - general
+    authorization:
+      pre_invocation: ["allow"]
   - tool: hr-compensation
-    plugins:
-      - specific
+    authorization:
+      pre_invocation: ["allow"]
 "#;
         let config = parse_config(yaml).unwrap();
-        let resolved = plugins_for(&config, "tool", "hr-compensation", None, &no_tags());
-        let names: Vec<&str> = resolved.iter().map(|r| r.name.as_str()).collect();
-        assert!(names.contains(&"specific"));
-        assert!(!names.contains(&"general"));
+        assert_eq!(
+            matched_name(&config, "tool", "hr-compensation", None).as_deref(),
+            Some("hr-compensation"),
+            "the exact selector outranks the glob that also matches",
+        );
     }
 
+    /// A route's `plugins:` list is the construct policy mode drops, and the
+    /// error names the step form that replaces it.
     #[test]
-    fn test_plugin_ref_bare_name() {
+    fn a_routes_plugins_list_is_rejected_in_policy_mode() {
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: rate_limiter
     kind: builtin
@@ -2525,17 +3419,44 @@ routes:
     plugins:
       - rate_limiter
 "#;
-        let config = parse_config(yaml).unwrap();
-        let resolved = plugins_for(&config, "tool", "get_compensation", None, &no_tags());
-        assert_eq!(resolved[0].name, "rate_limiter");
-        assert!(resolved[0].config_overrides.is_none());
+        let message = parse_config(yaml)
+            .expect_err("a route cannot activate a plugin in policy mode")
+            .to_string();
+        assert!(message.contains("routes[0]"), "{message}");
+        assert!(message.contains("run(name)"), "{message}");
     }
 
+    /// An `authorization:` block on the same route does not make the list
+    /// legal: the two are not two spellings of one thing.
     #[test]
-    fn test_plugin_ref_with_overrides() {
+    fn a_routes_plugins_list_is_rejected_beside_an_authorization_block() {
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
+plugins:
+  - name: rate_limiter
+    kind: builtin
+    hooks: [cmf.tool_pre_invoke]
+routes:
+  - tool: get_compensation
+    plugins:
+      - rate_limiter
+    authorization:
+      pre_invocation: ["run(rate_limiter)"]
+"#;
+        let message = parse_config(yaml)
+            .expect_err("an authorization block does not license the list")
+            .to_string();
+        assert!(message.contains("run(name)"), "{message}");
+    }
+
+    /// The mapping shape is a different construct that happens to share the
+    /// key: it overrides a plugin a step already invokes, so it stays valid.
+    #[test]
+    fn a_routes_plugins_override_map_loads_in_policy_mode() {
+        let yaml = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: rate_limiter
     kind: builtin
@@ -2545,77 +3466,35 @@ plugins:
 routes:
   - tool: get_compensation
     plugins:
-      - rate_limiter:
-          config:
-            max_requests: 10
+      rate_limiter:
+        config:
+          max_requests: 10
+    authorization:
+      pre_invocation: ["run(rate_limiter)"]
 "#;
-        let config = parse_config(yaml).unwrap();
-        let resolved = plugins_for(&config, "tool", "get_compensation", None, &no_tags());
-        assert_eq!(resolved[0].name, "rate_limiter");
-        assert!(resolved[0].config_overrides.is_some());
-        let overrides = resolved[0].config_overrides.as_ref().unwrap();
-        assert_eq!(overrides["config"]["max_requests"], 10);
+        let config = parse_config(yaml).expect("the override map is not an activation list");
+        assert!(
+            config.routes[0].plugins.is_empty(),
+            "the map is the APL visitor's to read, so the structural Vec stays empty",
+        );
     }
 
+    /// An empty sequence is still a sequence. It reads as "activate nothing",
+    /// which is a shape policy mode has no meaning for.
     #[test]
-    fn test_plugin_ref_mixed_bare_and_overrides() {
+    fn an_empty_plugins_list_is_rejected_in_policy_mode() {
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
-plugins:
-  - name: rate_limiter
-    kind: builtin
-    hooks: [cmf.tool_pre_invoke]
-  - name: pii_scanner
-    kind: builtin
-    hooks: [cmf.tool_pre_invoke]
+engine_settings:
+  dispatch: policy
+plugins: []
 routes:
   - tool: get_compensation
-    plugins:
-      - rate_limiter
-      - pii_scanner:
-          config:
-            sensitivity: high
+    plugins: []
 "#;
-        let config = parse_config(yaml).unwrap();
-        let resolved = plugins_for(&config, "tool", "get_compensation", None, &no_tags());
-        assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved[0].name, "rate_limiter");
-        assert!(resolved[0].config_overrides.is_none());
-        assert_eq!(resolved[1].name, "pii_scanner");
-        assert!(resolved[1].config_overrides.is_some());
-    }
-
-    #[test]
-    fn test_deduplication_preserves_order() {
-        let yaml = r#"
-plugin_settings:
-  routing_enabled: true
-global:
-  policies:
-    all:
-      plugins: [a, b]
-    pii:
-      plugins: [b, c]
-plugins:
-  - name: a
-    kind: builtin
-    hooks: [cmf.tool_pre_invoke]
-  - name: b
-    kind: builtin
-    hooks: [cmf.tool_pre_invoke]
-  - name: c
-    kind: builtin
-    hooks: [cmf.tool_pre_invoke]
-routes:
-  - tool: get_compensation
-    meta:
-      tags: [pii]
-"#;
-        let config = parse_config(yaml).unwrap();
-        let resolved = plugins_for(&config, "tool", "get_compensation", None, &no_tags());
-        let names: Vec<&str> = resolved.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, vec!["a", "b", "c"]);
+        let message = parse_config(yaml)
+            .expect_err("an empty activation list is an activation list")
+            .to_string();
+        assert!(message.contains("run(name)"), "{message}");
     }
 
     #[test]
@@ -2713,9 +3592,13 @@ routes:
         assert!(!matcher.matches("send_email"));
     }
 
+    /// A route that hook mode would never resolve fails on the mode rather
+    /// than on the route's own defects, which is the line to fix first.
     #[test]
-    fn test_validation_skipped_when_routing_disabled() {
+    fn a_routes_block_is_rejected_in_hook_mode() {
         let yaml = r#"
+engine_settings:
+  dispatch: hooks
 plugins:
   - name: test
     kind: builtin
@@ -2724,8 +3607,91 @@ routes:
   - meta:
       tags: [pii]
 "#;
-        let config = parse_config(yaml);
-        config.unwrap();
+        let message = parse_config(yaml)
+            .expect_err("hook dispatch resolves no route")
+            .to_string();
+        assert!(message.contains("`routes`"), "{message}");
+        assert!(message.contains("dispatch: hooks"), "{message}");
+    }
+
+    /// The same for the other two blocks, named one at a time and together.
+    #[test]
+    fn every_policy_mode_block_is_rejected_in_hook_mode() {
+        for (yaml, expected) in [
+            (
+                "engine_settings:\n  dispatch: hooks\nplugins: []\ngroups:\n  hr: {}\n",
+                "`groups`",
+            ),
+            (
+                "engine_settings:\n  dispatch: hooks\nplugins: []\nglobal:\n  \
+                 authentication: []\n",
+                "`global`",
+            ),
+            (
+                "engine_settings:\n  dispatch: hooks\nplugins: []\nglobal:\n  defaults:\n    \
+                 tool: {}\n",
+                "`global`, `global.defaults`",
+            ),
+        ] {
+            let message = parse_config(yaml)
+                .expect_err("hook dispatch resolves none of these")
+                .to_string();
+            assert!(message.contains(expected), "{expected}: {message}");
+            assert!(message.contains("dispatch: hooks"), "{message}");
+        }
+    }
+
+    /// The same document with no `engine_settings:` at all loads, which is the
+    /// default flip: a route is what the unwritten mode expects to see.
+    #[test]
+    fn a_routes_block_loads_under_the_defaulted_mode() {
+        let config = parse_config("plugins: []\nroutes:\n  - tool: t\n")
+            .expect("policy is the default, and a route is policy-mode");
+        assert_eq!(config.dispatch_mode(), DispatchMode::Policy);
+        assert_eq!(config.routes.len(), 1);
+    }
+
+    /// The policy-mode half of the boundary: nothing consults a per-plugin
+    /// condition once a policy decides dispatch.
+    #[test]
+    fn a_plugin_condition_is_rejected_in_policy_mode() {
+        let message = parse_config(
+            r#"
+engine_settings:
+  dispatch: policy
+plugins:
+  - name: pii-scan
+    kind: builtin
+    hooks: [cmf.tool_pre_invoke]
+    conditions:
+      - tools: [get_compensation]
+"#,
+        )
+        .expect_err("a condition is never consulted in policy mode")
+        .to_string();
+        assert!(message.contains("`conditions:`"), "{message}");
+        assert!(message.contains("dispatch: policy"), "{message}");
+        assert!(message.contains("pii-scan"), "{message}");
+    }
+
+    /// `priority:` is not rejected beside `conditions:`. The registry sorts
+    /// every hook's entries by it in both modes, so a policy-mode config's
+    /// priority still decides what runs first.
+    #[test]
+    fn a_plugin_priority_loads_in_policy_mode() {
+        let config = parse_config(
+            r#"
+engine_settings:
+  dispatch: policy
+plugins:
+  - name: pii-scan
+    kind: builtin
+    hooks: [cmf.tool_pre_invoke]
+    priority: 20
+"#,
+        )
+        .expect("policy mode consults priority, so it stays legal");
+        assert_eq!(config.plugins[0].priority, 20);
     }
 
     // -- Scope matching tests --
@@ -2733,160 +3699,56 @@ routes:
     #[test]
     fn test_scope_match_selects_scoped_route() {
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
-plugins:
-  - name: scoped_plugin
-    kind: builtin
-    hooks: [cmf.tool_pre_invoke]
-  - name: global_plugin
-    kind: builtin
-    hooks: [cmf.tool_pre_invoke]
+engine_settings:
+  dispatch: policy
+plugins: []
 routes:
   - tool: get_compensation
     meta:
       scope: hr-services
-    plugins:
-      - scoped_plugin
+    authorization:
+      pre_invocation: ["allow"]
   - tool: get_compensation
-    plugins:
-      - global_plugin
+    authorization:
+      pre_invocation: ["allow"]
 "#;
         let config = parse_config(yaml).unwrap();
 
-        // With matching scope — scoped route wins (more specific)
-        let resolved = plugins_for(
+        // Two routes share a name under different scopes, so the resolved
+        // route is identified by the scope it declared.
+        let scoped = resolve_route(
             &config,
-            "tool",
-            "get_compensation",
-            Some("hr-services"),
-            &no_tags(),
-        );
-        let names: Vec<&str> = resolved.iter().map(|r| r.name.as_str()).collect();
-        assert!(names.contains(&"scoped_plugin"));
-        assert!(!names.contains(&"global_plugin"));
-
-        // Without scope — global route matches
-        let resolved = plugins_for(&config, "tool", "get_compensation", None, &no_tags());
-        let names: Vec<&str> = resolved.iter().map(|r| r.name.as_str()).collect();
-        assert!(names.contains(&"global_plugin"));
-        assert!(!names.contains(&"scoped_plugin"));
-
-        // With different scope — global route matches (scoped doesn't)
-        let resolved = plugins_for(
-            &config,
-            "tool",
-            "get_compensation",
-            Some("billing"),
-            &no_tags(),
-        );
-        let names: Vec<&str> = resolved.iter().map(|r| r.name.as_str()).collect();
-        assert!(names.contains(&"global_plugin"));
-        assert!(!names.contains(&"scoped_plugin"));
-    }
-
-    // -- Tag merging tests --
-
-    #[test]
-    fn test_host_tags_merged_with_route_tags() {
-        let yaml = r#"
-plugin_settings:
-  routing_enabled: true
-global:
-  policies:
-    pii:
-      plugins: [pii_plugin]
-    runtime_tag:
-      plugins: [runtime_plugin]
-plugins:
-  - name: pii_plugin
-    kind: builtin
-    hooks: [cmf.tool_pre_invoke]
-  - name: runtime_plugin
-    kind: builtin
-    hooks: [cmf.tool_pre_invoke]
-routes:
-  - tool: get_compensation
-    meta:
-      tags: [pii]
-"#;
-        let config = parse_config(yaml).unwrap();
-
-        // Host provides a runtime tag that matches a policy group
-        let mut host_tags = HashSet::new();
-        host_tags.insert("runtime_tag".to_owned());
-
-        let resolved = plugins_for(&config, "tool", "get_compensation", None, &host_tags);
-        let names: Vec<&str> = resolved.iter().map(|r| r.name.as_str()).collect();
-
-        // Both route's static tag (pii) and host's runtime tag activate their groups
-        assert!(names.contains(&"pii_plugin"));
-        assert!(names.contains(&"runtime_plugin"));
-    }
-
-    // -- When clause carried tests --
-
-    #[test]
-    fn test_when_clause_carried_on_resolved_plugins() {
-        let yaml = r#"
-plugin_settings:
-  routing_enabled: true
-plugins:
-  - name: conditional_plugin
-    kind: builtin
-    hooks: [cmf.tool_pre_invoke]
-routes:
-  - tool: get_compensation
-    when: "args.include_ssn == true"
-    plugins:
-      - conditional_plugin
-"#;
-        let config = parse_config(yaml).unwrap();
-        let resolved = plugins_for(&config, "tool", "get_compensation", None, &no_tags());
-        assert_eq!(resolved[0].name, "conditional_plugin");
+            RouteQuery::named("tool", "get_compensation").with_scope(Some("hr-services")),
+        )
+        .expect("the scoped route matches its own scope");
         assert_eq!(
-            resolved[0].when.as_deref(),
-            Some("args.include_ssn == true")
+            scoped.route.meta.as_ref().and_then(|m| m.scope.as_deref()),
+            Some("hr-services"),
         );
-    }
 
-    #[test]
-    fn test_when_clause_not_on_policy_group_plugins() {
-        let yaml = r#"
-plugin_settings:
-  routing_enabled: true
-global:
-  policies:
-    all:
-      plugins: [global_plugin]
-plugins:
-  - name: global_plugin
-    kind: builtin
-    hooks: [cmf.tool_pre_invoke]
-  - name: route_plugin
-    kind: builtin
-    hooks: [cmf.tool_pre_invoke]
-routes:
-  - tool: get_compensation
-    when: "args.sensitive == true"
-    plugins:
-      - route_plugin
-"#;
-        let config = parse_config(yaml).unwrap();
-        let resolved = plugins_for(&config, "tool", "get_compensation", None, &no_tags());
-
-        // global_plugin has no when clause (from all group)
-        let global = resolved.iter().find(|r| r.name == "global_plugin").unwrap();
-        assert!(global.when.is_none());
-
-        // route_plugin carries the route's when clause
-        let route = resolved.iter().find(|r| r.name == "route_plugin").unwrap();
-        assert_eq!(route.when.as_deref(), Some("args.sensitive == true"));
+        for request_scope in [None, Some("billing")] {
+            let unscoped = resolve_route(
+                &config,
+                RouteQuery::named("tool", "get_compensation").with_scope(request_scope),
+            )
+            .expect("the unscoped route matches every other scope");
+            assert!(
+                unscoped
+                    .route
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.scope.as_deref())
+                    .is_none(),
+                "a scoped route must not answer for scope {request_scope:?}",
+            );
+        }
     }
 
     #[test]
     fn parse_route_identity_list_form() {
         let yaml = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - { name: corp-jwt, kind: builtin, hooks: [identity.resolve] }
   - { name: spiffe-attestor, kind: builtin, hooks: [identity.resolve] }
@@ -2898,18 +3760,19 @@ routes:
 "#;
         let cfg = parse_config(yaml).unwrap();
         let route = &cfg.routes[0];
-        let id = route.identity.as_ref().expect("identity present");
+        let id = route.authentication.as_ref().expect("identity present");
         assert!(!id.replace_inherited);
         assert_eq!(id.steps.len(), 2);
         assert_eq!(id.steps[0].name, "corp-jwt");
         assert!(id.steps[0].config_override.is_none());
-        assert!(id.steps[0].on_error.is_none());
         assert_eq!(id.steps[1].name, "spiffe-attestor");
     }
 
     #[test]
     fn parse_route_identity_object_form_carries_replace_inherited() {
         let yaml = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - { name: legacy-basic-auth, kind: builtin, hooks: [identity.resolve] }
 routes:
@@ -2920,30 +3783,30 @@ routes:
         - legacy-basic-auth
 "#;
         let cfg = parse_config(yaml).unwrap();
-        let id = cfg.routes[0].identity.as_ref().unwrap();
+        let id = cfg.routes[0].authentication.as_ref().unwrap();
         assert!(id.replace_inherited);
         assert_eq!(id.steps.len(), 1);
         assert_eq!(id.steps[0].name, "legacy-basic-auth");
     }
 
     #[test]
-    fn parse_route_identity_map_step_with_on_error_and_config() {
+    fn parse_route_identity_map_step_with_config() {
         let yaml = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - { name: corp-jwt, kind: builtin, hooks: [identity.resolve] }
 routes:
   - tool: get_weather
     authentication:
       - name: corp-jwt
-        on_error: deny
         config:
           audience: my-tool
 "#;
         let cfg = parse_config(yaml).unwrap();
-        let id = cfg.routes[0].identity.as_ref().unwrap();
+        let id = cfg.routes[0].authentication.as_ref().unwrap();
         let s0 = &id.steps[0];
         assert_eq!(s0.name, "corp-jwt");
-        assert_eq!(s0.on_error.as_deref(), Some("deny"));
         let cfg_override = s0.config_override.as_ref().expect("config_override set");
         assert_eq!(
             cfg_override.get("audience").and_then(|v| v.as_str()),
@@ -2951,9 +3814,57 @@ routes:
         );
     }
 
+    /// A step's `on_error:` was parsed and read by nothing. It is gone, and the
+    /// error names the plugin declaration that carries the real one.
+    #[test]
+    fn parse_route_identity_step_rejects_on_error() {
+        let yaml = r#"
+engine_settings:
+  dispatch: policy
+plugins:
+  - { name: corp-jwt, kind: builtin, hooks: [identity.resolve] }
+routes:
+  - tool: get_weather
+    authentication:
+      - name: corp-jwt
+        on_error: deny
+"#;
+        let err = parse_config(yaml)
+            .expect_err("`on_error:` is no longer a step key")
+            .to_string();
+        assert!(
+            err.contains("on_error") && err.contains("plugins:"),
+            "the error must name the key and the declaration that carries it: {err}"
+        );
+    }
+
+    /// The catch-all a step used to flatten swallowed a typo whole, leaving the
+    /// step running with the default the misspelled key meant to change.
+    #[test]
+    fn parse_route_identity_step_rejects_a_misspelled_key() {
+        let yaml = r#"
+engine_settings:
+  dispatch: policy
+plugins:
+  - { name: corp-jwt, kind: builtin, hooks: [identity.resolve] }
+routes:
+  - tool: get_weather
+    authentication:
+      - name: corp-jwt
+        confg:
+          audience: my-tool
+"#;
+        let err = parse_config(yaml)
+            .expect_err("a misspelled step key must fail the load")
+            .to_string();
+        assert!(err.contains("confg"), "the error must name the key: {err}");
+    }
+
     #[test]
     fn parse_route_identity_mixed_bare_and_map_steps() {
         let yaml = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - { name: corp-jwt, kind: builtin, hooks: [identity.resolve] }
   - { name: spiffe-attestor, kind: builtin, hooks: [identity.resolve] }
@@ -2961,19 +3872,21 @@ routes:
   - tool: get_weather
     authentication:
       - name: corp-jwt
-        on_error: deny
+        config: { audience: my-tool }
       - spiffe-attestor
 "#;
         let cfg = parse_config(yaml).unwrap();
-        let steps = &cfg.routes[0].identity.as_ref().unwrap().steps;
+        let steps = &cfg.routes[0].authentication.as_ref().unwrap().steps;
         assert_eq!(steps.len(), 2);
-        assert_eq!(steps[0].on_error.as_deref(), Some("deny"));
-        assert!(steps[1].on_error.is_none());
+        assert!(steps[0].config_override.is_some());
+        assert!(steps[1].config_override.is_none());
     }
 
     #[test]
     fn parse_route_identity_object_form_without_steps_errors() {
         let yaml = r#"
+engine_settings:
+  dispatch: policy
 routes:
   - tool: bad
     authentication:
@@ -2987,6 +3900,8 @@ routes:
     #[test]
     fn parse_route_identity_replace_inherited_must_be_boolean() {
         let yaml = r#"
+engine_settings:
+  dispatch: policy
 routes:
   - tool: bad
     authentication:
@@ -3002,6 +3917,8 @@ routes:
     #[test]
     fn parse_route_identity_empty_step_name_errors() {
         let yaml = r#"
+engine_settings:
+  dispatch: policy
 routes:
   - tool: bad
     authentication:
@@ -3013,20 +3930,20 @@ routes:
     }
 
     #[test]
-    fn legacy_identity_key_is_rejected_at_route_and_global() {
-        // The legacy `identity:` key must fail loudly, never be silently
+    fn the_removed_identity_key_is_rejected_at_route_and_above() {
+        // The removed `identity:` key must fail loudly, never be silently
         // dropped (which would skip authentication — a fail-open).
         for yaml in [
             "routes:\n  - tool: t\n    identity:\n      - corp-jwt\n",
             "global:\n  identity:\n    - corp-jwt\n",
-            "global:\n  policies:\n    all:\n      identity:\n        - corp-jwt\n",
+            "groups:\n  all:\n    identity:\n      - corp-jwt\n",
             "global:\n  defaults:\n    tool:\n      identity:\n        - corp-jwt\n",
         ] {
-            let err = parse_config(yaml).expect_err("legacy identity: must be rejected");
+            let err = parse_config(yaml).expect_err("`identity:` must be rejected");
             let msg = format!("{err}");
             assert!(
                 msg.contains("identity") && msg.contains("authentication"),
-                "rejection should name the rename: {msg}"
+                "the rejection should name the replacement: {msg}"
             );
         }
     }
@@ -3034,6 +3951,8 @@ routes:
     #[test]
     fn parse_route_identity_scalar_shape_errors() {
         let yaml = r#"
+engine_settings:
+  dispatch: policy
 routes:
   - tool: bad
     authentication: 42
@@ -3046,6 +3965,8 @@ routes:
     #[test]
     fn resolve_identity_returns_empty_when_no_route_matches() {
         let yaml = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - { name: corp-jwt, kind: builtin, hooks: [identity.resolve] }
 routes:
@@ -3061,12 +3982,14 @@ routes:
     #[test]
     fn resolve_identity_returns_empty_when_route_has_no_identity_block() {
         let yaml = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - { name: rate_limiter, kind: builtin, hooks: [cmf.tool_pre_invoke] }
 routes:
   - tool: get_weather
-    plugins:
-      - rate_limiter
+    authorization:
+      pre_invocation: ["run(rate_limiter)"]
 "#;
         let cfg = parse_config(yaml).unwrap();
         let resolved = identity_for(&cfg, "tool", "get_weather", None);
@@ -3076,6 +3999,8 @@ routes:
     #[test]
     fn resolve_identity_preserves_declared_order() {
         let yaml = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - { name: corp-jwt, kind: builtin, hooks: [identity.resolve] }
   - { name: spiffe-attestor, kind: builtin, hooks: [identity.resolve] }
@@ -3100,6 +4025,8 @@ routes:
         // `config_override` under that key so the existing override
         // pathway picks it up without a special case.
         let yaml = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - { name: corp-jwt, kind: builtin, hooks: [identity.resolve] }
 routes:
@@ -3125,11 +4052,11 @@ routes:
 
     #[test]
     fn resolve_identity_includes_global_layer_when_route_has_no_block() {
-        // global.identity defined; route declares no identity. The
+        // global.authentication defined; route declares none of its own. The
         // route should inherit the global steps unchanged.
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - { name: corp-jwt, kind: builtin, hooks: [identity.resolve] }
 global:
@@ -3150,8 +4077,8 @@ routes:
         // is the list form (implicit replace_inherited=false), so
         // its steps APPEND after the global's.
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - { name: corp-jwt, kind: builtin, hooks: [identity.resolve] }
   - { name: agent-context, kind: builtin, hooks: [identity.resolve] }
@@ -3175,8 +4102,8 @@ routes:
         // Order is global first, then the matching tag's bundle,
         // then the route's own steps.
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - { name: corp-jwt, kind: builtin, hooks: [identity.resolve] }
   - { name: workday-saml, kind: builtin, hooks: [identity.resolve] }
@@ -3184,10 +4111,10 @@ plugins:
 global:
   authentication:
     - corp-jwt
-  policies:
-    finance:
-      authentication:
-        - workday-saml
+groups:
+  finance:
+    authentication:
+      - workday-saml
 routes:
   - tool: get_compensation
     meta:
@@ -3206,8 +4133,8 @@ routes:
         // Route says `replace_inherited: true` → only route's steps
         // survive. Global and tag-bundle contributions get dropped.
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - { name: corp-jwt, kind: builtin, hooks: [identity.resolve] }
   - { name: workday-saml, kind: builtin, hooks: [identity.resolve] }
@@ -3215,10 +4142,10 @@ plugins:
 global:
   authentication:
     - corp-jwt
-  policies:
-    finance:
-      authentication:
-        - workday-saml
+groups:
+  finance:
+    authentication:
+      - workday-saml
 routes:
   - tool: legacy_endpoint
     meta:
@@ -3240,8 +4167,8 @@ routes:
         // opt-out — anonymous routes use this to suppress inherited
         // identity entirely.
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - { name: corp-jwt, kind: builtin, hooks: [identity.resolve] }
 global:
@@ -3258,20 +4185,252 @@ routes:
         assert!(resolved.is_empty());
     }
 
+    /// Two bundles, the second replacing: the global layer and the first
+    /// bundle go, the second bundle and the route stay.
+    const TWO_BUNDLES_SECOND_REPLACES: &str = r#"
+engine_settings:
+  dispatch: policy
+plugins:
+  - { name: corp-jwt, kind: builtin, hooks: [identity.resolve] }
+  - { name: workday-saml, kind: builtin, hooks: [identity.resolve] }
+  - { name: legacy-basic-auth, kind: builtin, hooks: [identity.resolve] }
+  - { name: agent-context, kind: builtin, hooks: [identity.resolve] }
+global:
+  authentication:
+    - corp-jwt
+groups:
+  finance:
+    authentication:
+      - workday-saml
+  legacy:
+    authentication:
+      replace_inherited: true
+      steps:
+        - legacy-basic-auth
+routes:
+  - tool: get_compensation
+    meta:
+      tags: [finance, legacy]
+    authentication:
+      - agent-context
+"#;
+
+    #[test]
+    fn resolve_identity_bundle_replace_inherited_drops_the_layers_before_it() {
+        let cfg = parse_config(TWO_BUNDLES_SECOND_REPLACES).unwrap();
+        let resolved = identity_for(&cfg, "tool", "get_compensation", None);
+        let names: Vec<&str> = resolved.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["legacy-basic-auth", "agent-context"],
+            "the replacing bundle drops the global layer and the bundle before it, \
+             and the route still appends",
+        );
+    }
+
+    /// `global.defaults.<entity>:` carries `authentication:` the way a bundle
+    /// does, and it used to be accepted and read by nothing: the steps
+    /// deserialized, and the resolver walked global to bundles to route
+    /// straight past them. A key accepted and honored nowhere is what the rest
+    /// of this key model exists to prevent.
+    #[test]
+    fn resolve_identity_reads_the_entity_default_layer() {
+        let yaml = r#"
+plugins:
+  - { name: corp-jwt, kind: builtin, hooks: [identity.resolve] }
+  - { name: tool-attestor, kind: builtin, hooks: [identity.resolve] }
+  - { name: agent-context, kind: builtin, hooks: [identity.resolve] }
+global:
+  authentication:
+    - corp-jwt
+  defaults:
+    tool:
+      authentication:
+        - tool-attestor
+routes:
+  - tool: get_compensation
+    authentication:
+      - agent-context
+  - resource: report
+"#;
+        let cfg = parse_config(yaml).unwrap();
+        let resolved = identity_for(&cfg, "tool", "get_compensation", None);
+        let names: Vec<&str> = resolved.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["corp-jwt", "tool-attestor", "agent-context"],
+            "the entity default stacks between the global layer and the route, \
+             the order the policy layers stack in",
+        );
+        let elsewhere = identity_for(&cfg, "resource", "report", None);
+        let other: Vec<&str> = elsewhere.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            other,
+            vec!["corp-jwt"],
+            "and it reaches only its own entity type",
+        );
+    }
+
+    /// The flag on an entity default drops what stacked before it, the way a
+    /// bundle's does, and the load names the route that lost the steps.
+    #[test]
+    fn an_entity_default_can_replace_the_inherited_authentication() {
+        let yaml = r#"
+plugins:
+  - { name: corp-jwt, kind: builtin, hooks: [identity.resolve] }
+  - { name: tool-attestor, kind: builtin, hooks: [identity.resolve] }
+global:
+  authentication:
+    - corp-jwt
+  defaults:
+    tool:
+      authentication:
+        replace_inherited: true
+        steps:
+          - tool-attestor
+routes:
+  - tool: get_compensation
+"#;
+        let cfg = parse_config(yaml).unwrap();
+        let resolved = identity_for(&cfg, "tool", "get_compensation", None);
+        let names: Vec<&str> = resolved.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["tool-attestor"], "the global layer is dropped");
+        assert_eq!(
+            dropped_inherited_authentication(&cfg),
+            vec![DroppedAuthentication {
+                route: "tool:get_compensation".to_owned(),
+                declared_in: "global.defaults.tool".to_owned(),
+                dropped: vec!["corp-jwt".to_owned()],
+            }],
+            "and the drop is reported, since the route's own block does not show it",
+        );
+    }
+
+    #[test]
+    fn resolve_identity_bundle_order_decides_what_the_flag_drops() {
+        // The same two bundles named the other way round: `legacy` replaces
+        // the global layer only, so `finance` survives behind it. Which
+        // bundle replaces is readable from tag declaration order.
+        let yaml = TWO_BUNDLES_SECOND_REPLACES
+            .replace("tags: [finance, legacy]", "tags: [legacy, finance]");
+        let cfg = parse_config(&yaml).unwrap();
+        let resolved = identity_for(&cfg, "tool", "get_compensation", None);
+        let names: Vec<&str> = resolved.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["legacy-basic-auth", "workday-saml", "agent-context"],
+        );
+    }
+
+    #[test]
+    fn resolve_identity_bundle_replace_inherited_with_empty_steps_contributes_nothing() {
+        let yaml = r#"
+engine_settings:
+  dispatch: policy
+plugins:
+  - { name: corp-jwt, kind: builtin, hooks: [identity.resolve] }
+groups:
+  public:
+    authentication:
+      replace_inherited: true
+      steps: []
+global:
+  authentication:
+    - corp-jwt
+routes:
+  - tool: healthcheck
+    groups: public
+"#;
+        let cfg = parse_config(yaml).unwrap();
+        assert!(
+            identity_for(&cfg, "tool", "healthcheck", None).is_empty(),
+            "an empty replacing bundle is the anonymous-route knob at bundle scope",
+        );
+    }
+
+    #[test]
+    fn dropped_inherited_authentication_names_the_route_and_the_bundle() {
+        let cfg = parse_config(TWO_BUNDLES_SECOND_REPLACES).unwrap();
+        assert_eq!(
+            dropped_inherited_authentication(&cfg),
+            vec![DroppedAuthentication {
+                route: "tool:get_compensation".to_owned(),
+                declared_in: "groups.legacy".to_owned(),
+                dropped: vec!["corp-jwt".to_owned(), "workday-saml".to_owned()],
+            }],
+        );
+    }
+
+    #[test]
+    fn dropped_inherited_authentication_is_silent_when_the_route_replaces() {
+        // The route's own flag drops the same layers, and its author can
+        // read that off the route. Nothing to report.
+        let yaml = r#"
+engine_settings:
+  dispatch: policy
+plugins:
+  - { name: corp-jwt, kind: builtin, hooks: [identity.resolve] }
+  - { name: legacy-basic-auth, kind: builtin, hooks: [identity.resolve] }
+global:
+  authentication:
+    - corp-jwt
+groups:
+  legacy:
+    authentication:
+      replace_inherited: true
+      steps:
+        - legacy-basic-auth
+routes:
+  - tool: legacy_endpoint
+    groups: legacy
+    authentication:
+      replace_inherited: true
+      steps:
+        - legacy-basic-auth
+"#;
+        let cfg = parse_config(yaml).unwrap();
+        assert!(dropped_inherited_authentication(&cfg).is_empty());
+    }
+
+    #[test]
+    fn dropped_inherited_authentication_is_silent_when_nothing_was_inherited() {
+        // A replacing bundle with no layer before it drops nothing, so
+        // reporting it would send an operator after a non-event.
+        let yaml = r#"
+engine_settings:
+  dispatch: policy
+plugins:
+  - { name: legacy-basic-auth, kind: builtin, hooks: [identity.resolve] }
+groups:
+  legacy:
+    authentication:
+      replace_inherited: true
+      steps:
+        - legacy-basic-auth
+routes:
+  - tool: legacy_endpoint
+    groups: legacy
+"#;
+        let cfg = parse_config(yaml).unwrap();
+        assert!(dropped_inherited_authentication(&cfg).is_empty());
+        let resolved = identity_for(&cfg, "tool", "legacy_endpoint", None);
+        let names: Vec<&str> = resolved.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["legacy-basic-auth"]);
+    }
+
     #[test]
     fn resolve_identity_tag_bundle_only_when_route_carries_the_tag() {
         // The tag bundle's identity only contributes when the route
         // declares the matching tag — not for unrelated routes.
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - { name: workday-saml, kind: builtin, hooks: [identity.resolve] }
-global:
-  policies:
-    finance:
-      authentication:
-        - workday-saml
+groups:
+  finance:
+    authentication:
+      - workday-saml
 routes:
   - tool: with_tag
     meta:
@@ -3297,17 +4456,17 @@ routes:
     fn groups_field_is_sugar_for_meta_tags_in_plugin_resolution() {
         // A route's `groups:` joins the same bundle as `meta.tags` — both
         // desugar to the same tag set, so resolution is identical. String and
-        // list forms both work.
+        // list forms both work. Read through `authentication:`, the dispatch
+        // list a bundle still contributes.
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - { name: pii-scan, kind: builtin, hooks: [identity.resolve] }
-global:
-  policies:
-    hr-tools:
-      plugins:
-        - pii-scan
+groups:
+  hr-tools:
+    authentication:
+      - pii-scan
 routes:
   - tool: via_tags
     meta:
@@ -3318,9 +4477,8 @@ routes:
     groups: hr-tools
 "#;
         let cfg = parse_config(yaml).unwrap();
-        let no_runtime = HashSet::new();
         let names = |entity: &str| {
-            plugins_for(&cfg, "tool", entity, None, &no_runtime)
+            identity_for(&cfg, "tool", entity, None)
                 .iter()
                 .map(|r| r.name.clone())
                 .collect::<Vec<_>>()
@@ -3343,15 +4501,14 @@ routes:
     fn groups_field_is_sugar_for_meta_tags_in_identity_resolution() {
         // The same sugar applies to the identity (authentication) resolver.
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - { name: workday-saml, kind: builtin, hooks: [identity.resolve] }
-global:
-  policies:
-    finance:
-      authentication:
-        - workday-saml
+groups:
+  finance:
+    authentication:
+      - workday-saml
 routes:
   - tool: via_groups
     groups: finance
@@ -3369,17 +4526,16 @@ routes:
     fn groups_and_meta_tags_compose_as_a_union() {
         // A route may carry both spellings; effective membership is the union.
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - { name: a, kind: builtin, hooks: [identity.resolve] }
   - { name: b, kind: builtin, hooks: [identity.resolve] }
-global:
-  policies:
-    grp-a:
-      authentication: [a]
-    grp-b:
-      authentication: [b]
+groups:
+  grp-a:
+    authentication: [a]
+  grp-b:
+    authentication: [b]
 routes:
   - tool: both
     meta:
@@ -3397,12 +4553,13 @@ routes:
     }
 
     #[test]
-    fn top_level_groups_section_is_the_canonical_bundle_location() {
-        // Bundles can live at top-level `groups:` (canonical) instead of
-        // `global.policies:` (deprecated); a route joins one the same way.
+    fn top_level_groups_is_the_only_bundle_location() {
+        // Bundles live at top-level `groups:` and nowhere else. This is the
+        // shape a config that used to write `global.policies:` becomes, and it
+        // resolves the same way that one did.
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - { name: workday-saml, kind: builtin, hooks: [identity.resolve] }
 groups:
@@ -3418,65 +4575,33 @@ routes:
         assert_eq!(
             resolved.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
             vec!["workday-saml"],
-            "a bundle at top-level groups: resolves like one at global.policies:"
+            "a bundle at top-level groups: must resolve"
         );
     }
 
     #[test]
-    fn top_level_groups_and_deprecated_global_policies_both_apply() {
-        // Both locations coexist and contribute; neither shadows the other.
+    fn a_bundle_under_global_policies_is_rejected() {
+        // The removed location fails the load naming what replaced it, rather
+        // than dropping the bundle and leaving every route that joins it
+        // unguarded.
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
-  - { name: a, kind: builtin, hooks: [identity.resolve] }
   - { name: b, kind: builtin, hooks: [identity.resolve] }
-groups:
-  new-loc:
-    authentication: [a]
 global:
   policies:
     old-loc:
       authentication: [b]
 routes:
   - tool: mixed
-    groups: [new-loc, old-loc]
+    groups: [old-loc]
 "#;
-        let cfg = parse_config(yaml).unwrap();
-        let resolved = identity_for(&cfg, "tool", "mixed", None);
-        let names: Vec<_> = resolved.iter().map(|r| r.name.as_str()).collect();
-        assert!(names.contains(&"a"), "top-level groups applies: {names:?}");
+        let err = parse_config(yaml).expect_err("`global.policies:` must be rejected");
+        let msg = format!("{err}");
         assert!(
-            names.contains(&"b"),
-            "deprecated global.policies applies: {names:?}"
-        );
-    }
-
-    #[test]
-    fn top_level_groups_wins_on_name_collision_with_global_policies() {
-        let yaml = r#"
-plugin_settings:
-  routing_enabled: true
-plugins:
-  - { name: canonical, kind: builtin, hooks: [identity.resolve] }
-  - { name: deprecated, kind: builtin, hooks: [identity.resolve] }
-groups:
-  dup:
-    authentication: [canonical]
-global:
-  policies:
-    dup:
-      authentication: [deprecated]
-routes:
-  - tool: t
-    groups: dup
-"#;
-        let cfg = parse_config(yaml).unwrap();
-        let resolved = identity_for(&cfg, "tool", "t", None);
-        assert_eq!(
-            resolved.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
-            vec!["canonical"],
-            "canonical top-level groups: must win over deprecated global.policies:"
+            msg.contains("policies") && msg.contains("groups"),
+            "the rejection must name the key and its replacement: {msg}"
         );
     }
 
@@ -3484,8 +4609,8 @@ routes:
     fn stale_identity_key_under_top_level_groups_is_rejected() {
         // The fail-loud guard extends to the new location.
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 groups:
   finance:
     identity:
@@ -3502,8 +4627,8 @@ groups:
         // A typo'd `groups:` value must fail at load, not silently
         // leave the route without the group's authentication.
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - { name: jwt-hr, kind: identity/jwt, hooks: [identity.resolve] }
 groups:
@@ -3524,8 +4649,8 @@ routes:
         // Sanity: a correct `groups:` reference (and via meta.tags, which
         // stays permissive) validates fine.
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - { name: jwt-hr, kind: identity/jwt, hooks: [identity.resolve] }
 groups:
@@ -3547,6 +4672,8 @@ routes:
         // so requests for a different scope shouldn't pick up
         // identity from this route.
         let yaml = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - { name: corp-jwt, kind: builtin, hooks: [identity.resolve] }
 routes:
@@ -3607,7 +4734,7 @@ routes:
     }
 
     #[test]
-    fn defaults_and_policies_plugins_map_loads() {
+    fn defaults_and_bundle_plugins_map_loads() {
         let cfg = deserialize_cfg(
             r#"
 global:
@@ -3616,17 +4743,19 @@ global:
       plugins:
         audit:
           on_error: ignore
-  policies:
-    sensitive:
-      plugins:
-        pii_scanner:
-          config:
-            sensitivity: high
+groups:
+  sensitive:
+    plugins:
+      pii_scanner:
+        config:
+          sensitivity: high
 "#,
         )
-        .expect("defaults/policies plugins map must deserialize");
+        .expect("defaults/bundle plugins map must deserialize");
         assert!(cfg.global.defaults["tool"].plugins.is_empty());
-        assert!(cfg.global.policies["sensitive"].plugins.is_empty());
+        // A bare deserialize does not fold `groups:` into the bundle store, so
+        // the bundle is read where the document wrote it.
+        assert!(cfg.groups["sensitive"].plugins.is_empty());
     }
 
     #[test]
@@ -3722,8 +4851,8 @@ routes:
     #[test]
     fn every_http_selector_shape_parses_and_serializes_back() {
         let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - http: /healthz
@@ -3782,8 +4911,8 @@ routes:
     fn a_trailing_slash_on_a_prefix_parses_to_the_same_selector() {
         let cfg = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   # Distinct scopes, since two routes resolving to one name in one scope is
@@ -3815,8 +4944,8 @@ routes:
     fn the_root_prefix_keeps_its_slash() {
         let cfg = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - http: { path_prefix: "/" }
@@ -3841,8 +4970,8 @@ routes:
     fn http_routes_with_a_catch_all_leave_no_gap_to_report() {
         let cfg = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - http: /healthz
@@ -3864,8 +4993,8 @@ routes:
     fn http_routes_without_a_catch_all_report_the_fallback_to_global() {
         let cfg = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - http: /healthz
@@ -3890,8 +5019,8 @@ routes:
     fn a_root_prefix_narrowed_by_method_is_not_the_catch_all() {
         let cfg = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - http: { path_prefix: "/", method: GET }
@@ -3905,27 +5034,23 @@ routes:
         );
     }
 
-    /// Routing off is the default, and it makes every `http:` route inert
-    /// rather than merely incomplete. That is the line to fix, so it is the
-    /// only one reported.
+    /// The routing-off report is gone rather than reworded: hook dispatch
+    /// rejects `routes:` outright, so an `http:` route only ever reaches the gap
+    /// scan in policy mode and the branch had no input left.
     #[test]
-    fn http_routes_with_routing_disabled_are_reported_as_inert() {
-        let cfg = parse_config(
+    fn an_http_route_under_hook_dispatch_never_reaches_the_gap_scan() {
+        let message = parse_config(
             r#"
+engine_settings:
+  dispatch: hooks
 plugins: []
 routes:
   - http: { path_prefix: /v1/files }
 "#,
         )
-        .expect("routing off still loads");
-        let gaps = http_routing_gaps(&cfg);
-        assert_eq!(gaps.len(), 1, "one gap, not two: {gaps:?}");
-        assert!(gaps[0].contains("routing_enabled"), "{}", gaps[0]);
-        assert!(
-            !gaps[0].contains("path_prefix"),
-            "the missing catch-all is not the problem to fix first: {}",
-            gaps[0]
-        );
+        .expect_err("hook dispatch rejects the route before any gap is scanned")
+        .to_string();
+        assert!(message.contains("`routes`"), "{message}");
     }
 
     /// A configuration that declares no `http:` route is what every deployment
@@ -3935,8 +5060,8 @@ routes:
     fn a_config_with_no_http_route_reports_no_gap() {
         let cfg = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - tool: get_compensation
@@ -3959,8 +5084,34 @@ routes:
     fn a_global_default_for_http_is_reachable_by_entity_type() {
         let cfg = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
+plugins:
+  - name: corp-jwt
+    kind: builtin
+    hooks: [http.request]
+global:
+  defaults:
+    http:
+      description: the http entity default
+"#,
+        )
+        .expect("`global.defaults.http` must parse");
+
+        assert!(
+            cfg.global.defaults.contains_key("http"),
+            "an http default has to survive the load"
+        );
+    }
+
+    /// A `global.defaults.<entity>` entry is a scope like any other, so its
+    /// activation list is rejected under its own path.
+    #[test]
+    fn an_entity_defaults_plugins_list_is_rejected_in_policy_mode() {
+        let message = parse_config(
+            r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: corp-jwt
     kind: builtin
@@ -3971,15 +5122,10 @@ global:
       plugins: [corp-jwt]
 "#,
         )
-        .expect("`global.defaults.http` must parse");
-
-        assert!(cfg.global.defaults.contains_key("http"));
-        let resolved = plugins_for(&cfg, "http", "*", None, &no_tags());
-        assert_eq!(
-            resolved.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
-            ["corp-jwt"],
-            "an http default has to reach an http request"
-        );
+        .expect_err("a defaults entry cannot activate a plugin in policy mode")
+        .to_string();
+        assert!(message.contains("global.defaults.http"), "{message}");
+        assert!(message.contains("run(name)"), "{message}");
     }
 
     /// A misspelled entity type under `global.defaults` applies to nothing, so
@@ -3988,13 +5134,13 @@ global:
     fn a_global_default_for_an_unknown_entity_type_is_rejected() {
         let err = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 global:
   defaults:
     htp:
-      plugins: []
+      description: a misspelled entity type
 "#,
         )
         .expect_err("an unknown entity type must fail the load")
@@ -4011,8 +5157,8 @@ global:
     fn a_route_declaring_http_beside_tool_names_both() {
         let err = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - tool: get_compensation
@@ -4030,8 +5176,8 @@ routes:
     fn a_route_with_no_selector_names_http_among_the_alternatives() {
         let err = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - meta:
@@ -4050,8 +5196,8 @@ routes:
     fn a_misspelled_route_key_names_the_key_and_the_route() {
         let err = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - tool: get_weather
@@ -4064,14 +5210,14 @@ routes:
         assert!(err.contains("htp"), "the key as written: {err}");
     }
 
-    /// The renamed-key check runs first, so a stale `identity:` block still
-    /// gets the message that tells the operator what to rename it to.
+    /// The unknown-key error carries the replacement, so a stale `identity:`
+    /// block still tells the operator what to write instead.
     #[test]
-    fn a_stale_identity_key_still_reports_the_rename() {
+    fn a_stale_identity_key_names_its_replacement() {
         let err = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - tool: get_weather
@@ -4079,20 +5225,20 @@ routes:
       - corp-jwt
 "#,
         )
-        .expect_err("a renamed key must fail the load")
+        .expect_err("a removed key must fail the load")
         .to_string();
-        assert!(err.contains("renamed to `authentication`"), "{err}");
+        assert!(err.contains("replaced by `authentication`"), "{err}");
     }
 
-    /// A stale `policy:` block is a rename, not a typo. The rename check runs
-    /// before the unknown-key scan so the operator is told what to rename it
-    /// to rather than sent looking for a misspelling.
+    /// A stale `policy:` block gets more than the key set: the unknown-key error
+    /// names the spelling that replaced it, so the operator is told where the
+    /// block's contents belong rather than sent looking for a misspelling.
     #[test]
-    fn a_stale_policy_key_on_a_route_reports_the_rename() {
+    fn a_stale_policy_key_on_a_route_names_its_replacement() {
         let err = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - tool: get_weather
@@ -4100,23 +5246,22 @@ routes:
       - "require(authenticated)"
 "#,
         )
-        .expect_err("a renamed key must fail the load")
+        .expect_err("a removed key must fail the load")
         .to_string();
         assert!(
-            err.contains("renamed to `authorization.pre_invocation"),
-            "the rename, not a typo: {err}"
+            err.contains("replaced by `authorization.pre_invocation"),
+            "the replacement, not the key set alone: {err}"
         );
-        assert!(!err.contains("unknown key"), "{err}");
     }
 
-    /// The post-phase half of the same rename. Dropping either block leaves
+    /// The post-phase half of the same removal. Dropping either block leaves
     /// no authorization enforced, so both fail the load.
     #[test]
-    fn a_stale_post_policy_key_on_a_route_reports_the_rename() {
+    fn a_stale_post_policy_key_on_a_route_names_its_replacement() {
         let err = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - tool: get_weather
@@ -4124,22 +5269,22 @@ routes:
       - "require(authenticated)"
 "#,
         )
-        .expect_err("a renamed key must fail the load")
+        .expect_err("a removed key must fail the load")
         .to_string();
         assert!(
-            err.contains("renamed to `authorization.post_invocation"),
+            err.contains("replaced by `authorization.post_invocation"),
             "{err}"
         );
     }
 
-    /// The rename is the more specific diagnostic, so it wins even when the
-    /// route also carries keys nothing reads.
+    /// One load names every bad key, and the replacement clause is attached to
+    /// the key that has one rather than to the list.
     #[test]
-    fn a_rename_outranks_the_unknown_keys_beside_it() {
+    fn a_replacement_is_named_beside_the_unknown_keys_it_shares_the_route_with() {
         let err = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - tool: get_weather
@@ -4148,10 +5293,11 @@ routes:
     htp: /v1/files
 "#,
         )
-        .expect_err("a renamed key must fail the load")
+        .expect_err("a removed key must fail the load")
         .to_string();
+        assert!(err.contains("htp"), "the typo is named too: {err}");
         assert!(
-            err.contains("renamed to `authorization.pre_invocation"),
+            err.contains("replaced by `authorization.pre_invocation"),
             "{err}"
         );
     }
@@ -4162,8 +5308,8 @@ routes:
     fn every_unknown_key_on_a_route_is_named_in_one_error() {
         let err = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - tool: get_weather
@@ -4206,8 +5352,78 @@ routes:
     fn a_route_carrying_orchestrator_blocks_loads() {
         parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
+plugins: []
+routes:
+  - tool: get_weather
+    authorization:
+      pre_invocation:
+        - "require(authenticated)"
+    response:
+      status: 403
+"#,
+        )
+        .expect("the policy terms and `response:` are route siblings, not typos");
+    }
+
+    /// Every orchestrator term a route accepts, plus the per-plugin override map
+    /// form of `plugins:`.
+    #[test]
+    fn a_route_declaring_every_orchestrator_term_loads() {
+        parse_config(
+            r#"
+engine_settings:
+  dispatch: policy
+plugins: []
+routes:
+  - tool: get_weather
+    authorization:
+      pre_invocation:
+        - "run(deny-gate)"
+        - "require(authenticated)"
+      post_invocation: []
+    args: {}
+    result: {}
+    plugins:
+      deny-gate:
+        on_error: ignore
+"#,
+        )
+        .expect("every term a route accepts must load together");
+    }
+
+    /// The two phase lists appear under `authorization:` and nowhere else, so a
+    /// route still writing one flat names it as the unknown key it now is rather
+    /// than loading with its authorization silently dropped.
+    #[test]
+    fn a_route_writing_a_phase_list_flat_is_rejected() {
+        for phase in ["pre_invocation", "post_invocation"] {
+            let err = parse_config(&format!(
+                r#"
+engine_settings:
+  dispatch: policy
+plugins: []
+routes:
+  - tool: get_weather
+    {phase}:
+      - "require(authenticated)"
+"#
+            ))
+            .expect_err("a phase list written flat is no longer a route key")
+            .to_string();
+            assert!(err.contains(phase), "the error must name `{phase}`: {err}");
+        }
+    }
+
+    /// The `apl:` wrapper is gone: a route that still writes one names it as an
+    /// unknown key rather than dropping the policy inside it.
+    #[test]
+    fn a_route_carrying_an_apl_wrapper_is_rejected() {
+        let err = parse_config(
+            r#"
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - tool: get_weather
@@ -4215,49 +5431,36 @@ routes:
       authorization:
         pre_invocation:
           - "require(authenticated)"
-    response:
-      status: 403
 "#,
         )
-        .expect("`apl:` and `response:` are route siblings, not typos");
+        .expect_err("the wrapper is no longer a route key")
+        .to_string();
+        assert!(err.contains("apl"), "the error must name the key: {err}");
     }
 
-    /// The same orchestrator terms written flat on the route, with no `apl:`
-    /// wrapper, plus the per-plugin override map form of `plugins:`.
+    /// A PDP and the session store are process-global wiring. Declared on a
+    /// route they used to load and warn; the declaration now fails the load.
     #[test]
-    fn a_route_written_in_the_flat_orchestrator_form_loads() {
-        parse_config(
-            r#"
-plugin_settings:
-  routing_enabled: true
-plugins: []
-routes:
-  - tool: get_weather
-    pre_invocation:
-      - "plugin(deny-gate)"
-    post_invocation: []
-    authorization:
-      pre_invocation:
-        - "require(authenticated)"
-    args: {}
-    result: {}
-    pdp: []
-    session_store:
-      kind: memory
-    plugins:
-      deny-gate:
-        on_error: ignore
-"#,
-        )
-        .expect("the flat orchestrator form must keep loading");
+    fn a_route_carrying_engine_wiring_is_rejected() {
+        for (key, block) in [
+            ("pdp", "pdp: []"),
+            ("session_store", "session_store:\n      kind: memory"),
+        ] {
+            let err = parse_config(&format!(
+                "engine_settings:\n  dispatch: policy\nplugins: []\nroutes:\n  - tool: get_weather\n    {block}\n"
+            ))
+            .expect_err("engine wiring belongs under `global:`")
+            .to_string();
+            assert!(err.contains(key), "the error must name `{key}`: {err}");
+        }
     }
 
     #[test]
     fn an_empty_http_list_is_rejected() {
         let err = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - http: []
@@ -4273,8 +5476,8 @@ routes:
     fn an_http_map_declaring_neither_path_nor_prefix_is_rejected() {
         let err = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - http:
@@ -4291,8 +5494,8 @@ routes:
     fn an_http_map_declaring_both_path_and_prefix_is_rejected() {
         let err = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - http:
@@ -4312,8 +5515,8 @@ routes:
     fn an_http_map_declaring_an_empty_method_list_is_rejected() {
         let err = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - http:
@@ -4332,8 +5535,8 @@ routes:
         for method in ["\"\"", "[GET, \"\"]"] {
             let err = parse_config(&format!(
                 r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - http:
@@ -4355,7 +5558,7 @@ routes:
     /// the selector, so a case reads as the selector it declares.
     fn selector_error(selector: &str) -> String {
         let yaml = format!(
-            "plugin_settings:\n  routing_enabled: true\nplugins: []\nroutes:\n  - http: \
+            "engine_settings:\n  dispatch: policy\nplugins: []\nroutes:\n  - http: \
              {selector}\n"
         );
         parse_config(&yaml)
@@ -4453,14 +5656,16 @@ routes:
         }
     }
 
-    /// The engine reads the annotation table whether or not routing is enabled,
-    /// so a route claiming the reserved name is refused either way.
+    /// A route claiming the reserved name is refused on the name rather than
+    /// waved through, and the mode is the only thing that changes which of the
+    /// two refusals an operator reads.
     #[test]
-    fn a_route_claiming_the_reserved_name_is_refused_with_routing_disabled() {
+    fn a_route_claiming_the_reserved_name_is_refused_in_policy_mode() {
         let err = parse_config(&format!(
-            "plugins: []\nroutes:\n  - http: \"{ENTITY_NAME_GLOBAL}\"\n"
+            "engine_settings:\n  dispatch: policy\nplugins: []\nroutes:\n  - http: \
+             \"{ENTITY_NAME_GLOBAL}\"\n"
         ))
-        .expect_err("the reserved name is refused with routing off too")
+        .expect_err("the reserved name is refused")
         .to_string();
         assert!(err.contains("route 0"), "{err}");
         assert!(err.contains("reserved"), "{err}");
@@ -4495,8 +5700,8 @@ routes:
     fn an_unknown_key_inside_the_http_map_names_the_key() {
         let err = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - http:
@@ -4513,8 +5718,8 @@ routes:
     fn an_http_selector_of_the_wrong_shape_is_reported() {
         let err = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - http: 8080
@@ -4526,8 +5731,8 @@ routes:
 
         let err = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - http: [/healthz, 8080]
@@ -4552,19 +5757,12 @@ routes:
         assert_eq!(built.path_prefix(), None);
     }
 
-    /// Routes are only read when routing is enabled, and the selector follows
-    /// that rule rather than inventing one of its own.
+    /// An empty selector list parses into a selector rather than into nothing,
+    /// which is what leaves the defect for the load-time check to name.
     #[test]
-    fn an_http_route_with_routing_disabled_is_left_alone() {
-        let cfg = parse_config(
-            r#"
-plugins: []
-routes:
-  - http: []
-"#,
-        )
-        .expect("routes are inert while routing is disabled");
-        assert!(cfg.routes[0].http.is_some());
+    fn an_empty_http_selector_list_still_parses_into_a_selector() {
+        let route: RouteEntry = serde_yaml::from_str("http: []\n").expect("the shape parses");
+        assert!(route.http.is_some());
     }
 
     // ---- no two routes resolve to one name --------------------------------
@@ -4572,8 +5770,7 @@ routes:
     /// Load a config written as just its `routes:` block and return the error
     /// text, so a duplicate case reads as the selectors it declares.
     fn duplicate_error(routes: &str) -> String {
-        let yaml =
-            format!("plugin_settings:\n  routing_enabled: true\nplugins: []\nroutes:\n{routes}");
+        let yaml = format!("engine_settings:\n  dispatch: policy\nplugins: []\nroutes:\n{routes}");
         parse_config(&yaml)
             .expect_err("two routes resolving to one name must fail")
             .to_string()
@@ -4581,8 +5778,7 @@ routes:
 
     /// Load a config written as just its `routes:` block, expecting success.
     fn routes_load(routes: &str) -> PolicyConfig {
-        let yaml =
-            format!("plugin_settings:\n  routing_enabled: true\nplugins: []\nroutes:\n{routes}");
+        let yaml = format!("engine_settings:\n  dispatch: policy\nplugins: []\nroutes:\n{routes}");
         parse_config(&yaml).expect("these routes are distinct and must load")
     }
 
@@ -4798,8 +5994,7 @@ routes:
     /// The identity of each route in a config written as just its `routes:`
     /// block, so a case reads as the selectors it declares.
     fn identities(routes: &str) -> Vec<Option<(&'static str, Vec<String>)>> {
-        let yaml =
-            format!("plugin_settings:\n  routing_enabled: true\nplugins: []\nroutes:\n{routes}");
+        let yaml = format!("engine_settings:\n  dispatch: policy\nplugins: []\nroutes:\n{routes}");
         parse_config(&yaml)
             .expect("every route in the case must parse")
             .routes
@@ -4984,8 +6179,7 @@ routes:
     /// A routing-enabled config written as just its `routes:` block, so a case
     /// reads as the selectors it declares.
     fn routed_config(routes: &str) -> PolicyConfig {
-        let yaml =
-            format!("plugin_settings:\n  routing_enabled: true\nplugins: []\nroutes:\n{routes}");
+        let yaml = format!("engine_settings:\n  dispatch: policy\nplugins: []\nroutes:\n{routes}");
         parse_config(&yaml).expect("every route in the case must parse")
     }
 
@@ -5797,69 +6991,45 @@ routes:
     /// Nothing matching resolves nothing, which is what lets the caller keep
     /// using the reserved global name rather than inventing one.
     #[test]
-    fn a_request_matching_no_http_route_resolves_nothing_and_still_gets_its_default() {
+    fn a_request_matching_no_http_route_resolves_nothing() {
         let cfg = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
-plugins:
-  - { name: http-default, kind: builtin, hooks: [http.request] }
-global:
-  defaults:
-    http:
-      plugins: [http-default]
+engine_settings:
+  dispatch: policy
+plugins: []
 routes:
   - http: /healthz
 "#,
         )
         .expect("the fixture must parse");
 
-        let matched = resolve_route(&cfg, RouteQuery::http("/v1/files", Some("GET")));
         assert!(
-            matched.is_none(),
+            resolve_route(&cfg, RouteQuery::http("/v1/files", Some("GET"))).is_none(),
             "no declared path covers /v1/files, so nothing resolves"
-        );
-
-        let resolved = resolve_plugins_for_entity(&cfg, ENTITY_HTTP, matched.as_ref(), &no_tags());
-        assert_eq!(
-            resolved.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
-            ["http-default"],
-            "the entity type's default applies whether or not a route matched"
         );
     }
 
-    /// An `http:` route stacks the same way every other route does: the `all`
-    /// group, then the entity-type default, then its tag bundles, then its own
-    /// plugins. Its `authentication:` list layers on top of the global one.
+    /// An `http:` route layers `authentication:` the way every other route
+    /// does: the global list, then its tag bundles, then its own steps. That is
+    /// the one dispatch list a route still contributes.
     #[test]
-    fn an_http_route_layers_groups_defaults_and_authentication_like_any_other() {
+    fn an_http_route_layers_authentication_like_any_other() {
         let cfg = parse_config(
             r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
-  - { name: audit, kind: builtin, hooks: [http.request] }
-  - { name: http-default, kind: builtin, hooks: [http.request] }
-  - { name: pii-scan, kind: builtin, hooks: [http.request] }
-  - { name: route-plugin, kind: builtin, hooks: [http.request] }
   - { name: corp-jwt, kind: builtin, hooks: [identity.resolve] }
   - { name: files-jwt, kind: builtin, hooks: [identity.resolve] }
   - { name: files-attestor, kind: builtin, hooks: [identity.resolve] }
 global:
   authentication: [corp-jwt]
-  policies:
-    all:
-      plugins: [audit]
-    files:
-      plugins: [pii-scan]
-      authentication: [files-jwt]
-  defaults:
-    http:
-      plugins: [http-default]
+groups:
+  files:
+    authentication: [files-jwt]
 routes:
   - http: { path_prefix: /v1/files }
     groups: files
-    plugins: [route-plugin]
     authentication: [files-attestor]
 "#,
         )
@@ -5867,13 +7037,6 @@ routes:
 
         let matched = resolve_route(&cfg, RouteQuery::http("/v1/files/q3.pdf", Some("GET")))
             .expect("the prefix covers the request");
-
-        let plugins = resolve_plugins_for_entity(&cfg, ENTITY_HTTP, Some(&matched), &no_tags());
-        assert_eq!(
-            plugins.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
-            ["audit", "http-default", "pii-scan", "route-plugin"],
-            "the layering an entity route gets applies to an http route too"
-        );
 
         let identity = resolve_identity_plugins_for_route(&cfg, Some(&matched));
         assert_eq!(
@@ -5931,18 +7094,28 @@ routes:
         );
     }
 
-    /// The summed score still gives a `when:`-carrying route its bonus, so a
-    /// broad glob with `when:` outranks a narrower glob without one. Adding the
-    /// path scale must not have moved that.
+    /// Two globs covering one tool rank identically. `when:` used to score a
+    /// bonus, so a broad glob declaring one beat a narrower glob without one;
+    /// with the key gone, declaration order is all that is left.
     #[test]
-    fn a_when_clause_still_outranks_a_narrower_glob() {
-        let cfg = routed_config("  - tool: \"hr-*\"\n    when: \"true\"\n  - tool: \"hr-get-*\"\n");
-
-        let matched = resolve_route(&cfg, RouteQuery::named(ENTITY_TOOL, "hr-get-comp"))
-            .expect("both globs cover the tool");
+    fn two_equally_specific_routes_rank_identically() {
+        let name_for = |routes: &str| {
+            resolve_route(
+                &routed_config(routes),
+                RouteQuery::named(ENTITY_TOOL, "hr-get-comp"),
+            )
+            .expect("both globs cover the tool")
+            .name
+        };
         assert_eq!(
-            matched.name, "hr-*",
-            "a `when:` route still beats a narrower glob without one"
+            name_for("  - tool: \"hr-*\"\n  - tool: \"hr-get-*\"\n"),
+            "hr-*",
+            "the first declared of two equally specific routes wins"
+        );
+        assert_eq!(
+            name_for("  - tool: \"hr-get-*\"\n  - tool: \"hr-*\"\n"),
+            "hr-get-*",
+            "declared the other way round, the other one wins"
         );
     }
 

@@ -19,7 +19,7 @@
 //                        in Rust (e.g. a hand-rolled audit resolver,
 //                        a test fake) and hands them in directly.
 //   * `pdp_factories`  — factories the visitor consults when it sees a
-//                        `global.apl.pdp[]` entry in the unified
+//                        `global.pdp[]` entry in the unified
 //                        config. Each factory advertises a `kind()`
 //                        string that matches the YAML block's `kind:`
 //                        field.
@@ -57,7 +57,7 @@ pub struct AplOptions {
     /// Zero or more code-supplied PDP resolvers. Each is registered
     /// into the visitor's internal `PdpRouter`, so `pdp(...)` steps
     /// dispatch by dialect across this list **and** any resolvers the
-    /// visitor builds from `global.apl.pdp[]` config entries. An empty
+    /// visitor builds from `global.pdp[]` config entries. An empty
     /// list combined with empty `pdp_factories` means no PDP is wired
     /// — routes that call `pdp(...)` surface `PdpError::NoResolver` at
     /// evaluation time, which is the correct behavior for "you forgot
@@ -65,7 +65,7 @@ pub struct AplOptions {
     pub pdps: Vec<Arc<dyn PdpResolver>>,
 
     /// PDP factories the visitor consults when it encounters a
-    /// `global.apl.pdp[]` entry. Each factory advertises a `kind()`
+    /// `global.pdp[]` entry. Each factory advertises a `kind()`
     /// string that matches the YAML block's `kind:` field — e.g.
     /// `cedar-direct`, `opa`. An empty list disables
     /// config-driven PDP wiring; hosts can still supply resolvers via
@@ -73,7 +73,7 @@ pub struct AplOptions {
     pub pdp_factories: Vec<Arc<dyn PdpFactory>>,
 
     /// Session-store factories the visitor consults when it encounters a
-    /// `global.apl.session_store` block. Each factory advertises a
+    /// `global.session_store` block. Each factory advertises a
     /// `kind()` string matching the block's `kind:` field — e.g.
     /// `valkey`. An empty list keeps the constructor-supplied
     /// `session_store` (the `MemorySessionStore` default) active, so
@@ -117,10 +117,10 @@ impl AplOptions {
 /// After this call, the next `mgr.load_config_yaml(yaml)` invocation
 /// will walk the visitor: praxis-policy-core's [`visit_plugins`][vp] populates
 /// the APL plugin registry from `&[PluginConfig]`; `visit_global`
-/// processes any `global.apl.pdp[]` entries by dispatching to the
-/// registered `pdp_factories`; the hierarchy walk stacks `global.apl`
-/// / `defaults.<entity>.apl` / `policies.<tag>.apl` / route-level
-/// `apl:` into compiled routes; one `AplRouteHandler` is installed
+/// processes any `global.pdp[]` entries by dispatching to the
+/// registered `pdp_factories`; the hierarchy walk stacks `global:` /
+/// `global.defaults.<entity>:` / `groups.<tag>:` / the route's own
+/// policy terms into compiled routes; one `AplRouteHandler` is installed
 /// per route per phase via [`PolicyEngine::annotate_route`][ar].
 ///
 /// [vp]: praxis_policy_core::visitor::ConfigVisitor::visit_plugins

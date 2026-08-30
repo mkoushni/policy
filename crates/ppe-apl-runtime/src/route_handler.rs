@@ -101,7 +101,7 @@ pub const ELICITATION_APPROVED_CODE: i64 = -32121;
 /// value ("1"/"true"/anything non-empty) enables it.
 pub const ELICITATION_PEEK_HEADER: &str = "X-Policy-Elicitation-Peek";
 
-/// Which APL phase this handler runs. Pre covers `args` + `policy`; Post
+/// Which APL phase this handler runs. Pre covers `args` + `pre_invocation`; Post
 /// covers `result` + `post_invocation`. Set once at construction and never
 /// changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

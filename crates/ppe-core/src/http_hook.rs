@@ -28,7 +28,7 @@ crate::define_hooks! {
     /// entirely before the request is forwarded.
     ///
     /// A route selecting on `http:` is matched from the request line once
-    /// `plugin_settings.routing_enabled: true` is set, which defaults to false,
+    /// `engine_settings.dispatch: policy` is set, which is not the default,
     /// so a host that also puts `method` and `path` on the HTTP extension at the
     /// identity invocation unlocks that route's own `authentication:` list. A
     /// host that supplies no request line there behaves exactly as it does

@@ -122,10 +122,10 @@ fn tool_request_with_http(name: &str, method: &str) -> Extensions {
 // APL predicate:action form: deny when the method is not GET. (Comparisons
 // use this form; `require(...)` is truthiness-only.)
 const GET_ONLY: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 global:
-  apl:
+  authorization:
     pre_invocation:
       - "http.method != 'GET': deny"
 "#;
@@ -134,10 +134,10 @@ global:
 // response hook can carry. Authorization is an admission check and has
 // nothing to say once the upstream has answered.
 const POST_ONLY: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 global:
-  apl:
+  authorization:
     post_invocation:
       - "http.method != 'GET': deny"
 "#;
@@ -176,10 +176,10 @@ async fn a_global_post_phase_policy_is_annotated_under_the_response_hook() {
 // request handler when a post block was present would be an authorization
 // bypass, and every other test here declares only one phase.
 const BOTH_PHASES: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 global:
-  apl:
+  authorization:
     pre_invocation:
       - "http.method == 'POST': deny"
     post_invocation:
@@ -274,10 +274,10 @@ async fn global_policy_denies_nonmatching_http_request() {
 #[tokio::test]
 async fn global_policy_deny_carries_custom_response() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 global:
-  apl:
+  authorization:
     pre_invocation:
       - "http.method != 'GET': deny"
   response:
@@ -312,10 +312,10 @@ global:
 #[tokio::test]
 async fn global_response_does_not_leak_onto_entity_denial() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 global:
-  apl:
+  authorization:
     pre_invocation:
       - "require(authenticated)"
   response:
@@ -323,7 +323,7 @@ global:
     body: "{\"error\":\"global\"}"
 routes:
   - tool: locked
-    apl:
+    authorization:
       pre_invocation:
         - "require(authenticated)"
 "#;
@@ -355,11 +355,11 @@ routes:
 #[tokio::test]
 async fn entity_route_reads_http_attributes() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 routes:
   - tool: echo
-    apl:
+    authorization:
       pre_invocation:
         - "http.method == 'GET': deny"
 "#;
@@ -398,11 +398,11 @@ routes:
 #[tokio::test]
 async fn route_scoped_response_still_decorates_entity_denial() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 routes:
   - tool: locked
-    apl:
+    authorization:
       pre_invocation:
         - "require(authenticated)"
     response:
@@ -475,10 +475,10 @@ async fn a_request_carrying_a_path_is_governed_by_the_global_policy_unchanged() 
 #[tokio::test]
 async fn a_global_rule_reads_the_path_the_host_populated() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 global:
-  apl:
+  authorization:
     pre_invocation:
       - "http.path == '/admin/./x': deny"
 "#;
@@ -589,42 +589,42 @@ async fn manager_with_response_gate(yaml: &str) -> Arc<PolicyEngine> {
     mgr
 }
 
-// A pre-only global policy plus an always-on response-side plugin. The
-// plugin sits in the `all` group so it is activated whether or not a route
-// matched, which is what makes the two configurations comparable.
+// A global policy with both halves: a pre rule, and a post step naming the
+// response-side plugin. The step is under `global.authorization`, so it stacks
+// onto every route and reaches the request whether or not a route matched,
+// which is what makes the two configurations comparable. It is also the
+// migration for the `all` bundle's activation list this used to write.
 const RESPONSE_CHAIN_NO_ROUTE: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: response-gate
     kind: response-gate
     hooks: [http.response]
 global:
-  policies:
-    all:
-      plugins: [response-gate]
-  apl:
+  authorization:
     pre_invocation:
       - "http.method != 'GET': deny"
+    post_invocation:
+      - "run(response-gate)"
 "#;
 
 // The same configuration with a catch-all route added. The route declares no
 // body of its own, so it inherits the global pre-only policy and has nothing
 // to say on the response half.
 const RESPONSE_CHAIN_WITH_CATCHALL: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: response-gate
     kind: response-gate
     hooks: [http.response]
 global:
-  policies:
-    all:
-      plugins: [response-gate]
-  apl:
+  authorization:
     pre_invocation:
       - "http.method != 'GET': deny"
+    post_invocation:
+      - "run(response-gate)"
 routes:
   - http:
       path_prefix: /
@@ -663,12 +663,12 @@ async fn a_bodyless_catchall_route_resolves_the_same_response_chain() {
 
 // A route that declares both halves itself, so neither guard may skip.
 const ROUTE_BOTH_HALVES: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 routes:
   - http:
       path_prefix: /
-    apl:
+    authorization:
       pre_invocation:
         - "http.method == 'POST': deny"
       post_invocation:
@@ -741,10 +741,10 @@ async fn a_route_declaring_both_halves_installs_both() {
 // A body-less route over a pre-only global body. Layer seeding still stacks
 // `global` into the route, so the request half is governed.
 const BODYLESS_ROUTE_OVER_GLOBAL: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 global:
-  apl:
+  authorization:
     pre_invocation:
       - "http.method != 'GET': deny"
 routes:
@@ -752,7 +752,7 @@ routes:
       path_prefix: /
 "#;
 
-/// A route with no `apl:` block still receives the global policy on the half
+/// A route with no policy block of its own still receives the global policy on the half
 /// that declares steps, and gains no handler on the half that does not.
 #[tokio::test]
 async fn a_bodyless_route_still_receives_the_global_policy() {

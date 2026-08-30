@@ -17,6 +17,7 @@ for the change.
 ## Quick Reference
 
 ```console
+make check          # type-check both feature sets (never links)
 make build          # workspace build (debug)
 make test           # all workspace tests (two passes)
 make lint           # fmt --check + clippy -D warnings
@@ -122,6 +123,21 @@ The Valkey session store tests are `#[ignore]`-gated
 and need `VALKEY_TEST_URL` set to run against a real
 server. `make coverage` runs them with
 `VALKEY_TESTS_OPTIONAL=1` so they skip gracefully.
+
+Prefer one test binary per concern over many small
+ones. Cargo builds one binary per `tests/*.rs`, and a
+`tests/<dir>/main.rs` harness that gathers related
+cases links once instead of a dozen times.
+
+While iterating:
+
+- Use `make check` for fast compile-time feedback.
+- Run tests for affected crates:
+  `cargo nextest run -p <crate> --lib`.
+- Reserve full workspace test runs for commit boundaries.
+
+Newly linked test binaries may be delayed by endpoint
+security. The test workflow above helps mitigate this issue.
 
 ## Supply Chain
 

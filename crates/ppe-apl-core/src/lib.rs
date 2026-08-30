@@ -30,14 +30,20 @@ pub mod rules;
 /// Steps: plugin calls, delegation, taint, and decision point calls.
 pub mod step;
 
+/// The one reader for a quoted literal, and the one rule for escapes inside one.
+mod lexical;
+
+/// Test scaffolding, behind the `test-util` feature.
+#[cfg(feature = "test-util")]
+pub mod test_util;
+
 pub use attribute_source::{AttributeError, AttributeSource, AttributeTree};
 pub use attributes::{AttributeBag, AttributeExtractor, AttributeValue};
 pub use evaluator::{
     Decision, FieldOutcome, PipelineEvaluation, evaluate_effects, evaluate_pipeline, evaluate_rules,
 };
 pub use parser::{
-    CompiledConfig, ConfigYaml, ParseError, RouteYaml, compile_config, compile_policy_block_value,
-    parse_pipeline, parse_predicate, parse_rule,
+    ParseError, RouteYaml, compile_policy_block_value, parse_pipeline, parse_predicate, parse_rule,
 };
 pub use pipeline::{FieldRule, Pipeline, ScanKind, Stage, TaintEvent, TaintScope, TypeCheck};
 pub use plugin_decl::{

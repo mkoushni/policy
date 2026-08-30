@@ -16,7 +16,7 @@
 //
 // One thing worth knowing before reading the `/healthz` scenarios: the visitor
 // stacks the global layer into every route before deciding whether a route
-// declares any phase, so a route with no `apl:` block still receives a handler
+// declares any phase, so a route with no policy block still receives a handler
 // carrying the global policy whenever a global body exists. An exact route
 // "inherits nothing" only in the structural sense, meaning no sibling route's
 // body or plugin list reaches it. That is why the worked example keeps its JWT
@@ -438,8 +438,8 @@ async fn resolve_identity(mgr: &PolicyEngine, ext: Extensions) {
 /// route and not to `global:` on purpose: under `global:` its policy would
 /// stack into the health route too.
 const WORKED_EXAMPLE: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: files-authn
     kind: test/identity
@@ -457,22 +457,23 @@ routes:
       path_prefix: /v1/files
     authentication:
       - files-authn
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(files-audit)"
+        - "run(files-audit)"
   - http: /healthz
   - http:
       path_prefix: /
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(jwt)"
+        - "run(jwt)"
 "#;
 
-/// A prefix route that layers everything a route can layer and declares no
-/// policy body, so the structural plugin chain is what dispatches.
+/// A prefix route that layers everything a route can layer: the bundle it joins
+/// contributes an `authorization:` layer, and the route adds its own body plus
+/// its own `authentication:` step.
 const LAYERED_PREFIX_ROUTE: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: files-authn
     kind: test/identity
@@ -485,25 +486,28 @@ plugins:
     kind: test/record
     hooks: [http.request]
     capabilities: [read_headers]
-global:
-  policies:
-    files-readers:
-      plugins: [group-audit]
+groups:
+  files-readers:
+    authorization:
+      pre_invocation:
+        - "run(group-audit)"
 routes:
   - http:
       path_prefix: /v1/files
-    groups: files-readers
+    meta:
+      tags: [files-readers]
     authentication:
       - files-authn
-    plugins:
-      - route-audit
+    authorization:
+      pre_invocation:
+        - "run(route-audit)"
 "#;
 
 /// Two prefixes plus a catch-all, so a path written as a traversal out of one
 /// of them has somewhere else it could plausibly have landed.
 const NESTED_PREFIXES: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: files-audit
     kind: test/record
@@ -520,23 +524,29 @@ plugins:
 routes:
   - http:
       path_prefix: /v1/files
-    plugins: [files-audit]
+    authorization:
+      pre_invocation:
+        - "run(files-audit)"
   - http:
       path_prefix: /admin
-    plugins: [admin-audit]
+    authorization:
+      pre_invocation:
+        - "run(admin-audit)"
   - http:
       path_prefix: /
-    plugins: [catch-all-audit]
+    authorization:
+      pre_invocation:
+        - "run(catch-all-audit)"
 "#;
 
 // =====================================================================
 // The route a request resolves, and what layers onto it
 // =====================================================================
 
-/// A prefix route's authentication list, its group's plugins, and its own
-/// plugins all reach a request that matches its path.
+/// A prefix route's bundle layer and its own body both reach a request that
+/// matches its path, in that order.
 #[tokio::test]
-async fn a_prefix_route_layers_its_authentication_group_and_plugins() {
+async fn a_prefix_route_layers_its_bundle_and_its_own_body() {
     let (mgr, ledger) = engine_with(LAYERED_PREFIX_ROUTE).await;
 
     resolve_identity(&mgr, request("GET", "/v1/files/q3.pdf")).await;
@@ -606,8 +616,8 @@ async fn the_worked_examples_prefix_route_runs_its_own_authentication_and_body()
 #[tokio::test]
 async fn a_method_narrowed_route_matches_only_the_methods_it_declares() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: files-audit
     kind: test/record
@@ -617,7 +627,9 @@ routes:
   - http:
       method: GET
       path_prefix: /v1/files
-    plugins: [files-audit]
+    authorization:
+      pre_invocation:
+        - "run(files-audit)"
 "#;
     let (mgr, ledger) = engine_with(YAML).await;
 
@@ -640,10 +652,25 @@ routes:
 /// Many distinct paths under one prefix share one cache entry per hook, and a
 /// plugin still reads the individual request path and the entity name the host
 /// set.
+///
+/// The count is read at `identity.resolve`, because an annotated hook returns
+/// the compiled handler before route resolution caches anything, and
+/// `http.request` is annotated here.
 #[tokio::test]
 async fn many_paths_under_one_prefix_share_a_cache_entry_and_keep_their_own_path() {
     let (mgr, ledger) = engine_with(LAYERED_PREFIX_ROUTE).await;
 
+    for n in 0..25 {
+        resolve_identity(&mgr, request("GET", &format!("/v1/files/report-{n}.pdf"))).await;
+    }
+    assert_eq!(
+        mgr.routing_cache_size(),
+        1,
+        "the cache is keyed on the selector that matched, so its size follows \
+         the configuration rather than the traffic"
+    );
+
+    clear(&ledger);
     for n in 0..25 {
         let path = format!("/v1/files/report-{n}.pdf");
         assert!(
@@ -651,13 +678,6 @@ async fn many_paths_under_one_prefix_share_a_cache_entry_and_keep_their_own_path
             "{path} must be allowed"
         );
     }
-
-    assert_eq!(
-        mgr.routing_cache_size(),
-        1,
-        "the cache is keyed on the selector that matched, so its size follows \
-         the configuration rather than the traffic"
-    );
 
     let seen = observations(&ledger);
     assert_eq!(seen.len(), 50, "two plugins per request");
@@ -677,14 +697,14 @@ async fn many_paths_under_one_prefix_share_a_cache_entry_and_keep_their_own_path
 // Dispatch
 // =====================================================================
 
-/// An `http:` route's policy body dispatches in place of its structural plugin
-/// chain, which is the one substitution an operator writing a first `http:`
-/// route will not expect.
+/// An `http:` route's policy body is the whole lineup: a plugin the body does
+/// not name never runs, which is what the removed `plugins:` activation list
+/// used to obscure.
 #[tokio::test]
-async fn an_http_route_body_dispatches_in_place_of_its_plugin_chain() {
+async fn an_http_route_reaches_only_the_plugins_its_body_names() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: body-audit
     kind: test/record
@@ -697,10 +717,14 @@ plugins:
 routes:
   - http:
       path_prefix: /v1/files
-    plugins: [chain-audit]
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(body-audit)"
+        - "run(body-audit)"
+  - http:
+      path_prefix: /v1/archive
+    authorization:
+      pre_invocation:
+        - "run(chain-audit)"
 "#;
     let (mgr, ledger) = engine_with(YAML).await;
 
@@ -708,8 +732,9 @@ routes:
     assert_eq!(
         fired(&ledger),
         vec!["body-audit".to_owned()],
-        "the body replaces the chain; the listed plugin runs only where a step \
-         names it"
+        "chain-audit is declared and registered on the same hook, and reached by \
+         another route's body, so what keeps it from firing here is that this \
+         request matched a route whose body does not name it"
     );
 }
 
@@ -721,8 +746,8 @@ routes:
 #[tokio::test]
 async fn a_route_declared_with_a_trailing_slash_runs_its_body_for_that_spelling_only() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: body-audit
     kind: test/record
@@ -731,9 +756,9 @@ plugins:
 routes:
   - http:
       path: "/admin/"
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(body-audit)"
+        - "run(body-audit)"
 "#;
     let (mgr, ledger) = engine_with(YAML).await;
     assert!(fire(&mgr, HOOK_HTTP_REQUEST, request("GET", "/admin/")).await);
@@ -756,35 +781,32 @@ routes:
     }
 }
 
-/// A glob route under one of the entity selectors dispatches exactly as it
-/// does today: its policy body does not evaluate, and its plugin chain does.
-/// This is the regression proving the entity selectors were left alone.
+/// A glob route under one of the entity selectors installs its annotation under
+/// the pattern as written, and the lookup is exact, so its policy body never
+/// evaluates. With the activation list gone there is no chain behind it either,
+/// so the route reaches nothing.
 #[tokio::test]
-async fn a_glob_entity_route_dispatches_exactly_as_before() {
+async fn a_glob_entity_routes_body_never_evaluates_and_nothing_replaces_it() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: body-audit
     kind: test/record
     hooks: [cmf.tool_pre_invoke]
-  - name: chain-audit
-    kind: test/record
-    hooks: [cmf.tool_pre_invoke]
 routes:
   - tool: "hr-*"
-    plugins: [chain-audit]
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(body-audit)"
+        - "run(body-audit)"
 "#;
     let (mgr, ledger) = engine_with(YAML).await;
 
     assert!(fire(&mgr, "cmf.tool_pre_invoke", tool_request("hr-get-salary")).await);
-    assert_eq!(
-        fired(&ledger),
-        vec!["chain-audit".to_owned()],
-        "a glob route's body still never evaluates, and its chain still runs"
+    assert!(
+        fired(&ledger).is_empty(),
+        "the glob's annotation is keyed on the pattern, so an exact lookup for \
+         `hr-get-salary` finds nothing and nothing else activates a plugin"
     );
 }
 
@@ -792,17 +814,17 @@ routes:
 #[tokio::test]
 async fn a_list_selector_dispatches_per_element() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: body-audit
     kind: test/record
     hooks: [cmf.tool_pre_invoke]
 routes:
   - tool: [alpha, beta]
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(body-audit)"
+        - "run(body-audit)"
 "#;
     let (mgr, ledger) = engine_with(YAML).await;
 
@@ -821,12 +843,12 @@ routes:
 #[tokio::test]
 async fn both_halves_of_one_exchange_resolve_the_same_route() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 routes:
   - http:
       path_prefix: /v1/files
-    apl:
+    authorization:
       pre_invocation:
         - "http.method == 'POST': deny"
       post_invocation:
@@ -871,12 +893,12 @@ routes:
 #[tokio::test]
 async fn a_post_phase_rule_denies_on_an_upstream_server_error() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 routes:
   - http:
       path_prefix: /v1/files
-    apl:
+    authorization:
       post_invocation:
         - "http.status >= 500: deny"
 "#;
@@ -926,12 +948,12 @@ routes:
 #[tokio::test]
 async fn a_post_phase_rule_matches_a_status_by_equality() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 routes:
   - http:
       path_prefix: /v1/files
-    apl:
+    authorization:
       post_invocation:
         - "http.status == 502: deny"
 "#;
@@ -965,12 +987,12 @@ routes:
 #[tokio::test]
 async fn a_status_rule_on_the_request_half_does_not_fire() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 routes:
   - http:
       path_prefix: /v1/files
-    apl:
+    authorization:
       pre_invocation:
         - "http.status >= 500: deny"
         - "http.method == 'TRACE': deny"
@@ -998,12 +1020,12 @@ routes:
 #[tokio::test]
 async fn a_response_without_a_status_is_governed_as_before() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 routes:
   - http:
       path_prefix: /v1/files
-    apl:
+    authorization:
       post_invocation:
         - "http.status >= 500: deny"
         - "http.method == 'TRACE': deny"
@@ -1031,16 +1053,16 @@ routes:
 #[tokio::test]
 async fn an_explicit_catch_all_and_the_implicit_one_do_not_displace_each_other() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 global:
-  apl:
+  authorization:
     pre_invocation:
       - "http.method == 'TRACE': deny"
 routes:
   - http:
       path_prefix: /
-    apl:
+    authorization:
       pre_invocation:
         - "http.method == 'POST': deny"
 "#;
@@ -1072,8 +1094,8 @@ routes:
 #[tokio::test]
 async fn the_longer_prefix_wins_in_either_declaration_order() {
     const BROAD_FIRST: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: broad-audit
     kind: test/record
@@ -1086,14 +1108,18 @@ plugins:
 routes:
   - http:
       path_prefix: /v1
-    plugins: [broad-audit]
+    authorization:
+      pre_invocation:
+        - "run(broad-audit)"
   - http:
       path_prefix: /v1/files
-    plugins: [narrow-audit]
+    authorization:
+      pre_invocation:
+        - "run(narrow-audit)"
 "#;
     const NARROW_FIRST: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: broad-audit
     kind: test/record
@@ -1106,10 +1132,14 @@ plugins:
 routes:
   - http:
       path_prefix: /v1/files
-    plugins: [narrow-audit]
+    authorization:
+      pre_invocation:
+        - "run(narrow-audit)"
   - http:
       path_prefix: /v1
-    plugins: [broad-audit]
+    authorization:
+      pre_invocation:
+        - "run(broad-audit)"
 "#;
     for yaml in [BROAD_FIRST, NARROW_FIRST] {
         let (mgr, ledger) = engine_with(yaml).await;
@@ -1128,8 +1158,8 @@ routes:
 #[tokio::test]
 async fn a_method_narrowed_route_wins_its_methods_in_either_declaration_order() {
     const PLUGINS: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: open-audit
     kind: test/record
@@ -1142,12 +1172,16 @@ plugins:
 "#;
     const OPEN: &str = r#"  - http:
       path_prefix: /api
-    plugins: [open-audit]
+    authorization:
+      pre_invocation:
+        - "run(open-audit)"
 "#;
     const NARROWED: &str = r#"  - http:
       path_prefix: /api
       method: DELETE
-    plugins: [delete-audit]
+    authorization:
+      pre_invocation:
+        - "run(delete-audit)"
 "#;
 
     for (first, second) in [(OPEN, NARROWED), (NARROWED, OPEN)] {
@@ -1176,8 +1210,8 @@ plugins:
 #[tokio::test]
 async fn a_prefix_matches_only_at_a_segment_boundary() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: api-audit
     kind: test/record
@@ -1186,13 +1220,15 @@ plugins:
 routes:
   - http:
       path_prefix: /api
-    plugins: [api-audit]
+    authorization:
+      pre_invocation:
+        - "run(api-audit)"
 "#;
     // Same table, twice: once for the prefix as written and once with a
     // trailing slash, which must be insignificant.
     const YAML_TRAILING_SLASH: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: api-audit
     kind: test/record
@@ -1201,7 +1237,9 @@ plugins:
 routes:
   - http:
       path_prefix: /api/
-    plugins: [api-audit]
+    authorization:
+      pre_invocation:
+        - "run(api-audit)"
 "#;
     for yaml in [YAML, YAML_TRAILING_SLASH] {
         let (mgr, ledger) = engine_with(yaml).await;
@@ -1228,8 +1266,8 @@ routes:
 #[tokio::test]
 async fn two_routes_resolving_to_one_name_are_rejected_at_load() {
     const SAME_SELECTOR: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 routes:
   - http:
       path_prefix: /v1/files
@@ -1245,8 +1283,8 @@ routes:
     // Different selector values that overlap in one element. A comparison of
     // what was written would pass this.
     const OVERLAPPING_LISTS: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 routes:
   - http: [/a, /b]
   - http: [/b, /c]
@@ -1344,8 +1382,8 @@ async fn an_unreadable_path_is_denied_rather_than_reaching_the_catch_all() {
 #[tokio::test]
 async fn a_route_declaring_two_selectors_is_rejected_naming_both() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 routes:
   - http: /healthz
     tool: get_weather
@@ -1362,8 +1400,8 @@ routes:
 #[tokio::test]
 async fn a_misspelled_selector_key_is_rejected_naming_the_key() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 routes:
   - htp: /healthz
 "#;
@@ -1384,8 +1422,8 @@ routes:
 #[tokio::test]
 async fn a_route_authentication_list_needs_the_request_line_to_apply() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: global-authn
     kind: test/identity
@@ -1431,8 +1469,8 @@ routes:
 #[tokio::test]
 async fn a_configuration_of_entity_selectors_only_resolves_as_it_always_has() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: tool-audit
     kind: test/record
@@ -1451,15 +1489,25 @@ plugins:
     hooks: [cmf.llm_input]
 routes:
   - tool: get_weather
-    plugins: [tool-audit]
+    authorization:
+      pre_invocation:
+        - "run(tool-audit)"
   - tool: "hr-*"
-    plugins: [glob-audit]
+    authorization:
+      pre_invocation:
+        - "run(glob-audit)"
   - resource: "file:///data.csv"
-    plugins: [resource-audit]
+    authorization:
+      pre_invocation:
+        - "run(resource-audit)"
   - prompt: summarize
-    plugins: [prompt-audit]
+    authorization:
+      pre_invocation:
+        - "run(prompt-audit)"
   - llm: gpt-4
-    plugins: [llm-audit]
+    authorization:
+      pre_invocation:
+        - "run(llm-audit)"
 "#;
     let (mgr, ledger) = engine_with(YAML).await;
 
@@ -1469,11 +1517,9 @@ routes:
             tool_request("get_weather"),
             "tool-audit",
         ),
-        (
-            "cmf.tool_pre_invoke",
-            tool_request("hr-get-salary"),
-            "glob-audit",
-        ),
+        // The glob's annotation is keyed on the pattern as written and the
+        // lookup is exact, so nothing answers for a name the glob covers.
+        ("cmf.tool_pre_invoke", tool_request("hr-get-salary"), ""),
         (
             "cmf.resource_pre_fetch",
             entity_request("resource", "file:///data.csv"),
@@ -1488,9 +1534,14 @@ routes:
     ] {
         clear(&ledger);
         assert!(fire(&mgr, hook, ext).await, "{hook} must be allowed");
+        let want: Vec<String> = if expected.is_empty() {
+            Vec::new()
+        } else {
+            vec![expected.to_owned()]
+        };
         assert_eq!(
             fired(&ledger),
-            vec![expected.to_owned()],
+            want,
             "{hook} must dispatch exactly the route it always did"
         );
     }
@@ -1502,16 +1553,16 @@ routes:
 #[tokio::test]
 async fn traffic_no_http_route_covers_falls_back_to_the_global_policy() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 global:
-  apl:
+  authorization:
     pre_invocation:
       - "http.method == 'TRACE': deny"
 routes:
   - http:
       path_prefix: /v1/files
-    apl:
+    authorization:
       pre_invocation:
         - "http.method == 'POST': deny"
 "#;
@@ -1724,8 +1775,8 @@ async fn engine_with_payload_fixtures(yaml: &str) -> (Arc<PolicyEngine>, Ledger)
 #[tokio::test]
 async fn a_plugin_on_an_http_route_receives_the_http_payload() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: payload-check
     kind: test/assert-payload
@@ -1733,9 +1784,9 @@ plugins:
 routes:
   - http:
       path_prefix: /v1/files
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(payload-check)"
+        - "run(payload-check)"
 "#;
     let (mgr, ledger) = engine_with_payload_fixtures(YAML).await;
 
@@ -1770,15 +1821,17 @@ routes:
 #[tokio::test]
 async fn a_plugin_on_an_mcp_route_still_receives_the_message_payload() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: payload-check
     kind: test/assert-payload
     hooks: [cmf.tool_pre_invoke]
 routes:
   - tool: get_weather
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(payload-check)"
+        - "run(payload-check)"
 "#;
     let (mgr, ledger) = engine_with_payload_fixtures(YAML).await;
 
@@ -1807,8 +1860,8 @@ routes:
 #[tokio::test]
 async fn an_extension_mutation_on_an_http_route_is_persisted() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: label-writer
     kind: test/label-writer
@@ -1817,9 +1870,9 @@ plugins:
 routes:
   - http:
       path_prefix: /v1/files
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(label-writer)"
+        - "run(label-writer)"
 "#;
     let (mgr, _ledger) = engine_with_payload_fixtures(YAML).await;
 
@@ -1861,14 +1914,13 @@ routes:
 #[tokio::test]
 async fn an_args_block_on_an_http_route_is_refused_naming_the_route_and_the_block() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 routes:
   - http:
       path_prefix: /v1/files
-    apl:
-      args:
-        city: "str | redact"
+    args:
+      city: "str | redact"
 "#;
     let msg = load_failure(YAML);
     assert!(
@@ -1881,13 +1933,12 @@ routes:
 #[tokio::test]
 async fn a_result_block_on_an_http_route_is_refused_naming_the_route_and_the_block() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 routes:
   - http: /healthz
-    apl:
-      result:
-        ssn: "str | redact"
+    result:
+      ssn: "str | redact"
 "#;
     let msg = load_failure(YAML);
     assert!(
@@ -1901,15 +1952,14 @@ routes:
 #[tokio::test]
 async fn an_entity_route_still_accepts_its_field_stages() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 routes:
   - tool: get_weather
-    apl:
-      args:
-        city: "str | redact"
-      result:
-        ssn: "str | redact"
+    args:
+      city: "str | redact"
+    result:
+      ssn: "str | redact"
 "#;
     let (_mgr, _ledger) = engine_with(YAML).await;
 }
@@ -1920,42 +1970,44 @@ routes:
 #[tokio::test]
 async fn a_default_http_layer_declaring_a_field_stage_is_refused() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 global:
   defaults:
     http:
-      apl:
-        args:
-          city: "str | redact"
+      args:
+        city: "str | redact"
 routes:
   - http: /healthz
 "#;
     let msg = load_failure(YAML);
     assert!(
-        msg.contains("args") && msg.contains("global.defaults.http.apl"),
+        msg.contains("args") && msg.contains("global.defaults.http"),
         "the refusal must name the block and the scope: {msg}"
     );
 }
 
-/// A `global.apl` carrying `args:` still loads, because those stages are
-/// meaningful for every entity route the global layer stacks onto. Refusing
-/// there would refuse a configuration that is correct elsewhere.
+/// A `global:` block carrying `args:` is refused outright, by the wider rule
+/// that `global:` accepts no field pipeline: it covers every entity route at
+/// once rather than reaching a payload of its own.
 #[tokio::test]
-async fn a_global_args_block_still_loads_alongside_an_http_route() {
+async fn a_global_field_stage_is_refused() {
     const YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 global:
-  apl:
-    args:
-      city: "str | redact"
+  args:
+    city: "str | redact"
 routes:
   - http:
       path_prefix: /v1/files
-    apl:
+    authorization:
       pre_invocation:
         - "http.method == 'POST': deny"
 "#;
-    let (_mgr, _ledger) = engine_with(YAML).await;
+    let msg = load_failure(YAML);
+    assert!(
+        msg.contains("args") && msg.contains("global"),
+        "the refusal must name the block and the scope: {msg}"
+    );
 }

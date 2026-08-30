@@ -50,7 +50,7 @@ use praxis_policy_core::plugin::{OnError, Plugin, PluginConfig, PluginMode};
 
 use praxis_policy_apl_core::{
     AttributeBag, Decision, PdpCall, PdpDecision, PdpDialect, PdpError, PdpResolver, RoutePayload,
-    compile_config, evaluate_route,
+    evaluate_route, test_util::compile_test_policy,
 };
 use praxis_policy_apl_runtime::{
     CmfPluginInvoker, DelegationPluginInvoker, DispatchCache, ElicitationPluginInvoker,
@@ -214,8 +214,8 @@ plugins:
   - name: workday-oauth
     kind: test
     hooks: [token.delegate]
-routes:
-  payroll_adjust:
+route:
+  authorization:
     pre_invocation:
       - "require_approval(manager-approver, from: claim.manager, channel: \"ciba\", scope: \"args.amount <= 25000\", purpose: \"Approve raise\")"
       - "delegate(workday-oauth, target: workday-api, permissions: [read_compensation])"
@@ -246,8 +246,8 @@ async fn run_route(outcome: ElicitationOutcomeKind) -> (Decision, usize) {
     .expect("register delegate");
     mgr.initialize().await.expect("initialize");
 
-    let cfg = compile_config(ROUTE_YAML).expect("compile route YAML");
-    let route = cfg.routes.get("payroll_adjust").expect("route present");
+    let cfg = compile_test_policy("payroll_adjust", ROUTE_YAML).expect("compile route YAML");
+    let route = &cfg.route;
     let cache = Arc::new(DispatchCache::new());
     let plan = cache.get_or_build(route, &cfg.plugins, &mgr).await;
 

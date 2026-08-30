@@ -439,7 +439,7 @@ enum EffectOutcome {
 }
 
 /// Run a single effect against the evaluator's state. Called by both
-/// `evaluate_effects` (top-level walk of `policy:` / `post_policy:`)
+/// `evaluate_effects` (top-level walk of `pre_invocation:` / `post_invocation:`)
 /// and by recursive arms (Sequential, Parallel, When body, Pdp
 /// reactions), so there's exactly one place that knows how each
 /// effect kind dispatches.
@@ -1282,7 +1282,7 @@ pub struct PipelineEvaluation {
 
 /// Walk a pipeline against `value` and the bag, applying stages left-to-right.
 ///
-/// Async because pipe-chain `plugin(name)` stages dispatch through
+/// Async because pipe-chain `run(name)` stages dispatch through
 /// `PluginInvoker`, which is async.
 ///
 /// `field_name` is the field this pipeline is attached to (from the wrapping
@@ -1292,7 +1292,7 @@ pub struct PipelineEvaluation {
 ///
 /// `Stage::Validate { name }` has no named-validator registry backing it;
 /// it always denies with a message pointing operators at `regex(...)` or
-/// `plugin(...)` instead.
+/// `run(...)` instead.
 pub async fn evaluate_pipeline(
     pipeline: &Pipeline,
     value: &serde_json::Value,
@@ -1431,12 +1431,12 @@ pub async fn evaluate_pipeline(
                 // time (parser.rs); this branch covers IR built
                 // programmatically bypassing the parser. Same shape
                 // as the parser's diagnostic — operators reach for
-                // `regex(...)` or `plugin(...)` instead.
+                // `regex(...)` or `run(...)` instead.
                 return PipelineEvaluation {
                     outcome: FieldOutcome::Deny {
                         reason: format!(
                             "`validate({name})` is not implemented; use `regex(...)` \
-                             or `plugin({name})` instead",
+                             or `run({name})` instead",
                         ),
                         stage_index: idx,
                     },
@@ -1549,7 +1549,7 @@ pub async fn evaluate_pipeline(
             Stage::Scan { kind } => {
                 // Spec mapping: scan stages are taint
                 // emitters. The actual PII detection / injection signal
-                // lives in plugin(...) variants of the same scanners; this
+                // lives in run(...) variants of the same scanners; this
                 // stage just records the label so downstream policies can
                 // gate on it. `pii.redact` additionally rewrites the value.
                 let (label, redact): (&str, bool) = match kind {
@@ -2225,7 +2225,7 @@ mod tests {
     }
 
     // Helper: a plugin invoker that's never expected to fire (pipelines
-    // without `plugin(...)` stages). Panics if called. Defined alongside
+    // without `run(...)` stages). Panics if called. Defined alongside
     // the other null fixtures further down in this module.
 
     async fn run_pipeline(
@@ -2257,7 +2257,7 @@ mod tests {
             _bag: &AttributeBag,
             _invocation: PluginInvocation<'_>,
         ) -> Result<PluginOutcome, PluginError> {
-            panic!("NullPipelinePlugins should not dispatch; got plugin({name})");
+            panic!("NullPipelinePlugins should not dispatch; got run({name})");
         }
     }
 
@@ -2464,7 +2464,7 @@ mod tests {
         // rejects it at compile time; this test exercises the runtime
         // defense-in-depth path for IR built programmatically. The
         // deny message points operators at the working alternatives
-        // (`regex(...)` / `plugin(...)`).
+        // (`regex(...)` / `run(...)`).
         let mut bag = AttributeBag::new();
         let p = make_pipeline(vec![
             Stage::Type(TypeCheck::Str),

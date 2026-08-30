@@ -119,7 +119,7 @@ pub const ENTITY_NAME_GLOBAL: &str = "*";
 // CMF hook names — the canonical names plugins register under and hosts
 // pass to `PolicyEngine::invoke_named::<CmfHook>(...)`. Two per entity
 // type — pre-invocation (called from APL's policy / args phase) and
-// post-invocation (called from APL's post_policy / result phase).
+// post-invocation (called from APL's post_invocation / result phase).
 //
 // Declared with `define_hooks!` so each name arrives with the routing
 // metadata `hooks::metadata` needs, the family among it: each row records

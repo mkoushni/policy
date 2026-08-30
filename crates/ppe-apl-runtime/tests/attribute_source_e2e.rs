@@ -84,9 +84,11 @@ async fn invoke_tool(mgr: &Arc<PolicyEngine>, tool: &str) -> bool {
 }
 
 const ROUTE: &str = r#"
+engine_settings:
+  dispatch: policy
 routes:
   - tool: fetch
-    apl:
+    authorization:
       pre_invocation:
         - "data.org.default_region == 'eu': deny('eu-restricted')"
 "#;
@@ -148,9 +150,11 @@ async fn invoke_as_subject(mgr: &Arc<PolicyEngine>, tool: &str, subject_id: &str
 }
 
 const INTERP_ROUTE: &str = r#"
+engine_settings:
+  dispatch: policy
 routes:
   - tool: infer
-    apl:
+    authorization:
       pre_invocation:
         - "data.agents[subject.id].region == 'eu': deny('agent pinned to eu')"
 "#;
@@ -210,9 +214,11 @@ async fn constraint_as_subject(
 }
 
 const REF_ROUTE: &str = r#"
+engine_settings:
+  dispatch: policy
 routes:
   - tool: infer
-    apl:
+    authorization:
       pre_invocation:
         - restrict:
             allow_models: "data.agents[subject.id].allowed_models"
@@ -257,7 +263,7 @@ async fn restrict_field_reference_absent_agent_is_empty() {
     assert_eq!(c.allow_models, Some(vec![]));
 }
 
-// ----- Declarative `global.apl.attribute_files` -----
+// ----- Declarative `global.attribute_files` -----
 
 fn default_opts() -> AplOptions {
     AplOptions {
@@ -288,7 +294,7 @@ fn write_attr_files(
     (dir, paths)
 }
 
-/// `global.apl.attribute_files` loads the tree during the config walk —
+/// `global.attribute_files` loads the tree during the config walk —
 /// no `set_attribute_tree` call — and it flows into the bag.
 #[tokio::test]
 async fn declarative_attribute_files_load_into_bag() {
@@ -299,13 +305,14 @@ async fn declarative_attribute_files_load_into_bag() {
 
     let yaml = format!(
         r#"
+engine_settings:
+  dispatch: policy
 global:
-  apl:
-    attribute_files:
-      - {path}
+  attribute_files:
+    - {path}
 routes:
   - tool: fetch
-    apl:
+    authorization:
       pre_invocation:
         - "data.org.default_region == 'eu': deny('eu-restricted')"
 "#,
@@ -340,14 +347,15 @@ async fn declarative_multiple_files_merge() {
 
     let yaml = format!(
         r#"
+engine_settings:
+  dispatch: policy
 global:
-  apl:
-    attribute_files:
-      - {a}
-      - {b}
+  attribute_files:
+    - {a}
+    - {b}
 routes:
   - tool: infer
-    apl:
+    authorization:
       pre_invocation:
         - "data.agents[subject.id].region == 'eu': deny('pinned')"
 "#,
@@ -377,13 +385,14 @@ async fn injected_tree_beats_declarative_files() {
 
     let yaml = format!(
         r#"
+engine_settings:
+  dispatch: policy
 global:
-  apl:
-    attribute_files:
-      - {path}
+  attribute_files:
+    - {path}
 routes:
   - tool: fetch
-    apl:
+    authorization:
       pre_invocation:
         - "data.org.default_region == 'eu': deny('eu-restricted')"
 "#,
@@ -410,13 +419,14 @@ routes:
 #[tokio::test]
 async fn missing_attribute_file_fails_config_load() {
     let yaml = r#"
+engine_settings:
+  dispatch: policy
 global:
-  apl:
-    attribute_files:
-      - /no/such/attrs.yaml
+  attribute_files:
+    - /no/such/attrs.yaml
 routes:
   - tool: fetch
-    apl:
+    authorization:
       pre_invocation:
         - "require(authenticated)"
 "#;

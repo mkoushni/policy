@@ -7,8 +7,9 @@
 //   1. Define hook types and payloads
 //   2. Build plugins that implement HookHandler
 //   3. Create plugin factories for config-driven loading
-//   4. Load a YAML config with routing rules
-//   5. Invoke hooks with MetaExtension for route resolution
+//   4. Load a YAML config under hook dispatch, where a plugin's own
+//      `conditions:` decide when it fires
+//   5. Invoke hooks with MetaExtension, which is what a condition reads
 //
 // Run with: cargo run --example plugin_demo
 
@@ -404,7 +405,8 @@ impl PluginFactory for RemoteAuthzFactory {
 }
 
 // ---------------------------------------------------------------------------
-// Step 4: Build extensions with MetaExtension for routing
+// Step 4: Build extensions with MetaExtension, the source a
+// per-plugin `conditions: [{tools: [...]}]` matches against
 // ---------------------------------------------------------------------------
 
 fn make_tool_extensions(tool_name: &str, tags: &[&str]) -> Extensions {
@@ -536,8 +538,8 @@ async fn main() {
     print_result("list_departments", &result);
     bg.wait_for_background_tasks().await;
 
-    // --- Scenario 4: Unknown tool (wildcard route) ---
-    println!("=== Scenario 4: some_other_tool (wildcard route) ===\n");
+    // --- Scenario 4: A tool no condition names ---
+    println!("=== Scenario 4: some_other_tool (no plugin narrows to it) ===\n");
     let payload = ToolInvokePayload {
         tool_name: "some_other_tool".into(),
         user: "charlie".into(),
@@ -545,7 +547,7 @@ async fn main() {
     };
     let ext = make_tool_extensions("some_other_tool", &[]);
     let (result, bg) = mgr.invoke::<ToolPreInvoke>(payload, ext, None).await;
-    print_result("some_other_tool (wildcard)", &result);
+    print_result("some_other_tool (unconditional plugins only)", &result);
     bg.wait_for_background_tasks().await;
 
     // --- Scenario 5: Awaiting plugin — cache hit ---

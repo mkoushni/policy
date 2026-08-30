@@ -19,8 +19,8 @@
 # `global` HTTP policy (no entity routes), Praxis authorizes it at the
 # HTTP layer for generic (non-MCP) requests. Review the coverage report
 # before use.
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
 - name: keycloak-jwt
   kind: identity/jwt

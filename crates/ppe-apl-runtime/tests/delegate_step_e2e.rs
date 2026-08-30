@@ -47,7 +47,7 @@ use praxis_policy_core::plugin::{OnError, Plugin, PluginConfig, PluginMode};
 
 use praxis_policy_apl_core::{
     AttributeBag, Decision, PdpCall, PdpDecision, PdpDialect, PdpError, PdpResolver, RoutePayload,
-    compile_config, evaluate_route,
+    evaluate_route, test_util::compile_test_policy,
 };
 
 use praxis_policy_apl_runtime::{
@@ -257,11 +257,12 @@ fn ext_with_subject_and_label(token: &str, subject_id: &str, label: &str) -> Ext
 /// run the route YAML through praxis-policy-apl-core's compile, and return the
 /// pieces a test needs to invoke a route.
 async fn build_setup(
+    source: &str,
     yaml: &str,
     plugins: Vec<(String, Arc<RecordingDelegate>, PluginConfig)>,
 ) -> (
     Arc<PolicyEngine>,
-    praxis_policy_apl_core::CompiledConfig,
+    praxis_policy_apl_core::test_util::TestPolicy,
     Arc<DispatchCache>,
 ) {
     let mgr = Arc::new(PolicyEngine::default());
@@ -270,7 +271,7 @@ async fn build_setup(
             .expect("register delegate plugin");
     }
     mgr.initialize().await.expect("initialize");
-    let cfg = compile_config(yaml).expect("compile route YAML");
+    let cfg = compile_test_policy(source, yaml).expect("compile route YAML");
     let cache = Arc::new(DispatchCache::new());
     (mgr, cfg, cache)
 }
@@ -304,14 +305,15 @@ plugins:
   - name: workday-oauth
     kind: test
     hooks: [token.delegate]
-routes:
-  get_compensation:
+route:
+  authorization:
     pre_invocation:
       - "delegate(workday-oauth, target: workday-api, permissions: [read_compensation])"
       - "!delegation.granted: deny"
       - "!(delegation.granted.permissions contains 'read_compensation'): deny"
 "#;
     let (mgr, cfg, cache) = build_setup(
+        "get_compensation",
         yaml,
         vec![(
             "workday-oauth".to_owned(),
@@ -321,7 +323,7 @@ routes:
     )
     .await;
 
-    let route = cfg.routes.get("get_compensation").expect("route present");
+    let route = &cfg.route;
     let registry = cfg.plugins.clone();
     let plan = cache.get_or_build(route, &registry, &mgr).await;
 
@@ -434,12 +436,13 @@ plugins:
   - name: workday-oauth
     kind: test
     hooks: [token.delegate]
-routes:
-  get_compensation:
+route:
+  authorization:
     pre_invocation:
       - "delegate(workday-oauth, target: workday-api, permissions: [write_everything])"
 "#;
     let (mgr, cfg, cache) = build_setup(
+        "get_compensation",
         yaml,
         vec![(
             "workday-oauth".to_owned(),
@@ -449,7 +452,7 @@ routes:
     )
     .await;
 
-    let route = cfg.routes.get("get_compensation").expect("route present");
+    let route = &cfg.route;
     let registry = cfg.plugins.clone();
     let plan = cache.get_or_build(route, &registry, &mgr).await;
 
@@ -531,12 +534,13 @@ plugins:
   - name: audit-receipt
     kind: test
     hooks: [token.delegate]
-routes:
-  any:
+route:
+  authorization:
     pre_invocation:
       - "delegate(audit-receipt, target: audit, on_error: continue)"
 "#;
     let (mgr, cfg, cache) = build_setup(
+        "any",
         yaml,
         vec![(
             "audit-receipt".to_owned(),
@@ -546,7 +550,7 @@ routes:
     )
     .await;
 
-    let route = cfg.routes.get("any").expect("route present");
+    let route = &cfg.route;
     let registry = cfg.plugins.clone();
     let plan = cache.get_or_build(route, &registry, &mgr).await;
 
@@ -638,14 +642,15 @@ plugins:
   - name: payroll-oauth
     kind: test
     hooks: [token.delegate]
-routes:
-  fanout:
+route:
+  authorization:
     pre_invocation:
       - "delegate(workday-oauth, target: workday-api, permissions: [read_compensation])"
       - "delegate(payroll-oauth, target: payroll-api, permissions: [read_salary])"
       - "!(delegation.granted.permissions contains 'read_salary'): deny"
 "#;
     let (mgr, cfg, cache) = build_setup(
+        "fanout",
         yaml,
         vec![
             (
@@ -662,7 +667,7 @@ routes:
     )
     .await;
 
-    let route = cfg.routes.get("fanout").expect("route present");
+    let route = &cfg.route;
     let registry = cfg.plugins.clone();
     let plan = cache.get_or_build(route, &registry, &mgr).await;
 
@@ -768,12 +773,13 @@ plugins:
   - name: scoped-delegate
     kind: test
     hooks: [token.delegate]
-routes:
-  get_compensation:
+route:
+  authorization:
     pre_invocation:
       - "delegate(scoped-delegate, target: workday-api, permissions: [read_compensation])"
 "#;
     let (mgr, cfg, cache) = build_setup(
+        "get_compensation",
         yaml,
         vec![(
             "scoped-delegate".to_owned(),
@@ -783,7 +789,7 @@ routes:
     )
     .await;
 
-    let route = cfg.routes.get("get_compensation").expect("route present");
+    let route = &cfg.route;
     let registry = cfg.plugins.clone();
     let plan = cache.get_or_build(route, &registry, &mgr).await;
 
@@ -877,12 +883,13 @@ plugins:
   - name: capless-delegate
     kind: test
     hooks: [token.delegate]
-routes:
-  any:
+route:
+  authorization:
     pre_invocation:
       - "delegate(capless-delegate, target: workday-api)"
 "#;
     let (mgr, cfg, cache) = build_setup(
+        "any",
         yaml,
         vec![(
             "capless-delegate".to_owned(),
@@ -892,7 +899,7 @@ routes:
     )
     .await;
 
-    let route = cfg.routes.get("any").expect("route present");
+    let route = &cfg.route;
     let registry = cfg.plugins.clone();
     let plan = cache.get_or_build(route, &registry, &mgr).await;
 

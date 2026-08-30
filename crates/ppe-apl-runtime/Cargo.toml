@@ -46,6 +46,9 @@ sha2 = "0.10"
 
 [dev-dependencies]
 serde = { workspace = true }
+# See praxis-policy-apl-cmf's note: the feature unifies into the non-test build,
+# which costs one module and no behavior.
+praxis-policy-apl-core = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

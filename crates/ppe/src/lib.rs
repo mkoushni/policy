@@ -183,7 +183,7 @@ pub fn builtin_pdp_factories() -> Vec<std::sync::Arc<dyn PdpFactory>> {
 }
 
 /// The enabled session-store factories, ready to drop into
-/// [`AplOptions::session_store_factories`]. A `global.apl.session_store:
+/// [`AplOptions::session_store_factories`]. A `global.session_store:
 /// { kind: ... }` config block selects one; absent that, the in-process
 /// [`MemorySessionStore`] default stays active.
 #[cfg(feature = "_builtin")]

@@ -3,12 +3,12 @@
 
 // Policy-phase Step IR and async dispatch traits.
 //
-// The DSL allows policy:/post_policy: lists to contain three kinds of
+// The DSL allows pre_invocation:/post_invocation: lists to contain three kinds of
 // entries beyond predicate-and-action rules:
 //
 //   - PDP calls: `cedar:(...)`, `opa(...)`, `authzen(...)`, `nemo(...)`,
 //     `cel:(...)` with optional `on_deny:` / `on_allow:` reaction blocks
-//   - Plugin invocations: `plugin(name)`
+//   - Plugin invocations: `run(name)`
 //   - Taint effects: `taint(label[, scope])`
 //
 // `Step` is the union over these forms plus the existing `Rule`. The async
@@ -53,7 +53,7 @@ pub(crate) enum Step {
         on_allow: Vec<Step>,
     },
 
-    /// `plugin(name)` — invoke a PPE-registered plugin. The plugin's
+    /// `run(name)` — invoke a PPE-registered plugin. The plugin's
     /// `PluginResult` decision becomes the step's outcome.
     Plugin { name: String },
 
@@ -142,7 +142,7 @@ pub struct DelegateStep {
     pub on_error: Option<String>,
 
     /// Human-readable source path (e.g.
-    /// `"route.get_compensation.policy[2]"`) — used in audit and
+    /// `"route.get_compensation.pre_invocation[2]"`) used in audit and
     /// `Decision::Deny.rule_source` when the step denies.
     pub source: String,
 }
@@ -188,7 +188,7 @@ impl ElicitKind {
     }
 }
 
-/// One elicitation invocation inside `policy:` or `post_policy:` — the
+/// One elicitation invocation inside `pre_invocation:` or `post_invocation:`, the
 /// runtime dispatches a question to a human (approval, confirmation,
 /// step-up, …) through a channel plugin, holds a pending state across
 /// the agent's retries, validates the response, and resumes.
@@ -279,7 +279,7 @@ pub struct ElicitStep {
     pub on_error: Option<String>,
 
     /// Human-readable source path (e.g.
-    /// `"route.payroll_adjust.policy[0]"`) — used in audit and
+    /// `"route.payroll_adjust.pre_invocation[0]"`) used in audit and
     /// `Decision::Deny.rule_source` when the step denies.
     pub source: String,
 }
@@ -372,7 +372,7 @@ pub trait PdpResolver: Send + Sync {
 ///
 /// Hosts register a factory by handing it to praxis-policy-apl-runtime's
 /// `AplOptions.pdp_factories`. When the visitor walks the unified
-/// config and finds a `global.apl.pdp[].kind` matching the factory's
+/// config and finds a `global.pdp[].kind` matching the factory's
 /// reported `kind()`, it calls `build` with the rest of that block.
 ///
 /// The error type is `Box<dyn Error + Send + Sync>` to keep this trait
@@ -424,7 +424,8 @@ pub enum DispatchPhase {
 /// Context for one plugin invocation: tells the invoker the *intent* of
 /// the call so it can dispatch to the right PPE hook contract.
 ///
-/// `Step` is the policy / `post_policy` case — the invoker (praxis-policy-apl-runtime side)
+/// `Step` is the `pre_invocation` / `post_invocation` case; the invoker
+/// (praxis-policy-apl-runtime side)
 /// already holds a typed payload reference; APL doesn't need to pass one.
 ///
 /// `Field` is the pipe-chain case — APL is focused on a specific field
@@ -883,7 +884,8 @@ pub struct PluginOutcome {
     /// Pipe-context return: when a plugin runs as a stage inside an
     /// args/result chain, it may rewrite the field value (e.g., a PII
     /// scrubber producing a redacted string). `None` means "leave value
-    /// unchanged"; always `None` for policy / `post_policy` invocations.
+    /// unchanged"; always `None` for `pre_invocation` / `post_invocation`
+    /// invocations.
     ///
     /// Scoped to the field named in [`PluginInvocation::Field`] and
     /// nothing else. A plugin that rewrote some other part of the

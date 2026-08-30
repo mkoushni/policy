@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-// End-to-end reference for the CANONICAL APL config shape: a route that
-// declares `authentication:` and `authorization:` as sibling blocks, with
-// NO `apl:` wrapper. This is the form the docs teach; this test proves it
-// loads and runs both phases:
+// End-to-end reference for the canonical APL config shape: a route that
+// declares `authentication:` and `authorization:` as sibling blocks. This is
+// the form the docs teach; this test proves it loads and runs both phases:
 //
 //   routes:
 //     - tool: get_compensation
@@ -12,13 +11,13 @@
 //         - corp-jwt
 //       authorization:             # praxis-policy-apl-core authorization phases
 //         pre_invocation:
-//           - "plugin(audit-log)"
+//           - "run(audit-log)"
 //
 // The two blocks are handled by different layers — `authentication:` binds
 // identity plugins for the `identity.resolve` hook (praxis-policy-core), while
 // `authorization:` compiles into the APL route handler the visitor installs
-// on `cmf.tool_pre_invoke` (praxis-policy-apl-runtime). Dropping `apl:` is what lets them sit
-// at the same level. This test exercises both from one loaded config.
+// on `cmf.tool_pre_invoke` (praxis-policy-apl-runtime). This test exercises
+// both from one loaded config.
 
 #![allow(
     missing_docs,
@@ -107,7 +106,7 @@ impl PluginFactory for RecordingIdentityFactory {
 
 // ---------------------------------------------------------------------
 // `authorization:` side — an allow-through CMF plugin the APL
-// `pre_invocation` step invokes via `plugin(audit-log)`.
+// `pre_invocation` step invokes via `run(audit-log)`.
 // ---------------------------------------------------------------------
 
 struct AllowGate {
@@ -166,10 +165,10 @@ fn ext_for_tool(name: &str) -> Extensions {
 }
 
 // The canonical shape under test: `authentication:` and `authorization:`
-// as siblings on the route, no `apl:` wrapper.
+// as siblings on the route.
 const CANONICAL_YAML: &str = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: corp-jwt
     kind: identity-recorder
@@ -183,7 +182,7 @@ routes:
       - corp-jwt
     authorization:
       pre_invocation:
-        - "plugin(audit-log)"
+        - "run(audit-log)"
 "#;
 
 async fn build_manager(ledger: Arc<Mutex<Vec<String>>>) -> Arc<PolicyEngine> {

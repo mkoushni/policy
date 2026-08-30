@@ -289,15 +289,17 @@ async fn manager_with(
     );
     let yaml = format!(
         r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: {kind}
     kind: {kind}
     hooks: [{hook}]
 routes:
   - tool: get_weather
-    apl:
+    authorization:
       {phase}:
-        - "plugin({kind})"
+        - "run({kind})"
 "#
     );
     mgr.load_config_yaml(&yaml).expect("load_config_yaml");
@@ -580,17 +582,19 @@ async fn tool_result_redaction_reaches_the_host_in_post_phase() {
 #[tokio::test]
 async fn args_pipeline_and_plugin_edits_both_survive() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: token-scrubber
     kind: token-scrubber
     hooks: [cmf.tool_pre_invoke]
 routes:
   - tool: get_weather
-    apl:
-      args:
-        city: "str | redact"
+    args:
+      city: "str | redact"
+    authorization:
       pre_invocation:
-        - "plugin(token-scrubber)"
+        - "run(token-scrubber)"
 "#;
 
     let mgr = manager_with_yaml(
@@ -644,17 +648,19 @@ routes:
 #[tokio::test]
 async fn result_pipeline_and_plugin_edits_both_survive() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: ssn-redactor
     kind: ssn-redactor
     hooks: [cmf.tool_post_invoke]
 routes:
   - tool: get_weather
-    apl:
-      result:
-        employee_id: "str | mask(2)"
+    result:
+      employee_id: "str | mask(2)"
+    authorization:
       post_invocation:
-        - "plugin(ssn-redactor)"
+        - "run(ssn-redactor)"
 "#;
 
     let mgr = manager_with_yaml(
@@ -708,15 +714,16 @@ routes:
 #[tokio::test]
 async fn plugin_stage_rewrites_only_the_field_it_was_pointed_at() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: city-scrubber
     kind: city-scrubber
     hooks: [cmf.tool_pre_invoke]
 routes:
   - tool: get_weather
-    apl:
-      args:
-        city: "str | plugin(city-scrubber)"
+    args:
+      city: "str | run(city-scrubber)"
 "#;
 
     let mgr = manager_with_yaml(
@@ -756,6 +763,8 @@ routes:
 #[tokio::test]
 async fn mutations_from_several_plugins_accumulate() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: result-redactor
     kind: result-redactor
@@ -765,10 +774,10 @@ plugins:
     hooks: [cmf.tool_pre_invoke]
 routes:
   - tool: get_weather
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(result-redactor)"
-        - "plugin(thought-redactor)"
+        - "run(result-redactor)"
+        - "run(thought-redactor)"
 "#;
 
     let mgr = Arc::new(PolicyEngine::default());
@@ -833,6 +842,8 @@ routes:
 #[tokio::test]
 async fn a_denied_route_forwards_no_payload() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: redactor
     kind: redactor
@@ -842,10 +853,10 @@ plugins:
     hooks: [cmf.tool_pre_invoke]
 routes:
   - tool: get_weather
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(redactor)"
-        - "plugin(denier)"
+        - "run(redactor)"
+        - "run(denier)"
 "#;
 
     let mgr = Arc::new(PolicyEngine::default());
@@ -891,6 +902,8 @@ routes:
 #[tokio::test]
 async fn a_mutation_the_executor_rejects_is_not_reported() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: redactor
     kind: redactor
@@ -898,9 +911,9 @@ plugins:
     mode: audit
 routes:
   - tool: get_weather
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(redactor)"
+        - "run(redactor)"
 "#;
 
     let mgr = manager_with_yaml(
@@ -936,17 +949,19 @@ routes:
 #[tokio::test]
 async fn omit_stage_and_plugin_edit_both_survive() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: token-scrubber
     kind: token-scrubber
     hooks: [cmf.tool_pre_invoke]
 routes:
   - tool: get_weather
-    apl:
-      args:
-        debug: "str | omit"
+    args:
+      debug: "str | omit"
+    authorization:
       pre_invocation:
-        - "plugin(token-scrubber)"
+        - "run(token-scrubber)"
 "#;
 
     let mgr = manager_with_yaml(
@@ -1002,17 +1017,19 @@ routes:
 #[tokio::test]
 async fn nested_pipeline_and_plugin_edits_both_survive() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: name-scrubber
     kind: name-scrubber
     hooks: [cmf.tool_pre_invoke]
 routes:
   - tool: get_weather
-    apl:
-      args:
-        user.ssn: "str | redact"
+    args:
+      user.ssn: "str | redact"
+    authorization:
       pre_invocation:
-        - "plugin(name-scrubber)"
+        - "run(name-scrubber)"
 "#;
 
     let mgr = manager_with_yaml(
@@ -1070,17 +1087,19 @@ routes:
 #[tokio::test]
 async fn a_plugin_stage_does_not_undo_an_earlier_mask_in_the_same_chain() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: token-scrubber
     kind: token-scrubber
     hooks: [cmf.tool_pre_invoke]
 routes:
   - tool: get_weather
-    apl:
-      args:
-        city: "str | mask(2) | plugin(token-scrubber)"
+    args:
+      city: "str | mask(2) | run(token-scrubber)"
+    authorization:
       pre_invocation:
-        - "plugin(token-scrubber)"
+        - "run(token-scrubber)"
 "#;
 
     // The plugin rewrites `token`, never `city`. It must therefore report

@@ -233,18 +233,17 @@ pub struct PluginConfig {
     #[serde(default)]
     pub tags: Vec<String>,
 
-    /// Legacy conditions for when the plugin should execute.
+    /// How a plugin narrows its own scope, under `dispatch: hooks`.
     ///
     /// Each condition narrows the plugin's scope by server, tenant,
     /// tool name, prompt name, etc. If any condition in the list
     /// matches, the plugin runs. If the list is empty (default),
     /// the plugin runs unconditionally.
     ///
-    /// **Backward compatibility:** Conditions are the legacy mechanism
-    /// for scoping plugins. When the host uses the unified routing
-    /// system (`routes:` in config YAML), routing rules handle scope
-    /// matching and conditions on the plugin are ignored. The two
-    /// mechanisms should not be used together on the same plugin.
+    /// **Hook mode only.** Declaring it under `dispatch: policy` is a load
+    /// error: a policy decides dispatch there, so nothing would consult the
+    /// condition. `priority:` is not restricted the same way — the registry
+    /// orders every hook's entries by it in both modes.
     #[serde(default)]
     pub conditions: Vec<PluginCondition>,
 
@@ -255,7 +254,7 @@ pub struct PluginConfig {
 
 impl PluginConfig {
     /// Whether this plugin's `conditions` allow it to fire for the given
-    /// request `Extensions`. Used in legacy mode (`routing_enabled: false`)
+    /// request `Extensions`. Used in hook mode (`dispatch: hooks`)
     /// to filter which plugins run per request.
     ///
     /// Semantics:
@@ -347,9 +346,9 @@ fn default_priority() -> i32 {
 /// fields participate in matching. Within a field, any match suffices
 /// (OR semantics). Across fields, all must match (AND semantics).
 ///
-/// This is the legacy scoping mechanism. The unified routing system
-/// (`routes:` in config) supersedes this — when routes are used,
-/// conditions are ignored.
+/// Hook mode's scoping mechanism. Under `dispatch: policy` a policy step's
+/// `run(name)` scopes the plugin instead, and a `conditions:` block there is a
+/// load error rather than an ignored one.
 ///
 ///
 /// # Examples

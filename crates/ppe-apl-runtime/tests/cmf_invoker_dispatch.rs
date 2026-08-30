@@ -322,7 +322,10 @@ async fn build_manager(factory_kind: &str, factory: Box<dyn PluginFactory>) -> A
     let mgr = PolicyEngine::default();
     mgr.register_factory(factory_kind, factory);
 
-    let yaml = format!("plugins:\n  - name: {factory_kind}\n    kind: {factory_kind}\n");
+    let yaml = format!(
+        "engine_settings:\n  dispatch: hooks\nplugins:\n  - name: {factory_kind}\n    \
+         kind: {factory_kind}\n"
+    );
     let cfg = praxis_policy_core::config::parse_config(&yaml).expect("parse_config");
     mgr.load_config(cfg).expect("load_config");
     mgr.initialize().await.expect("initialize");
@@ -1009,8 +1012,10 @@ async fn build_manager_with_caps(
     } else {
         format!("    capabilities: [{}]\n", policy_caps.join(", "))
     };
-    let yaml =
-        format!("plugins:\n  - name: {factory_kind}\n    kind: {factory_kind}\n{caps_yaml}",);
+    let yaml = format!(
+        "engine_settings:\n  dispatch: hooks\nplugins:\n  - name: {factory_kind}\n    \
+         kind: {factory_kind}\n{caps_yaml}",
+    );
     let cfg = praxis_policy_core::config::parse_config(&yaml).expect("parse_config");
     mgr.load_config(cfg).expect("load_config");
     mgr.initialize().await.expect("initialize");
@@ -1148,7 +1153,7 @@ async fn route_override_caps_narrow_what_plugin_sees() {
 // dispatch to the right entry per phase. Previously the
 // dispatch plan classified both as "step" and arbitrary "first
 // non-field wins" picked one for every dispatch — silent wrong
-// routing when policy and post_policy needed different handlers.
+// routing when pre_invocation and post_invocation needed different handlers.
 
 /// Pre-side handler — returns Allow with no modification.
 struct PreSideHandler {

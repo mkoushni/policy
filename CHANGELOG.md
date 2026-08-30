@@ -15,13 +15,43 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+> **Upgrading a 0.1.0 configuration?** `docs/upgrade-apl.md` lists every key and
+> form that must be rewritten, with a before and an after for each. This release
+> removes ten configuration keys, changes the default dispatch mode, and tightens
+> the policy language's lexical rules, so a 0.1.0 document does not load unchanged.
+>
+> For what the language accepts now, rather than what changed,
+> `docs/apl-grammar.md` is normative. It replaces a grammar that existed only as
+> comments inside the parser.
+
 ### Added
+
+- **`docs/apl-grammar.md`, the grammar as a document.** APL's grammar lived in
+  comments beside the parser, and those comments were wrong on four counts: they
+  described steps, pipe chains, `in` / `not in` / `exists()` and
+  `sequential:` / `parallel:` as rejected, long after each was implemented. There is
+  now one normative document, with the EBNF, the lexical rules, one precedence
+  table, a per-position table of what each of the three positions accepts, the YAML
+  shape, hook mode's key set beside policy mode's, and the surviving warts with the
+  reason each survives.
+
+  `crates/ppe-apl-core/tests/conformance/` is what holds the parser and the document
+  in agreement: one accepted and one rejected case per production, per documented
+  wart, and per breaking change, with each rejection asserting on the message rather
+  than only on being an error.
+
+- **`response:`, the custom denial block, documented at last.** It shipped in 0.1.0
+  undocumented. A `response:` block on a route, a bundle, a `global.defaults.<entity>:`
+  entry, or `global:` supplies the status and body a denial renders, and the
+  most-specific layer wins on collision. `None` leaves the host's default denial
+  behavior. Its resolution rule changed in this release too, which the Changed
+  section covers.
 
 - **Delegated tokens can be reused until they expire.** The OAuth delegator runs one RFC 8693 exchange per `delegate` step; a `cache:` block lets it serve a token it already minted instead. Off unless enabled, and then only for `subject: this_workload` and `client`, whose number of cache entries is bounded by configuration rather than by the caller population. `user` and `caller_workload` are opt-in through `cache.subjects`. Concurrent requests for one uncached key produce one exchange rather than one each, and a failed exchange is not stored. A cached token stays usable after an `IdP`-side revocation until its entry retires, which `cache.ttl_ceiling_seconds` bounds. ([#30](https://github.com/praxis-proxy/policy/issues/30))
 
 - **A route that delegates an unvalidated credential is reported at config load.** A `delegate` step whose subject exchanges the caller's own token relies on identity resolution having checked it, but `identity:` is per-route and optional, so a route can reach the delegator with a token this process has not validated. Loading the config now warns under `alarm = "delegation_without_identity_resolution"`, naming the route and the delegate plugins on it. `subject: this_workload` is excluded, since it carries no inbound credential. ([#30](https://github.com/praxis-proxy/policy/issues/30))
 
-- **`http.response`, the return half of the L7 path.** `http.request` had no counterpart because authorization is an admission check that belongs entirely before the request is forwarded. Response filtering is not: stripping a header the upstream set, enforcing a content type, and attaching labels all belong after. Header and extension filtering only, since no response body exists in the model yet and the payload is unused on this path. A `global.apl` carrying `result:` or `post_invocation:` steps now installs a `Post`-phase handler under the same `http` / `*` coordinates the request hook uses; a policy that only authorizes gains nothing and installs nothing. PPE defining and routing a hook does not oblige a host to fire it, so a host that never does sees no change. For the host that does adopt it: a `global.apl` whose post steps were previously inert on the entity-less HTTP path becomes live the moment the hook is fired, and `result.*` keys do not exist for a request carrying no entity, so a step reading one denies. Check what the global post block does before firing.
+- **`http.response`, the return half of the L7 path.** `http.request` had no counterpart because authorization is an admission check that belongs entirely before the request is forwarded. Response filtering is not: stripping a header the upstream set, enforcing a content type, and attaching labels all belong after. Header and extension filtering only, since no response body exists in the model yet and the payload is unused on this path. A `global:` block carrying `result:` or `post_invocation:` steps now installs a `Post`-phase handler under the same `http` / `*` coordinates the request hook uses; a policy that only authorizes gains nothing and installs nothing. PPE defining and routing a hook does not oblige a host to fire it, so a host that never does sees no change. For the host that does adopt it: a `global:` block whose post steps were previously inert on the entity-less HTTP path becomes live the moment the hook is fired, and `result.*` keys do not exist for a request carrying no entity, so a step reading one denies. Check what the global post block does before firing.
 
 - **`http.status`, the response status a post-phase policy can read.** The HTTP
   model carried the request line and both header maps but no status, so a rule
@@ -44,21 +74,21 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   and a list (`http: [/livez, /readyz]`) match exact paths; the map form asks
   for a segment-boundary prefix (`http: {path_prefix: /v1/files}`) or an exact
   path (`http: {path: /v1/files/manifest}`), either optionally narrowed by
-  `method:`. It requires `plugin_settings.routing_enabled: true`, which
-  defaults to false and leaves an `http:` route inert until it is set; a load
-  now reports that state, and reports a set of `http:` routes that declares no
-  catch-all, naming that a request matching none of them is governed by the
-  global policy instead. A prefix matches at segment boundaries exactly as the
-  gateway's own router reads one, so `/api` covers `/api`, `/api/`, and
-  `/api/v1` but not `/apikeys`, and a trailing slash is insignificant. An exact
-  path outranks every prefix, the longer prefix wins among prefixes, and a
-  route narrowed by `method:` outranks the same path left open for the methods
-  it names, with the narrower of two narrowings winning a method both name.
-  Declaration order decides nothing among them, and among two selectors naming
-  the same number of methods it is what is left. An exact path is
-  compared byte for byte against the path the request arrived on, the way the
-  gateway router's own exact arm compares it, so `/admin` and `/admin/` are two
-  routes answering for two different requests.
+  `method:`. It requires `engine_settings.dispatch: policy`, which is the
+  default, so an `http:` route is live as written; a load reports a set of
+  `http:` routes that declares no catch-all, naming that a request matching
+  none of them is governed by the global policy instead. A prefix matches at
+  segment boundaries exactly as the gateway's own router reads one, so `/api`
+  covers `/api`, `/api/`, and `/api/v1` but not `/apikeys`, and a trailing
+  slash is insignificant. An exact path outranks every prefix, the longer
+  prefix wins among prefixes, and a route narrowed by `method:` outranks the
+  same path left open for the methods it names, with the narrower of two
+  narrowings winning a method both name. Declaration order decides nothing
+  among them, and among two selectors naming the same number of methods it is
+  what is left. An exact path is compared byte for byte against the path the
+  request arrived on, the way the gateway router's own exact arm compares it,
+  so `/admin` and `/admin/` are two routes answering for two different
+  requests.
 
   Two things worth knowing before writing the first one. An `http:` route
   carrying a policy body dispatches that body in place of its structural plugin
@@ -98,6 +128,230 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 - **Roles and permissions are readable as whole sets.** `subject.roles`, `subject.permissions`, `client.roles`, and `client.permissions` join `subject.teams` as `StringSet` bag keys, so a policy can write `"hr" in subject.roles` rather than enumerating `role.<name>` booleans. The flattened boolean keys are unchanged. ([#7](https://github.com/praxis-proxy/policy/pull/7))
 
 ### Changed
+
+- **`require(P)` is a predicate, and means `!P`.** It was a rule-level shorthand
+  with its own hand-written parser, which read a comma-or-pipe list of bare
+  attribute names and nothing else. So `require(delegation.depth < 3)`,
+  `require(!delegated)`, `require(a) & b` and `require(a) | require(b)` were all
+  unwritable, not because any of them is ambiguous but because there was no code
+  path to them. They parse now.
+
+  **Every form already in use compiles to the tree it compiled to before**, and
+  that is structural rather than a claim: negation is normalized down to the
+  leaves, folding `!IsTrue` to `IsFalse` and applying De Morgan, so `require(a)` is
+  `IsFalse(a)`, `require(a, b)` is `Or([IsFalse(a), IsFalse(b)])` and
+  `require(a | b)` is `And([IsFalse(a), IsFalse(b)])`. Those three were the whole
+  of what the old parser accepted, so no deployed policy changes what it decides.
+
+  Two smaller changes come with it. Mixing `,` and `|` inside the parens used to be
+  refused outright, because the old parser tracked one separator and had no
+  precedence to appeal to; the comma binds lower than `&` and `|`, so
+  `require(a, b | c)` is `!(a & (b | c))`. **A configuration that was rejected for
+  mixing them now loads and decides something**, so read one before upgrading. And
+  a `require(...)` rule's action can only be `deny`: the construct states what must
+  hold and refuses when it does not, so `require(a): allow` is a contradiction and
+  fails the load naming the inversion.
+
+- **`run(name)` is the only form that invokes a plugin.** `plugin(name)` was a
+  second spelling for it in both step and stage position, so a reader had to know
+  both and a document could use either. It is refused in both positions now, naming
+  `run(name)`. The word survives as a noun: `plugin:` as a keyword argument inside
+  `delegate(...)`, and the `delegate:` map form, both still parse.
+
+- **An empty stage in a pipe chain is rejected.** A leading, trailing or doubled
+  `|` left a position with no stage in it, and those positions were skipped, so a
+  chain compiled shorter than its author wrote it. `parse_pipeline("")` still
+  answers with an empty pipeline, because a caller hands it a field value that may
+  be absent and absent is not malformed; what is refused is naming a stage and then
+  leaving a position beside it empty.
+
+  The `validate(name)` refusal now names `run(...)` rather than the removed
+  spelling among its alternatives.
+
+- **One rule for a quoted literal, and escapes that unescape.** Quoted text was
+  read in ten places with three different escape rules and two different answers
+  for an unterminated quote. The lexer processed no escapes at all, so there was no
+  way to write a quote inside a literal delimited by that quote; the
+  delegate-argument splitter let a backslash protect the next character; the pipe
+  finder skipped two bytes after one. Two splitters treated an unterminated quote
+  as an error and two silently swallowed the rest of the line, which is how a rule
+  could lose its action with no diagnostic. Every site now reads a literal the same
+  way.
+
+  The escape set is exactly `\\`, `\'`, and `\"`. **Breaking for policy text that
+  carries a backslash**, and this is the one change in the release that can break
+  text which looks correct: a backslash used to pass through untouched, so a regex
+  character class worked by accident. Write `regex("\\d+")` where you wrote
+  `regex("\d+")`; the single form now fails the load naming the unrecognized
+  escape rather than being reinterpreted. `\n` and `\t` are deliberately not
+  escapes: a deny reason rides in a violation field a host renders, so a multi-line
+  reason there is a display problem rather than a capability.
+
+  Two things that were quietly wrong are now right. A closing paren inside a
+  literal is content, so `deny("blocked (see policy)")` loads where it used to be
+  refused as a malformed call. And a lone quote in a field stage is an unterminated
+  literal, where `regex(")` used to compile to a pattern matching one quote
+  character. A stage argument may still carry no quotes at all, so
+  `enum(low, medium, high)` and `regex(^[A-Z]+$)` are unaffected.
+
+- **An attribute path is a production, so a path that names nothing fails the
+  load.** `a..b`, `a.`, `.a`, `data.t[]`, `data.t[a:b]`, and `data.t["a]"]` all
+  lexed clean and then resolved to an absent attribute, which made a predicate
+  silently false and a `require` silently deny: a policy that never matched and
+  never said why. Each is now rejected naming the production it broke. A quoted key
+  inside a subscript was the quiet one, since `data.t["a"]` looked up the four
+  characters `"a"` including the quotes and so never matched anything; write
+  `data.t[subject.tenant]` with the inner path unquoted.
+
+  The rule splitter counts brackets now, which its two siblings already did. A
+  colon inside a subscript used to be the only depth-zero colon on a
+  bare-predicate line, so the rule split into a predicate and a nonsense action and
+  the error named neither brackets nor quotes.
+
+- **`not` is reserved, and a doubled boolean operator names the single form.**
+  `not authenticated` used to read as an attribute called `not` followed by a stray
+  token, so the error mentioned neither `not` nor `!`. It now names `!`. The
+  `not in` phrase is unaffected, and it is the one place the word is legal; a path
+  beginning `not.` is rejected too, which used to slip through because the keyword
+  table compared the whole path. `a && b` and `a || b` name `&` and `|` instead of
+  dumping a token. Spacing around an operator is not significant and never was,
+  despite a comment in the lexer claiming a caller enforced it.
+
+- **A number has one shape, and a position is a character offset.** Digits are
+  required on both sides of the dot, so `1.` is rejected; `.5` was already rejected
+  while `-.5` parsed as a float, and both now name the number. An exponent is
+  rejected by name rather than producing a trailing-token error that never
+  mentioned it. `007` is still the integer 7, deliberately: reading it as octal
+  would alter a value silently.
+
+  Lexer positions count characters rather than bytes, and name the real character.
+  A non-ASCII identifier was reported at a byte index, and the character was
+  rendered by casting a single byte to `char`, so the message named a character
+  that was not in the input at all.
+
+- **`engine_settings.dispatch:` defaults to `policy`.** It defaulted to `hooks`,
+  where every declared plugin fires at every hook its own `hooks:` names. The
+  document a policy engine is written in is the `routes:` / `groups:` / `global:`
+  half, and defaulting to the other one meant the common config was the one whose
+  policy did nothing until an operator found the key naming the mode. A config
+  carrying `routes:`, `groups:`, or `global:` now needs no `engine_settings:`
+  block at all.
+
+  **Breaking for existing config**, and the widest break in this release. A config
+  that declared plugins and relied on the old default fired all of them; under
+  `policy` a plugin runs only where a step names it. `dispatch: hooks` restores
+  the old behavior exactly and is the one-line upgrade for a config that wants it.
+  Two checks make the difference visible rather than silent, below.
+
+- **A declared plugin no policy reaches fails the load, by name.** Under
+  `dispatch: policy` a plugin runs only from a step that names it, so a plugin
+  nothing names is inert and every request it was meant to govern is ungoverned.
+  The load now fails, naming each unreached plugin. The reference set is wider
+  than a `run(name)` step: an `authentication:` list at any scope, a `delegate`
+  call, and an elicitation verb's handler each reach a plugin, and a step under
+  `global.authorization:` reaches one for every route it stacks onto. The check is
+  per plugin rather than per config, so a config naming one of three still reports
+  the other two. A host that registers no orchestrator gets a narrower version
+  from the engine itself: policy mode, plugins declared, and no `routes:`,
+  `groups:`, or `global:` block to name them from.
+
+- **A plugin reached on fewer hooks than it declares is reported at load.** A
+  plugin declaring three hooks and named by a step on one runs on that one, where
+  hook dispatch ran it on three. Narrowing is often what an operator meant, so it
+  warns rather than failing, under `alarm = "plugin_narrowed_by_policy"`, naming
+  the plugin and every hook left uncovered. Add a step on the uncovered hooks, or
+  narrow the plugin's own `hooks:` to match what the policy asks for.
+
+- **A request the engine cannot identify is denied rather than dispatched against
+  absent context.** A request carrying no `meta.entity_type` / `meta.entity_name`
+  resolves no route, and it used to fall through to every entry registered on the
+  hook. In the mode whose premise is that a policy decides, that both ran plugins
+  against context which was not there and let a caller skip every rule by omitting
+  metadata. It is now denied with the violation code `unidentified_request` and a
+  400-class proto code, distinct from a policy's own deny because no rule was
+  reached. **The guard is the configuration, not the mode**: a config declaring no
+  policy at all passes the request exactly as before, so a deployment that has not
+  written policy yet sees no new denials. An HTTP request is unaffected either way,
+  since it names its entity type and resolves the global annotation.
+
+- **The compiled IR stops speaking a vocabulary no config may use.** `Phase::Policy`
+  and `Phase::PostPolicy` are `Phase::PreInvocation` and `Phase::PostInvocation`;
+  `CompiledRoute.policy` and `.post_policy` are `.pre_invocation` and
+  `.post_invocation`. The three config structs whose Rust field was `identity`
+  behind `#[serde(rename = "authentication")]` now name the field
+  `authentication`, matching the key a document writes. `CompiledRoute.args` and
+  `.result` were already right and did not move.
+
+  The old spellings were the config keys this release removes, so the IR was the
+  last place naming a form a document is now rejected for writing. **Breaking** for
+  Rust callers reading those fields or matching those variants. `Phase` and
+  `CompiledRoute` both derive `Serialize`, so the **serialized keys change too**: a
+  phase serializes as `pre_invocation` / `post_invocation` rather than `policy` /
+  `post_policy`, and a serialized `CompiledRoute` names the two step lists the same
+  way. A consumer reading either shape off the wire has to move with it. The
+  `authentication` rename is Rust-only, since the serde key was already
+  `authentication`.
+
+- **The two dispatch modes reject each other's keys by name.** Each used to
+  ignore the other's silently, which is how a config asked for one mode's
+  behavior and got the other's. Under `engine_settings.dispatch: hooks`,
+  `routes:`, `groups:`, `global:`, and `global.defaults:` are load errors: hook
+  dispatch resolves none of them, so a route written there matched nothing and
+  reported nothing. Under `dispatch: policy`, a per-plugin `conditions:` is a
+  load error: a policy decides dispatch, so the condition was never consulted.
+  The error names the key and the mode that rejects it.
+
+  `priority:` is deliberately **not** rejected beside `conditions:`. The registry
+  orders every hook's entries by trusted priority in both modes, so a policy-mode
+  config's `priority:` still decides what runs first and stays legal.
+
+  **Breaking for existing config**: the mode is checked against the effective
+  value, written or defaulted. A config declaring `routes:`, `groups:`, or
+  `global:` needs nothing written, since `policy` is the default. One that
+  declares plugins with their own `conditions:`, or relies on every declared
+  plugin firing at the hooks it names, must write `dispatch: hooks`.
+
+- **A tag bundle's `authentication.replace_inherited: true` is honored, and what
+  it drops is reported at load.** The flag was read at bundle scope and only
+  acted on at route scope, so writing it on a bundle was a documented no-op.
+  It now drops everything the route accumulated before that bundle: the global
+  `authentication:` layer and any bundle the route joined ahead of it. The
+  bundles after it and the route's own block still append, and a route's own
+  flag still drops every inherited layer. Bundle order is `meta.tags` in
+  declaration order followed by `groups:` in declaration order, so which bundle
+  replaces and which survive it are both readable from the document.
+  **Breaking for existing config**: a config that already sets the flag on a
+  bundle gets a route that authenticates with less than it did before, silently
+  as far as the route's own block shows. That is why the load now warns under
+  `alarm = "authentication_replaced_above_the_route"`, once per affected route,
+  naming the route, the section that set the flag, and the steps the route no
+  longer runs. Read those lines before upgrading: an authentication-removing
+  control moved from route-local and visible to inherited and remote, and the
+  route's author is not the person who wrote the section it comes from.
+
+- **`attribute_files:`, `pdp:`, and `session_store:` are `global:` keys, and
+  nowhere else.** `attribute_files:` was read only as `global.apl.attribute_files`,
+  so it moves with the wrapper: write it as `global.attribute_files:`. `pdp:` and
+  `session_store:` were accepted on a route, under `global.defaults.<entity>:`,
+  and on a bundle, where the compiler dropped them and the load warned; they now
+  fail the load naming the key. A PDP, the session store, and the static
+  attribute tree are process-global, so the three engine blocks agree on their
+  own scope for the first time. The diagnostic paths follow: an error that said
+  `global.apl.attribute_files` now says `global.attribute_files`.
+
+- **A key nothing reads now fails the load at every scope, not only on a
+  route.** `GlobalConfig` and `PolicyGroup` drop an unknown field, so a
+  misspelled `authorizaton:` under `global:`, `global.defaults.<entity>:`, or a
+  bundle used to load clean and enforce nothing. Each of those scopes now
+  reports every unrecognized key it carries, naming the section, the same way a
+  route already did. A visitor's `extra_route_keys` are honored at those scopes
+  too, so an out-of-tree orchestrator's own block stays loadable wherever it is
+  written.
+
+- **A `response:` block resolves by one rule.** It was read from the section and,
+  failing that, from inside `apl:`, with the section winning — the inverse of the
+  precedence the wrapper itself had. With no wrapper there is one source: the
+  section. A `response:` nested inside anything is an unknown key.
 
 - **`HookFamily::for_entity` reports an unmapped entity type instead of
   defaulting to CMF.** It returned `HookFamily` and treated every entity type
@@ -181,7 +435,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   now fails naming the declaration and the block, and points at
   `pre_invocation:` / `post_invocation:` with the `http.*` attributes instead.
   It covers both scopes that reach HTTP routes and nothing else: a route's own
-  `apl:` block and `global.defaults.http.apl`. A `global.apl` carrying `args:`
+  policy block and `global.defaults.http`. A `global:` block carrying `args:`
   still loads, because those stages are meaningful for the entity routes the
   global layer also stacks onto.
   ([#40](https://github.com/praxis-proxy/policy/issues/40))
@@ -259,9 +513,233 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 ### Removed
 
+- **`compile_config`, and the second `routes:` shape it defined.** Along with it
+  `ConfigYaml`, `CompiledConfig`, and the private `compile_route`. The function
+  read a whole document whose `routes:` was a **map keyed by route name**, while a
+  real configuration writes `routes:` as a list of selectors, so the project
+  defined two incompatible shapes for one key and the one no host could load was
+  the one the compiler's tests read. Nothing in production called it: the runtime
+  compiles a section's policy block through `compile_policy_block_value`, which
+  stays.
+
+  **Breaking** for any Rust caller using it. What the tests wanted from it was
+  narrower than a config, and that is what replaces it: `test_util::compile_test_policy`
+  returns one compiled route plus the plugin registry its steps name, behind a new
+  `test-util` feature on `praxis-policy-apl-core` so a test seam stays out of the
+  semver-bound published surface. `ConfigYaml`'s lenient catch-all for unknown
+  top-level keys is gone with it and has no replacement, which is the same
+  direction as the rest of this release: an unrecognized key is reported, not
+  swallowed. The has-APL gate is gone too, so a block declaring no APL term now
+  compiles to an empty route rather than being dropped from a map; read
+  `declared_phases().is_empty()` for that question.
+
+  `make coverage` gains `--all-features`, without which the newly gated test
+  targets would fall outside the coverage floor rather than being measured by it.
+
+ A
+  route's, a bundle's under `groups:`, a `global.defaults.<entity>:` entry's, and
+  the reserved `all` bundle's were one construct, and under
+  `engine_settings.dispatch: policy` all four are now load errors naming
+  `run(name)` as the way a policy invokes a plugin. An empty list is refused with
+  the rest: it is a shape the mode has no reading for, not a way to activate
+  nothing. The `plugins:` **mapping** is untouched and still valid there — it
+  overrides `config`, `capabilities`, and `on_error` for a plugin a step already
+  names, which is a different construct that happens to share the key. Top-level
+  `plugins:`, the declaration block, is untouched in both modes.
+
+  **Breaking for existing config.** What replaces chain-wide activation is a
+  `run(name)` step under `global.authorization`, which stacks onto every entity
+  route, so a config using the `all` bundle migrates like this:
+
+  ```yaml
+  # Before
+  groups:
+    all:
+      plugins: [audit-log]
+
+  # After
+  global:
+    authorization:
+      pre_invocation:
+        - "run(audit-log)"
+  ```
+
+  A bundle's or a route's list moves the same way, into that section's own
+  `authorization:` block. One case has no policy-mode spelling at all: a plugin
+  that must fire at a hook no APL block annotates. `engine_settings.dispatch:
+  hooks` is the answer for it — the plugin fires at the hooks its own `hooks:`
+  declares, narrowed by its own `conditions:`. Both examples under
+  `crates/ppe-core/examples/` are exactly that case and now run in hook mode.
+
+  `resolve_plugins_for_entity` loses the four list sources with them, and its
+  signature loses the entity type, the matched route, and the request tags,
+  which nothing left in it reads. Under `dispatch: policy` it returns nothing.
+
+- **The `http:` route inertness report.** A load reported that `http:` routes
+  existed while `engine_settings.dispatch` was `hooks`. `routes:` is a load error
+  in that mode now, so a config carrying an `http:` route is in policy mode by
+  construction and the report had no reachable input. The report beside it, that
+  a set of `http:` routes declares no catch-all, stays.
+
+- **A route's `when:`.** The one removal here that takes a capability with it. A
+  route could carry a conditional match expression, and nothing ever evaluated
+  it: static resolution carried the string onto every plugin the route resolved
+  and no dispatch site read it back. It was not inert in one respect, which is
+  the part worth reading before upgrading. `when:` scored a specificity bonus, so
+  declaring a narrowing condition made a route win more often, and a config with
+  `when:` on one of two otherwise equally specific routes resolved to the one
+  that declared it. That bonus is gone with the key, so those two routes now rank
+  identically and the first declared wins. **Breaking for existing config**: the
+  intent belongs in a `when:` / `do:` step under the route's `authorization:`
+  block, which the evaluator does run against the payload the route carries.
+  Check any pair of routes that relied on the bonus to order them, because the
+  winner changes.
+
+- **`plugin_dirs:`, `engine_settings.parallel_execution_within_band`,
+  `engine_settings.fail_on_plugin_error`, and an `authentication:` step's
+  `on_error:`.** Four keys the loader parsed and the runtime honored nowhere.
+  Three of them warned at load, which put an operator in the worst position: the
+  config said one thing, a log line said another, and the behavior was a third.
+  The fourth was worse, because a step's key set flattened everything it did not
+  model into a forward-compat bag, so a step's `on_error:` and a misspelled
+  `confg:` both vanished without a word. Each of the four now fails the load
+  naming itself and the spelling that does the job: `plugin_dirs:` becomes
+  `register_factory()` plus a declaration in the `plugins:` block,
+  `parallel_execution_within_band` becomes `mode: concurrent` on the individual
+  plugin, `fail_on_plugin_error` becomes that plugin's `on_error: fail`, and a
+  step's `on_error:` is the `on_error:` of the plugin's own `plugins:`
+  declaration. `engine_settings:` and a map-form `authentication:` step each
+  carry a closed key set now, so a typo in either is a load error rather than a
+  silently dropped setting.
+
+  **Breaking for embedders**: `PolicyConfig::plugin_dirs`,
+  `EngineSettings::parallel_execution_within_band`,
+  `EngineSettings::fail_on_plugin_error`, `RouteEntry::when`,
+  `ResolvedPlugin::when`, `RouteIdentityStep::on_error`, and
+  `RouteIdentityStep::extra` are all removed from `praxis-policy-core`.
+
+- **`policy:`, `post_policy:`, `identity:`, and `global.policies:`.** The four
+  keys that had already been replaced but were still recognized, each by its own
+  rejection guard. Every config scope now carries one closed key set, so all four
+  fail the load as the unknown keys they are, and the unknown-key error carries
+  the replacement: a removed key's message names the spelling to write instead,
+  while a plain misspelling gets the accept set and nothing invented. **Breaking
+  for existing config**: `policy:` becomes `authorization.pre_invocation`,
+  `post_policy:` becomes `authorization.post_invocation`, `identity:` becomes
+  `authentication:`, and a bundle under `global.policies:` moves to the top-level
+  `groups:` block, dedented one level. `groups:` is now the only place a document
+  declares a bundle; the two locations no longer merge, and a name can no longer
+  be declared twice with one shadowing the other. A bundle's own contents and the
+  way a route joins it by name or by `meta.tags` are unchanged.
+
+  **Breaking for embedders**: the rename tables and the errors that existed only
+  to report these keys are gone with them. `config::RENAMED_APL_KEYS` and
+  `config::renamed_apl_key_message` are removed from `praxis-policy-core`, and
+  `ParseError::RenamedField` is removed from `praxis-policy-apl-core`; a removed
+  key now arrives as the same unknown-key error every other bad key gets.
+  `GlobalConfig::policies` is renamed to `GlobalConfig::bundles` and is no longer
+  a serde field, since top-level `groups:` is what fills it.
+
+- **Every top-level key the document model does not name.** `engine_settings:`,
+  `global:`, `groups:`, `routes:`, and `plugins:` are the whole set, and anything
+  else fails the load. This closes the last silent drop: a
+  config still writing `plugin_settings:` lost every engine setting including
+  `dispatch:`, so it ran in the default mode rather than the one it declared. The
+  targeted rejection that shipped with the rename is now the general rule, and it
+  still names `engine_settings` and the `dispatch: policy` spelling that replaced
+  `routing_enabled: true`.
+
+- **The route shape's catch-all in the policy compiler.** A route handed to the
+  standalone compile entry point accepted any key and stashed the ones it did not
+  model, so a flat `pre_invocation:` compiled a route with no policy in it. The
+  shape now denies unknown fields: `authorization:`, `args:`, `result:`, and
+  `plugins:` are the whole body, and anything else fails to compile. The
+  config-load path already refused these through its key tables; this closes the
+  same gap for a caller that compiles a document directly.
+
+- **The flat `pre_invocation:` / `post_invocation:` spelling.** The two phase
+  lists were accepted twice, nested under `authorization:` or written directly on
+  a section, which needed a reconciliation rule for a section that wrote both.
+  `authorization:` is now the only place they appear, at every scope, and a
+  section still writing one flat fails the load naming it as the unknown key it
+  is. A block must name at least one of the two: `authorization: {}`, and
+  `authorization:` written with nothing under it, both used to load as an empty
+  block that authorized nothing, and each now fails the load naming the missing
+  phase. **Breaking for existing config**: nest each phase list under
+  `authorization:`. `pre_invocation: [...]` on a route becomes
+  `authorization: { pre_invocation: [...] }`. `args:` and `result:` are
+  unaffected. They stay on the section and are never nested under
+  `authorization:`, because they are phases rather than authorization steps.
+
+  This retires a published guarantee. The 0.1.0 entry below names the policy
+  document format as deliberately unchanged and as the surface a deployment
+  depends on, pinned by `crates/ppe-core/tests/wire_compatibility.rs` against a
+  document authored before the rename. That fixture wrote the flat form, so it
+  has been rewritten and the test now guards the narrower surface: the plugin
+  `kind:` strings, the plugin and route names, the hook names, and the violation
+  codes. Those are unchanged. The phase spelling is not, and this is the notice
+  rather than a diff nobody reads.
+
+- **`args:` and `result:` under `global:`.** A field pipeline names one field of
+  the payload a route carries, and `global:` covers every entity route at once
+  rather than reaching a payload of its own. The two blocks are no longer keys
+  there and each fails the load naming itself. This is a **removed capability,
+  not a tightening**: it was the only spelling for one field pipeline covering
+  every entity route, and there is no replacement that keeps that reach. Write
+  the pipeline on each `global.defaults.<entity>:` block that has a payload for
+  it to address, or on the routes themselves. Both blocks are unchanged at every
+  other scope.
+
+- **The `apl:` wrapper.** A section's policy terms were accepted twice, nested
+  under `apl:` or written directly on the section, and the two spellings needed
+  two precedence rules that pointed opposite ways: the wrapper won outright for
+  the policy terms, while the section won for `response:`. The wrapper is gone at
+  every scope — `global:`, `global.defaults.<entity>:`, `groups.<name>:`, and a
+  `routes[]` entry — and a config still writing one fails the load naming the
+  key rather than dropping the policy inside it. **Breaking for existing
+  config**: lift each `apl:` block's contents onto the section that carried it.
+  `apl: { authorization: {...} }` becomes `authorization: {...}`,
+  `apl: { pdp: [...] }` under `global:` becomes `pdp: [...]`, and
+  `global.apl.attribute_files` becomes `global.attribute_files`.
+
 - **The `hooks::types::hook_names` and `hooks::types::cmf_hook_names` modules.** Sixteen `pub const`s that no dispatch site read. Six of `hook_names` shadowed CMF hooks under names nothing fires; two spelled identity and delegation `identity_resolve` / `token_delegate`, which no handler answers to. `cmf_hook_names` duplicated `cmf::constants` and got the prompt pair wrong, teaching `cmf.prompt_pre_fetch` where the dispatched name is `cmf.prompt_pre_invoke`. Because nothing consumed them they drifted unnoticed for months. **Breaking**, with no replacement needed: `praxis_policy_core::cmf::constants` holds the CMF names and is the supported import path, alongside `identity::HOOK_IDENTITY_RESOLVE`, `delegation::HOOK_TOKEN_DELEGATE`, and `elicitation::HOOK_ELICIT`. Those constants keep their paths and their values. The values are operator-facing, since a `hooks:` list in YAML names them as strings, so they are fixed as public API rather than free to rename.
 
 ### Fixed
+
+- **A `delegate(...)` or elicitation step above route scope no longer fails the
+  load.** The reachability check that makes `dispatch: policy` survivable asks
+  which plugins a policy names, and it asked with two different reference sets:
+  a route's tally counted delegation and elicitation, while a `global:`,
+  `global.defaults.<entity>:`, or `groups.<name>:` layer's counted only
+  `run(name)` steps and pipeline stages. A plugin named only by a
+  `delegate(...)` in one of those sections was therefore reported as reaching
+  nothing, and the load failed telling the operator to add a step that was
+  already there. Any route stacking the section hid it, so it struck exactly
+  the section-only configs the layer tally exists to cover. Both paths now read
+  the same reference set. No configuration that loaded before stops loading.
+
+- **`global.defaults.<entity>.authentication:` is read.** The key deserialized
+  at that scope and the identity resolver walked global to tag bundles to route
+  straight past it, so an entity type's default authentication steps were
+  parsed, stored, and dropped: a key accepted and honored nowhere, which is the
+  fault this release's key model exists to remove. The layer now stacks between
+  the global block and the tag bundles, which is where the policy layers put
+  the same section, and its `replace_inherited: true` drops what came before it
+  the way a bundle's does, reported at load under the same alarm. **Breaking
+  for existing config**: a document already carrying that block gains the
+  identity steps it was silently going without. Under the APL visitor such a
+  document did not load at all, since nothing recorded the plugin as reached;
+  without a visitor it loaded and authenticated nobody for that entity type.
+
+- **An `authorization:` block whose phases are all empty is refused.** A block
+  naming neither phase was already a load error, since it authorizes nothing
+  and the has-APL gate would then drop the route as if it carried no policy.
+  `pre_invocation: []` reached that same end state by another spelling and
+  loaded clean. Layers append, so an empty list overrides nothing and cannot be
+  a way to opt out of an inherited phase. A phase written empty beside one that
+  carries steps still loads and means what it says. **Breaking for existing
+  config**: a section whose only authorization content is an empty list stops
+  loading; delete the block.
 
 - **Normalizing a request path that carries a query allocates nothing.** The query and the fragment are dropped by taking a shorter borrow of the request line, but the check for whether the path needed rewriting ran on the raw path, so the `?` and the `#` it found there forced the owned branch and every request carrying a query string paid for a rewrite with nothing to do. The check now runs on the path the borrow covers, so `/v1/files/q3.pdf?page=2` borrows the way `/v1/files/q3.pdf` already did. A path that still needs its dot segments resolved, its duplicate slashes collapsed, or its path parameters stripped is owned as before. Normalized paths are unchanged, except that a trailing slash sitting in front of a query is now kept the way `/a/` already kept its own.
 
