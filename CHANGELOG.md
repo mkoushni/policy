@@ -292,6 +292,64 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   `authentication` rename is Rust-only, since the serde key was already
   `authentication`.
 
+- **A plugin only an unreachable layer names fails the reachability check.** The
+  per-plugin check tallied a layer's references as soon as the layer compiled,
+  which treated every compiled layer as executable. A group installs no handler
+  and matches no request on its own, and an entity default only stacks onto routes
+  of its type, so a plugin named in a group nothing joins, or in a default for an
+  entity type no route declares, has no dispatch path and reported as reachable
+  anyway. The tally now comes from the effective route, at the point a handler
+  installs, so it counts the layers a route actually inherits.
+
+  `global:` keeps its exception, and it is the only one: it installs the
+  entity-less HTTP catch-all, which governs every request that resolves no route,
+  so a config with no `routes:` at all still reaches its plugins.
+
+  **Breaking for existing config**: a document that declares a group or an entity
+  default no route reaches now fails the load naming the plugin, where it used to
+  load with that policy dead. Join the group from a route, or drop it.
+
+- **A route joining a group through `groups:` inherits that group's
+  `authorization:`.** `groups: hr` and `meta: { tags: [hr] }` are documented as
+  resolving identically, and they did not. Identity resolution read both
+  spellings; the orchestrator that layers a bundle's policy read `meta.tags`
+  alone, so a `groups:` membership inherited the group's `authentication:` and
+  none of its `authorization:`.
+
+  With the activation lists gone, authorization layering is most of what a group
+  is for, so this was a fail-open rather than a metadata asymmetry: no layer
+  contributed anything to the route, so no handler installed and the route was
+  governed by nothing at all. Both chains now read one ordered stream of
+  membership names, `meta.tags` in declaration order then `groups:`, which is
+  also what makes `replace_inherited:` well defined at bundle scope. A name
+  written in both spellings is one membership, so the group's steps run once.
+
+  **Breaking for existing config**: a route joining a group through `groups:`
+  begins enforcing that group's `authorization:`. If you were relying on the old
+  asymmetry, that route will start denying what the group denies. Move the route
+  out of the group, or move the policy off the group, whichever you meant.
+
+- **A policy term with no visitor to compile it fails the load.** `authorization:`,
+  `args:`, `result:`, `response:`, and the `global:` wiring keys are accepted at
+  every section that can carry them, and their bodies live only in the raw
+  document: the typed config model has no field for any of them, because the APL
+  runtime's config visitor is what reads them. With no visitor registered the load
+  committed the typed config and returned success having dropped every one, so a
+  route declaring `authorization: [run(audit)]`, or an unconditional `deny`,
+  loaded clean, installed no handler, and enforced nothing at all. The load now
+  names the section, the keys, and the two ways out: register the visitor
+  (`praxis_policy_apl_runtime::register_apl`), or write `dispatch: hooks`.
+
+  The reachability backstop did not cover this and could not. It passes as soon as
+  a document declares any route, group, default, or global authentication block,
+  which the document in question does.
+
+  The check runs before the typed config is installed, so a rejected document
+  never becomes the live snapshot. It reads the key model rather than a written
+  list, so a policy term added later cannot slip past it. `parse_config` is
+  untouched: it parses and validates a document without loading it, and a host may
+  well parse one for an engine that does have a visitor.
+
 - **The two dispatch modes reject each other's keys by name.** Each used to
   ignore the other's silently, which is how a config asked for one mode's
   behavior and got the other's. Under `engine_settings.dispatch: hooks`,
@@ -301,15 +359,26 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   load error: a policy decides dispatch, so the condition was never consulted.
   The error names the key and the mode that rejects it.
 
-  `priority:` is deliberately **not** rejected beside `conditions:`. The registry
-  orders every hook's entries by trusted priority in both modes, so a policy-mode
-  config's `priority:` still decides what runs first and stays legal.
+  A per-plugin `priority:` is a load error there too, for the same reason. It
+  orders the entries one hook holds, and policy dispatch never runs more than one
+  at a time: effects run in the order the document writes them, a `run(name)`
+  step invokes the single plugin it names, and the runtime hands the executor a
+  one-entry slice. Identity resolution is declaration order and reads no priority
+  either. The key was accepted and inert, which is the ambiguity this release set
+  out to remove. Order the steps under `authorization:` instead, or write
+  `dispatch: hooks` to order by priority.
+
+  Both checks read the document, so only a *declared* key is refused. The typed
+  `PolicyConfig` boundary refuses the activation lists, `conditions:`, and the
+  hook-mode scopes, but not `priority:`: the field is defaulted, so a host that
+  set the default cannot be told apart from one that set nothing.
 
   **Breaking for existing config**: the mode is checked against the effective
   value, written or defaulted. A config declaring `routes:`, `groups:`, or
   `global:` needs nothing written, since `policy` is the default. One that
-  declares plugins with their own `conditions:`, or relies on every declared
-  plugin firing at the hooks it names, must write `dispatch: hooks`.
+  declares plugins with their own `conditions:` or `priority:`, or relies on
+  every declared plugin firing at the hooks it names, must write
+  `dispatch: hooks`.
 
 - **A tag bundle's `authentication.replace_inherited: true` is honored, and what
   it drops is reported at load.** The flag was read at bundle scope and only

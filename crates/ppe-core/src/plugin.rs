@@ -213,7 +213,13 @@ pub struct PluginConfig {
     #[serde(default)]
     pub mode: PluginMode,
 
-    /// Execution priority — lower numbers execute first within each mode.
+    /// Execution priority, under `dispatch: hooks`. Lower numbers execute first
+    /// within each mode.
+    ///
+    /// **Hook mode only.** Declaring it under `dispatch: policy` is a load error:
+    /// it orders the entries one hook holds, and policy dispatch never runs more
+    /// than one at a time. Effects run in document order and a `run(name)` step
+    /// invokes the one plugin it names, so nothing would consult the priority.
     #[serde(default = "default_priority")]
     pub priority: i32,
 
@@ -242,8 +248,7 @@ pub struct PluginConfig {
     ///
     /// **Hook mode only.** Declaring it under `dispatch: policy` is a load
     /// error: a policy decides dispatch there, so nothing would consult the
-    /// condition. `priority:` is not restricted the same way — the registry
-    /// orders every hook's entries by it in both modes.
+    /// condition. `priority:` is restricted the same way, for the same reason.
     #[serde(default)]
     pub conditions: Vec<PluginCondition>,
 

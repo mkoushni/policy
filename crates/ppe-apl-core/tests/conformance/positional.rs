@@ -119,3 +119,62 @@ fn a_named_validator_is_refused_and_names_the_alternatives() {
         ["regex(", "run("].as_slice(),
     );
 }
+
+// ---- a field operation in rule position --------------------------------
+
+/// `result.x | redact` used to compile as a disjunction of two truthy attributes
+/// and take the default deny, so a pipeline written one position too high
+/// enforced something its author never asked for.
+#[test]
+fn a_field_operation_in_rule_position_is_rejected() {
+    for src in ["result.x | redact", "args.employee_id | mask(4)"] {
+        let e = parse_rule(src, "test")
+            .expect_err("a field operation is not a rule")
+            .to_string();
+        names_all(&e, ["effect position", "args:", "result:"].as_slice());
+    }
+}
+
+/// The guard has to stay narrow. This is a legal disjunction of two truthy
+/// attributes: both sides are paths, neither is a stage. Without this case the
+/// guard gets widened to "an `args.`/`result.` head" and starts refusing it.
+#[test]
+fn a_disjunction_of_two_field_paths_is_still_a_predicate() {
+    parse_rule("result.x | result.y: deny", "test")
+        .expect("two attribute paths are a disjunction, not a field operation");
+    parse_rule("args.a | result.b", "test").expect("the same with no explicit action");
+}
+
+/// A chain whose head is not a field path is not a field operation either, so the
+/// predicate parser keeps deciding it. `subject.id | redact` is a disjunction on
+/// an attribute that happens to share a stage's name, and the guard leaves it
+/// alone: what marks a field operation is the field, not the stage.
+#[test]
+fn a_chain_without_a_field_head_is_not_caught_by_the_guard() {
+    parse_rule("subject.id | redact", "test")
+        .expect("a non-field head stays a predicate, whatever the other side is named");
+}
+
+// ---- a declared field entry with no stages -----------------------------
+
+/// `args: { value: "" }` used to compile to a no-op `FieldRule`: the author named
+/// a field and then left its chain empty, and nothing said so.
+#[test]
+fn a_declared_field_entry_with_no_stages_is_rejected() {
+    for (half, chain) in [("args", ""), ("result", "   ")] {
+        let yaml = format!("route:\n  {half}:\n    ssn: \"{chain}\"\n");
+        let e = compile_test_route("test", &yaml)
+            .expect_err("a declared entry with no stages is a load error")
+            .to_string();
+        names_all(&e, [&format!("{half}.ssn"), "no stages"].as_slice());
+    }
+}
+
+/// And the entry with a stage still compiles, keyed by the field it names.
+#[test]
+fn a_declared_field_entry_with_a_stage_still_compiles() {
+    let route = compile_test_route("test", "route:\n  result:\n    ssn: \"redact\"\n")
+        .expect("a named stage compiles");
+    let fields: Vec<&str> = route.result.iter().map(|r| r.field.as_str()).collect();
+    assert_eq!(fields, ["ssn"]);
+}

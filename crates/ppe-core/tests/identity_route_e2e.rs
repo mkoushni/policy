@@ -252,9 +252,16 @@ fn manager_with_observing_factory() -> (
 async fn route_identity_block_dispatches_in_declared_order() {
     let (mgr, ledger, _) = manager_with_recording_factory();
 
-    // Three identity plugins, all registered under `identity.resolve`.
-    // Route declares them in REVERSE priority order to prove that
-    // routing follows the `authentication:` declaration, not chain priority.
+    // Three identity plugins, all registered under `identity.resolve`. The route
+    // declares them in an order no other signal could produce, so the ledger
+    // reading back in that order is the binding working.
+    //
+    // This used to set priority 10/20/30 and declare them reversed, so the
+    // ledger order proved declaration beat priority. `priority:` is a
+    // policy-mode load error now, and the route block this test needs is itself
+    // a hook-mode load error, so the contrast cannot be set up either way. It
+    // is also no longer a contrast worth drawing: in policy mode there is no
+    // priority for declaration order to beat.
     let yaml = r#"
 engine_settings:
   dispatch: policy
@@ -262,22 +269,19 @@ plugins:
   - name: jwt-a
     kind: recording
     hooks: [identity.resolve]
-    priority: 10
   - name: jwt-b
     kind: recording
     hooks: [identity.resolve]
-    priority: 20
   - name: jwt-c
     kind: recording
     hooks: [identity.resolve]
-    priority: 30
 
 routes:
   - tool: get_weather
     authentication:
-      - jwt-c       # priority 30 — would naturally run LAST in chain order
-      - jwt-a       # priority 10 — would naturally run FIRST
-      - jwt-b       # priority 20
+      - jwt-c
+      - jwt-a
+      - jwt-b
 "#;
     let parsed = config::parse_config(yaml).expect("parse");
     mgr.load_config(parsed).expect("load");

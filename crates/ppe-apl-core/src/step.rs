@@ -326,17 +326,31 @@ pub enum PdpDialect {
 }
 
 impl PdpDialect {
+    /// The dialect a built-in key names, or `None` when the key names none.
+    ///
+    /// The closed half of the key set. A step-map key resolves through this and
+    /// takes `pdp(name)` for a custom dialect, so a misspelling is a load error
+    /// rather than a `Custom` no resolver will ever answer for.
+    pub fn from_builtin_key(key: &str) -> Option<Self> {
+        match key {
+            "cedar" => Some(Self::Cedar),
+            "opa" => Some(Self::Opa),
+            "authzen" => Some(Self::AuthZen),
+            "nemo" => Some(Self::NeMo),
+            "cel" => Some(Self::Cel),
+            _ => None,
+        }
+    }
+
     /// Parse a YAML key prefix like `cedar`, `opa`, `authzen`, `nemo`
     /// into the matching `PdpDialect`. Unknown dialects become `Custom`.
+    ///
+    /// Open by design, for a host naming a dialect it registered. The parser
+    /// does not read step-map keys through this: an open mapping there turned
+    /// every misspelling into a custom dialect. Use [`Self::from_builtin_key`]
+    /// where the key set is closed.
     pub fn from_key(key: &str) -> Self {
-        match key {
-            "cedar" => Self::Cedar,
-            "opa" => Self::Opa,
-            "authzen" => Self::AuthZen,
-            "nemo" => Self::NeMo,
-            "cel" => Self::Cel,
-            other => Self::Custom(other.to_owned()),
-        }
+        Self::from_builtin_key(key).unwrap_or_else(|| Self::Custom(key.to_owned()))
     }
 }
 

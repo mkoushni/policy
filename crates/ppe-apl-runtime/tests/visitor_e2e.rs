@@ -31,7 +31,8 @@
     clippy::unwrap_used,
     reason = "test and example code"
 )]
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
@@ -158,6 +159,61 @@ impl PluginFactory for DenyGateFactory {
     }
 }
 
+/// Counts `count-gate` invocations, for the case that one membership written in
+/// both spellings must run the bundle's step once.
+static COUNT_GATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Records the order the `order-*` gates fired in, for the case that bundle
+/// layers stack in document order.
+static ORDER_LEDGER: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// An allowing gate that records that it ran, under the name it was declared as.
+struct Recorder {
+    cfg: PluginConfig,
+}
+
+#[async_trait]
+impl Plugin for Recorder {
+    fn config(&self) -> &PluginConfig {
+        &self.cfg
+    }
+}
+
+impl HookHandler<CmfHook> for Recorder {
+    async fn handle(
+        &self,
+        _payload: &MessagePayload,
+        _extensions: &Extensions,
+        _ctx: &mut PluginContext,
+    ) -> PluginResult<MessagePayload> {
+        // Each case owns its own names, so the two never touch the same state.
+        // `cargo test` runs a binary's tests as threads in one process, and a
+        // ledger both wrote to would make each flaky in the other's presence.
+        // `cargo nextest` gives a process per test and would have hidden it.
+        if self.cfg.name == "count-gate" {
+            COUNT_GATE_CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        if self.cfg.name.starts_with("order-") {
+            ORDER_LEDGER
+                .lock()
+                .expect("ledger")
+                .push(self.cfg.name.clone());
+        }
+        PluginResult::allow()
+    }
+}
+
+struct RecorderFactory;
+impl PluginFactory for RecorderFactory {
+    fn create(&self, config: &PluginConfig) -> Result<PluginInstance, Box<CoreError>> {
+        let plugin = Arc::new(Recorder {
+            cfg: config.clone(),
+        });
+        let handlers = hooks_for(config, plugin.clone());
+        Ok(PluginInstance { plugin, handlers })
+    }
+}
+
 // =====================================================================
 // Helpers
 // =====================================================================
@@ -185,6 +241,9 @@ fn manager_with_visitor() -> Arc<PolicyEngine> {
     let mgr = Arc::new(PolicyEngine::default());
     mgr.register_factory("allow-gate", Box::new(AllowGateFactory));
     mgr.register_factory("deny-gate", Box::new(DenyGateFactory));
+    for kind in ["count-gate", "order-a", "order-b"] {
+        mgr.register_factory(kind, Box::new(RecorderFactory));
+    }
 
     register_apl(
         &mgr,
@@ -367,6 +426,141 @@ routes:
         .violation
         .expect("tag bundle's deny-gate should propagate");
     assert_eq!(violation.reason, "deny-gate fired");
+}
+
+/// The same bundle, joined through `groups:` instead of `meta.tags`. The two
+/// spellings are documented as resolving identically, and they did not: the
+/// visitor read `meta.tags` alone, so this route inherited the bundle's
+/// `authentication:` (which praxis-policy-core resolves through the shared
+/// ordered stream) and none of its `authorization:`.
+///
+/// With the activation lists gone that was a fail-open, not a metadata
+/// asymmetry. No layer contributed anything, so no handler installed and the
+/// route was governed by nothing at all.
+#[tokio::test]
+async fn visitor_applies_tag_bundle_to_a_route_joining_by_groups() {
+    const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
+plugins:
+  - name: deny-gate
+    kind: deny-gate
+    hooks: [cmf.tool_pre_invoke]
+groups:
+  pii:
+    authorization:
+      pre_invocation:
+        - "run(deny-gate)"
+routes:
+  - tool: get_weather
+    groups: pii
+"#;
+    let mgr = build_manager_with_visitor(YAML).await;
+
+    let ext = Extensions {
+        meta: Some(Arc::new(meta_for_tool("get_weather"))),
+        ..Default::default()
+    };
+    let (result, _bg) = mgr
+        .invoke_named::<CmfHook>("cmf.tool_pre_invoke", cmf_payload("hi"), ext, None)
+        .await;
+
+    let violation = result
+        .violation
+        .expect("a `groups:` membership inherits the bundle's authorization");
+    assert_eq!(violation.reason, "deny-gate fired");
+}
+
+/// A route naming the same bundle in both spellings joins it once. `apply_layer`
+/// appends steps, so counting the membership twice would run the bundle's steps
+/// twice.
+#[tokio::test]
+async fn a_bundle_named_in_both_spellings_stacks_once() {
+    const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
+plugins:
+  - name: count-gate
+    kind: count-gate
+    hooks: [cmf.tool_pre_invoke]
+groups:
+  pii:
+    authorization:
+      pre_invocation:
+        - "run(count-gate)"
+routes:
+  - tool: get_weather
+    groups: [pii]
+    meta:
+      tags: [pii]
+"#;
+    COUNT_GATE_CALLS.store(0, Ordering::SeqCst);
+    let mgr = build_manager_with_visitor(YAML).await;
+
+    let ext = Extensions {
+        meta: Some(Arc::new(meta_for_tool("get_weather"))),
+        ..Default::default()
+    };
+    let (result, _bg) = mgr
+        .invoke_named::<CmfHook>("cmf.tool_pre_invoke", cmf_payload("hi"), ext, None)
+        .await;
+
+    assert!(result.continue_processing, "count-gate allows");
+    assert_eq!(
+        COUNT_GATE_CALLS.load(Ordering::SeqCst),
+        1,
+        "one membership, one run of the bundle's step"
+    );
+}
+
+/// Two bundles stack in the order the document writes them: `meta.tags` first,
+/// in declaration order, then `groups:`. That is the order the authentication
+/// chain uses, and the order that makes `replace_inherited:` well defined at
+/// bundle scope, so the policy chain has to match it.
+#[tokio::test]
+async fn two_bundles_stack_in_document_order() {
+    const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
+plugins:
+  - name: order-a
+    kind: order-a
+    hooks: [cmf.tool_pre_invoke]
+  - name: order-b
+    kind: order-b
+    hooks: [cmf.tool_pre_invoke]
+groups:
+  from-groups:
+    authorization:
+      pre_invocation:
+        - "run(order-b)"
+  from-tags:
+    authorization:
+      pre_invocation:
+        - "run(order-a)"
+routes:
+  - tool: get_weather
+    groups: from-groups
+    meta:
+      tags: [from-tags]
+"#;
+    ORDER_LEDGER.lock().expect("ledger").clear();
+    let mgr = build_manager_with_visitor(YAML).await;
+
+    let ext = Extensions {
+        meta: Some(Arc::new(meta_for_tool("get_weather"))),
+        ..Default::default()
+    };
+    let (result, _bg) = mgr
+        .invoke_named::<CmfHook>("cmf.tool_pre_invoke", cmf_payload("hi"), ext, None)
+        .await;
+
+    assert!(result.continue_processing, "both gates allow");
+    assert_eq!(
+        *ORDER_LEDGER.lock().expect("ledger"),
+        vec!["order-a".to_owned(), "order-b".to_owned()],
+        "`meta.tags` stacks before `groups:`"
+    );
 }
 
 /// Scope routing: a scoped annotation overrides the unscoped default for

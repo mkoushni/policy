@@ -21,7 +21,7 @@
 //
 //   effective = global
 //   effective.apply_layer(default_layer_for(entity_type))
-//   for tag in route.meta.tags { effective.apply_layer(tag_layer(tag)) }
+//   for name in route_bundle_names(route) { effective.apply_layer(tag_layer(name)) }
 //   effective.apply_layer(route_policy_block)
 //
 // then construct one `AplRouteHandler` per phase (Pre, Post) and call
@@ -30,7 +30,10 @@
 // The `(entity_type, entity_name)` pairs come from
 // `praxis_policy_core::config::route_entity_identity`, the one place a
 // route maps to the names it is known by, so the key annotated here is
-// the key a request resolves to.
+// the key a request resolves to. The bundle names come from
+// `route_bundle_names` for the same reason: it is the one place a route maps to
+// the bundles it joins, so the policy chain and the authentication chain cannot
+// disagree about the membership or the order it stacks in.
 //
 // # A policy body replaces the route's plugin chain
 //
@@ -76,7 +79,9 @@ use praxis_policy_core::cmf::constants::{
     HOOK_CMF_PROMPT_PRE_INVOKE, HOOK_CMF_RESOURCE_POST_FETCH, HOOK_CMF_RESOURCE_PRE_FETCH,
     HOOK_CMF_TOOL_POST_INVOKE, HOOK_CMF_TOOL_PRE_INVOKE,
 };
-use praxis_policy_core::config::{PluginRouteRef, RouteEntry, route_entity_identity};
+use praxis_policy_core::config::{
+    PluginRouteRef, RouteEntry, route_bundle_names, route_entity_identity,
+};
 use praxis_policy_core::engine::PolicyEngine;
 use praxis_policy_core::http_hook::{HOOK_HTTP_REQUEST, HOOK_HTTP_RESPONSE};
 use praxis_policy_core::identity::HOOK_IDENTITY_RESOLVE;
@@ -531,12 +536,18 @@ impl AplConfigVisitor {
 
     /// Tally the plugins a layer's steps name, without a hook.
     ///
-    /// For `global:`, `global.defaults.<entity>:`, and a bundle: those layers
-    /// stack onto routes, and the hook pair a step runs under is fixed by the
-    /// route's entity family, so it is not known here. A config with no `routes:`
-    /// at all still reaches these plugins, since a `global:` policy governs every
-    /// request that resolves no route, which is why reachability cannot wait for
-    /// a route to record it.
+    /// One caller: `visit_global`. Its layer is the exception, because it is the
+    /// one scope that installs a handler of its own, the entity-less HTTP
+    /// catch-all, and so governs every request that resolves no route. A config
+    /// with no `routes:` at all still reaches those plugins, which is why this
+    /// cannot wait for a route.
+    ///
+    /// `global.defaults.<entity>:` and a bundle install nothing and match nothing:
+    /// they only stack onto routes, and `visit_route` records what the *effective*
+    /// route reaches, layers included. They used to record here too, which made
+    /// an orphan group or an unused entity default report its plugins as
+    /// reachable when no dispatch path existed. The hook pair is unknown here
+    /// either way, since it is fixed by the route's entity family.
     ///
     /// The reference set is [`crate::dispatch_plan::collect_plugin_names_by_half`]'s,
     /// merged: a layer has no hook to split the halves by, but it has to name
@@ -854,7 +865,10 @@ impl ConfigVisitor for AplConfigVisitor {
         // A default layer reaches only its own entity type, so a field stage
         // declared here for `http` is as unreadable as one on the route.
         reject_field_stages_without_fields(entity_type, &source, &compiled)?;
-        self.record_reached_layer_names(&compiled);
+        // No reachability tally here. This installs no handler and matches no
+        // request: it stacks onto routes, and `visit_route` records what the
+        // effective route reaches. Recording at compile time meant a default for
+        // an entity type no route declares reported its plugins as reachable.
         self.state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -877,7 +891,11 @@ impl ConfigVisitor for AplConfigVisitor {
         };
         let compiled = compile_policy_block_value(&source, &apl_block)
             .map_err(|e| -> VisitorError { Box::new(e) })?;
-        self.record_reached_layer_names(&compiled);
+        // No reachability tally here, for the reason in `visit_default`. A group
+        // installs no handler and matches no request on its own: a route has to
+        // carry its name. Recording at compile time meant an orphan group nothing
+        // joins reported its plugins as reachable, which is the fail-open the
+        // per-plugin check exists to close.
         self.state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -913,11 +931,14 @@ impl ConfigVisitor for AplConfigVisitor {
             return Ok(());
         };
         let scope = parsed.meta.as_ref().and_then(|m| m.scope.clone());
-        let tags: Vec<String> = parsed
-            .meta
-            .as_ref()
-            .map(|m| m.tags.clone())
-            .unwrap_or_default();
+        // Both membership spellings, in the order their layers stack. This read
+        // `parsed.meta.tags` alone, so a route joining a bundle through `groups:`
+        // inherited the bundle's `authentication:` (which praxis-policy-core
+        // resolves through the same ordered stream) and none of its
+        // `authorization:`. With the activation lists gone that was a fail-open
+        // rather than a metadata asymmetry: no layer contributed anything, so the
+        // route installed no handler and was governed by nothing.
+        let bundles: Vec<String> = route_bundle_names(parsed);
 
         // Snapshot the dispatch state once outside the per-entity loop.
         // `visit_plugins` populated the registry before any `visit_route`
@@ -960,8 +981,8 @@ impl ConfigVisitor for AplConfigVisitor {
             if let Some(layer) = state.default_layers.get(entity_type).cloned() {
                 effective.apply_layer(layer);
             }
-            for tag in &tags {
-                if let Some(layer) = state.tag_layers.get(tag).cloned() {
+            for bundle in &bundles {
+                if let Some(layer) = state.tag_layers.get(bundle).cloned() {
                     effective.apply_layer(layer);
                 }
             }

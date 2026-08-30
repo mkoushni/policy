@@ -11,6 +11,14 @@
 //! rewrote the fixture's four route bodies, so the phase spelling is a surface
 //! this crate has moved deliberately, and the CHANGELOG records the retirement.
 //!
+//! `priority:` is the second such surface. It is a policy-mode load error now,
+//! because policy dispatch never hands the registry more than one entry to
+//! order, so the fixture's seven declarations are gone. The fixture is the best
+//! evidence for that change rather than a casualty of it: its `audit-log` entry
+//! read `priority: 90  # fires AFTER policy / delegate so the record reflects
+//! the final decision`, which is exactly the ordering the key reads as promising
+//! and exactly what policy dispatch does not do.
+//!
 //! Everything else the fixture pins still holds. It exercises multi-source
 //! identity, token exchange, policy requirements, a decision point, argument
 //! redaction, PII scanning, audit emission, and session taint, so a change to

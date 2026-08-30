@@ -190,3 +190,42 @@ fn an_empty_require_is_rejected() {
 fn an_unclosed_require_is_rejected() {
     parse_rule("require(a", "test").expect_err("the paren must close");
 }
+
+// ---- the restriction is on the rule shape, not the operator -------------
+
+/// `require` nested inside a larger predicate is the negation it desugars to and
+/// nothing more, so it composes with the boolean operators and may allow.
+///
+/// The guard tested a text prefix, which made it asymmetric: `require(a) & b`
+/// was refused while `a & require(b)` was accepted, though the grammar documents
+/// both. The restriction is on a rule whose *whole* predicate is the call.
+#[test]
+fn require_inside_a_larger_predicate_may_allow() {
+    for src in [
+        "require(a) & b: allow",
+        "a & require(b): allow",
+        "require(a) | require(b): allow",
+        "require(a) & require(b) & c: allow",
+    ] {
+        parse_rule(src, "test").unwrap_or_else(|e| panic!("`{src}` is legal composition: {e}"));
+    }
+}
+
+/// And a rule whose whole predicate is the call still cannot allow, in every
+/// spelling of the call: with a comma list, with an operator inside, and with the
+/// whitespace the lexer tolerates between the name and its paren.
+#[test]
+fn a_whole_predicate_require_still_cannot_allow() {
+    for src in [
+        "require(a): allow",
+        "require(a, b): allow",
+        "require(a | b): allow",
+        "require (a): allow",
+    ] {
+        let e = parse_rule(src, "test").unwrap_err().to_string();
+        assert!(
+            e.contains("require(...)"),
+            "`{src}` must be refused naming the form: {e}"
+        );
+    }
+}

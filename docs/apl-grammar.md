@@ -268,6 +268,15 @@ A custom dialect is written `pdp(name):`, which is closest to the existing call
 syntax. The name cannot be verified at load, because resolvers register at
 runtime.
 
+The parens hold the dialect name, so there is no room left for a call signature.
+A custom resolver reads its arguments from the body map, the way `cedar:` does:
+
+```yaml
+- pdp(workload):
+    path: hr/deny
+    on_deny: [deny]
+```
+
 ### Step maps
 
 A step may be a YAML map instead of a string, for the forms that carry a body:
@@ -280,7 +289,16 @@ A step may be a YAML map instead of a string, for the forms that carry a body:
 | `pdp(name):` | a custom PDP dialect |
 | a dialect name | `cedar:`, `cel:`, `opa:`, `authzen:`, `nemo:` |
 
-The key set is closed. A misspelling such as `whens:` is an error naming the key.
+The key set is closed. A misspelling such as `whens:` is an error naming the key,
+and the message points at `pdp(whens):` in case a custom dialect was meant.
+
+The closure is on **map-bodied** keys. A key with a sequence body is the
+multi-effect shorthand (`- "predicate": [effects]`), so `whens: [deny]` stays a
+rule on an attribute named `whens`, and `whens: { on_deny: [...] }` is the error.
+
+A `)` ends a call signature: text after it (`opa(x) y:`) is an error rather than
+being dropped. One redundant trailing colon is tolerated, because a key quoted in
+YAML keeps the separator the parse already consumed (`- 'opa("p/q"):':`).
 
 ---
 

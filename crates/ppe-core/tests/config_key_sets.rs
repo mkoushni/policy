@@ -592,6 +592,73 @@ fn the_authentication_step_table_is_the_accept_set() {
     );
 }
 
+/// The object form of an `authentication:` block accepts two keys. It read both
+/// and validated neither, so `replace_inherted: true` loaded with the flag
+/// `false` and quietly changed which identity steps ran.
+#[test]
+fn the_authentication_table_is_the_accept_set() {
+    assert_eq!(
+        names(ConfigScope::Authentication),
+        vec!["steps", "replace_inherited"],
+        "an authentication block's accept set changed"
+    );
+}
+
+/// The typo that motivated closing the set, at route scope and above it. Each
+/// one changes the identity-layer result, and each used to load clean.
+#[test]
+fn a_misspelled_authentication_object_key_is_rejected() {
+    for (path, yaml) in [
+        (
+            "routes[]",
+            "routes:\n  - tool: get_weather\n    authentication:\n      replace_inherted:              true\n      steps: [jwt]\n",
+        ),
+        (
+            "global",
+            "global:\n  authentication:\n    replace_inherted: true\n    steps: [jwt]\n",
+        ),
+        (
+            "groups.hr",
+            "groups:\n  hr:\n    authentication:\n      replace_inherted: true\n      steps:              [jwt]\n",
+        ),
+    ] {
+        let err = praxis_policy_core::config::parse_config(yaml)
+            .expect_err("a misspelled authentication key must be rejected")
+            .to_string();
+        assert!(
+            err.contains("replace_inherted"),
+            "the error at {path} must name the key: {err}"
+        );
+        assert!(
+            err.contains("replace_inherited"),
+            "and the key it was meant to be, at {path}: {err}"
+        );
+    }
+}
+
+/// Both accepted shapes still load, and the flag still reads through.
+#[test]
+fn the_authentication_object_shapes_still_load() {
+    let additive = praxis_policy_core::config::parse_config(
+        "routes:\n  - tool: get_weather\n    authentication: [jwt]\n",
+    )
+    .expect("the list form is additive");
+    let replacing = praxis_policy_core::config::parse_config(
+        "routes:\n  - tool: get_weather\n    authentication:\n      replace_inherited:          true\n      steps: [jwt]\n",
+    )
+    .expect("the object form loads");
+    for (label, cfg, expected) in [("list", additive, false), ("object", replacing, true)] {
+        let identity = cfg.routes[0]
+            .authentication
+            .as_ref()
+            .expect("both forms declare authentication");
+        assert_eq!(
+            identity.replace_inherited, expected,
+            "{label} form's replace_inherited"
+        );
+    }
+}
+
 /// The five keys the runtime parsed and honored nowhere, each at the scope that
 /// recognized it, each naming what to write instead. Four were no-ops the engine
 /// warned about; `when:` was scored, so it changed which route won.

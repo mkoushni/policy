@@ -233,10 +233,14 @@ global:
     );
 }
 
-/// And the same for a bundle, which also stacks rather than matching on its own.
+/// A bundle is not the exception `global:` is, and asserting that it was blessed
+/// a fail-open. This declared a plugin, put `run(...)` in a group nothing joined,
+/// and passed: the tally ran when the layer compiled, so any compiled layer
+/// counted as executable. A group installs no handler and matches no request on
+/// its own, so with no route carrying its name the step cannot run.
 #[test]
-fn a_bundle_step_reaches_a_plugin_with_no_routes_declared() {
-    loads(
+fn an_orphan_bundle_reaches_nothing() {
+    let e = load_err(
         "
 plugins:
   - name: audit-log
@@ -247,6 +251,83 @@ groups:
     authorization:
       pre_invocation:
         - \"run(audit-log)\"
+routes:
+  - tool: get_weather
+    authorization:
+      pre_invocation:
+        - \"require(authenticated)\"
+",
+    );
+    assert!(e.contains("audit-log"), "the message must name it: {e}");
+}
+
+/// And the same group with one route joining it loads, in either membership
+/// spelling. This is the other half: the tally now comes from the effective
+/// route, so it has to see a layer the route actually inherits.
+#[test]
+fn a_bundle_a_route_joins_reaches_its_plugin() {
+    for membership in ["    meta:\n      tags: [hr]\n", "    groups: hr\n"] {
+        loads(&format!(
+            "
+plugins:
+  - name: audit-log
+    kind: builtin
+    hooks: [cmf.tool_pre_invoke]
+groups:
+  hr:
+    authorization:
+      pre_invocation:
+        - \"run(audit-log)\"
+routes:
+  - tool: get_weather
+{membership}"
+        ));
+    }
+}
+
+/// An entity default is the same shape as a bundle: it stacks, so a default for
+/// an entity type no route declares reaches nothing.
+#[test]
+fn an_entity_default_with_no_route_of_that_type_reaches_nothing() {
+    let e = load_err(
+        "
+plugins:
+  - name: audit-log
+    kind: builtin
+    hooks: [cmf.tool_pre_invoke]
+global:
+  defaults:
+    prompt:
+      authorization:
+        pre_invocation:
+          - \"run(audit-log)\"
+routes:
+  - tool: get_weather
+    authorization:
+      pre_invocation:
+        - \"require(authenticated)\"
+",
+    );
+    assert!(e.contains("audit-log"), "the message must name it: {e}");
+}
+
+/// With a route of that entity type, the default is reachable.
+#[test]
+fn an_entity_default_reaches_its_plugin_through_a_route_of_that_type() {
+    loads(
+        "
+plugins:
+  - name: audit-log
+    kind: builtin
+    hooks: [cmf.tool_pre_invoke]
+global:
+  defaults:
+    tool:
+      authorization:
+        pre_invocation:
+          - \"run(audit-log)\"
+routes:
+  - tool: get_weather
 ",
     );
 }
@@ -311,26 +392,33 @@ routes:
     }
 }
 
-/// The same step above route scope, where a route is not what carries it to a
-/// plugin. A layer's tally used a reference set that omitted delegation and
-/// elicitation, so each of these failed the load naming a plugin the layer
-/// reaches; a route under the layer hid it, which is why the two cases above
-/// passed while these did not.
+/// The same step above route scope, where the route's own block is not what
+/// carries it to a plugin. A layer's tally used a reference set that omitted
+/// delegation and elicitation, so each of these failed the load naming a plugin
+/// the layer reaches.
+///
+/// The bundle case carries a route joining `hr`, because a bundle is not
+/// executable on its own: a group nothing joins reaches nothing, which
+/// `an_orphan_bundle_reaches_nothing` is about. `global:` needs no route, since
+/// its catch-all handler governs every request that resolves none.
 #[test]
 fn a_plugin_reached_only_by_delegation_above_route_scope_passes() {
-    for section in [
-        "global:\n  authorization:\n    pre_invocation:",
-        "groups:\n  hr:\n    authorization:\n      pre_invocation:",
+    for (section, indent, routes) in [
+        (
+            "global:\n  authorization:\n    pre_invocation:",
+            "      ",
+            "",
+        ),
+        (
+            "groups:\n  hr:\n    authorization:\n      pre_invocation:",
+            "        ",
+            "routes:\n  - tool: get_compensation\n    groups: hr\n",
+        ),
     ] {
         for step in [
             "delegate(workday-oauth, target: workday-api)",
             "require_approval(workday-oauth, from: claim.manager, channel: 'ciba')",
         ] {
-            let indent = if section.starts_with("groups") {
-                "        "
-            } else {
-                "      "
-            };
             loads(&format!(
                 "
 plugins:
@@ -339,7 +427,7 @@ plugins:
     hooks: [cmf.tool_pre_invoke]
 {section}
 {indent}- \"{step}\"
-"
+{routes}"
             ));
         }
     }
@@ -511,4 +599,83 @@ plugins:
 ",
         )
         .expect("hook dispatch fires it at the hooks it declares");
+}
+
+// ---- an APL term needs a visitor that can consume it --------------------
+
+/// The other half of praxis-policy-core's refusal. Every APL term it rejects
+/// with no visitor has to keep loading with one, or the check has cost more than
+/// it closed.
+///
+/// The fault it closes: praxis-policy-core has no field for these bodies, so a
+/// visitor-less load committed the typed config and returned success having
+/// dropped them. A route declaring an unconditional `deny` loaded clean,
+/// installed no handler, and enforced nothing.
+#[test]
+fn every_apl_term_still_loads_with_the_visitor_registered() {
+    for yaml in [
+        "
+routes:
+  - tool: get_compensation
+    authorization:
+      pre_invocation:
+        - \"deny('always')\"
+",
+        "
+routes:
+  - tool: get_compensation
+    result:
+      ssn: redact
+    authorization:
+      pre_invocation:
+        - \"require(authenticated)\"
+",
+        "
+global:
+  authorization:
+    pre_invocation:
+      - \"require(authenticated)\"
+",
+        "
+groups:
+  hr:
+    authorization:
+      pre_invocation:
+        - \"require(authenticated)\"
+routes:
+  - tool: get_compensation
+    groups: hr
+",
+    ] {
+        let mgr = engine();
+        register_apl(&mgr, AplOptions::in_process());
+        mgr.load_config_yaml(yaml)
+            .unwrap_or_else(|e| panic!("this config must load with a visitor: {e}\n{yaml}"));
+    }
+}
+
+/// And the refusal itself, through the engine rather than the config function:
+/// no visitor registered, so the term is dropped and nothing enforces it.
+#[test]
+fn an_apl_term_fails_the_load_with_no_visitor_registered() {
+    let e = engine()
+        .load_config_yaml(
+            "
+routes:
+  - tool: get_compensation
+    authorization:
+      pre_invocation:
+        - \"deny('always')\"
+",
+        )
+        .expect_err("a policy nothing can compile must not load")
+        .to_string();
+    for needle in [
+        "authorization",
+        "routes[0]",
+        "dispatch: hooks",
+        "register_apl",
+    ] {
+        assert!(e.contains(needle), "the message must name `{needle}`: {e}");
+    }
 }

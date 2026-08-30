@@ -386,10 +386,11 @@ pub struct RouteEntry {
     ///
     /// **Pure sugar over tags.** Each named group is folded into the route's
     /// tag set at resolution, so `groups: [hr-tools]` and
-    /// `meta: { tags: [hr-tools] }` resolve identically. Tags remain the
+    /// `meta: { tags: [hr-tools] }` resolve identically, for the bundle's
+    /// `authentication:` and for its `authorization:` alike. Tags remain the
     /// substrate — they can also be injected by the host at runtime and carry
     /// metadata beyond membership; `groups:` just names the common "join this
-    /// bundle" case up front. See `route_static_tags`.
+    /// bundle" case up front. See `route_static_tags` and `route_bundle_names`.
     #[serde(default)]
     pub groups: Option<StringOrList>,
 
@@ -452,6 +453,17 @@ where
     let (replace_inherited, raw_steps): (bool, Vec<serde_yaml::Value>) = match raw {
         serde_yaml::Value::Sequence(items) => (false, items),
         serde_yaml::Value::Mapping(map) => {
+            // Before either value is read, so a document with both a typo and a
+            // bad `steps:` shape is told about the typo. Enforced here rather
+            // than from `parse_config`, the way the step map's own set is: this
+            // shape is only reachable through the deserializer.
+            let unknown = unknown_keys_in(ConfigScope::Authentication, &map, &[]);
+            if !unknown.is_empty() {
+                return Err(D::Error::custom(format!(
+                    "`authentication:` has {}",
+                    unknown_keys_message(ConfigScope::Authentication, &unknown)
+                )));
+            }
             let replace_inherited =
                 match map.get(serde_yaml::Value::String("replace_inherited".to_owned())) {
                     Some(v) => v.as_bool().ok_or_else(|| {
@@ -1252,6 +1264,17 @@ const AUTHENTICATION_STEP_KEYS: &[ConfigKey] = &[
     structural_key("config", KeyOwner::Core),
 ];
 
+/// The keys the object form of an `authentication:` block carries.
+///
+/// The object read `replace_inherited` and `steps` and validated nothing else,
+/// so `replace_inherted: true` loaded with the flag `false` and quietly changed
+/// which identity steps ran. The step map inside it already had a closed set;
+/// this closes the object that holds it.
+const AUTHENTICATION_KEYS: &[ConfigKey] = &[
+    structural_key("steps", KeyOwner::Core),
+    structural_key("replace_inherited", KeyOwner::Core),
+];
+
 /// A config scope: one mapping shape the loader reads, with one key table each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigScope {
@@ -1273,19 +1296,23 @@ pub enum ConfigScope {
     /// The top-level `engine_settings:` block.
     EngineSettings,
 
+    /// The object form of an `authentication:` block, at any scope.
+    Authentication,
+
     /// One map-form step of an `authentication:` block, at any scope.
     AuthenticationStep,
 }
 
 impl ConfigScope {
     /// Every scope, for a walk over the whole key model.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Document,
         Self::Global,
         Self::EntityDefault,
         Self::Group,
         Self::Route,
         Self::EngineSettings,
+        Self::Authentication,
         Self::AuthenticationStep,
     ];
 
@@ -1299,6 +1326,7 @@ impl ConfigScope {
             Self::Group => "groups.<name>",
             Self::Route => "routes[]",
             Self::EngineSettings => "engine_settings",
+            Self::Authentication => "an authentication block",
             Self::AuthenticationStep => "an authentication step",
         }
     }
@@ -1331,6 +1359,7 @@ impl ConfigScope {
                 &[],
             ),
             Self::EngineSettings => (ENGINE_SETTINGS_KEYS, &[], &[], &[]),
+            Self::Authentication => (AUTHENTICATION_KEYS, &[], &[], &[]),
             Self::AuthenticationStep => (AUTHENTICATION_STEP_KEYS, &[], &[], &[]),
         };
         structural.iter().chain(terms).chain(fields).chain(wiring)
@@ -1568,6 +1597,105 @@ pub(crate) fn reject_unknown_section_keys(
     Ok(())
 }
 
+/// Reject the keys only an APL visitor reads, when no visitor is registered to
+/// read them.
+///
+/// These keys are in the accept tables because a route shares its mapping with
+/// the orchestrator's blocks, and their *bodies* live only in the raw YAML: the
+/// typed [`PolicyConfig`] has no field for `authorization:`, `args:`, `result:`,
+/// `response:`, or the `global:` wiring. With a visitor registered that is the
+/// division of labour working. With none, the load committed the typed config and
+/// returned success having dropped every one of them, so a document declaring
+/// `authorization: [run(audit)]`, or an unconditional `deny`, loaded clean,
+/// installed no handler, and enforced nothing.
+///
+/// [`reject_policy_mode_with_nothing_to_dispatch`] does not cover this. It passes
+/// as soon as the document declares any route, group, default, or global
+/// authentication block, which the document in question does.
+///
+/// The predicate is [`KeyOwner::Apl`] rather than a hand-written list, so a key
+/// added to the tables later cannot slip past: owning the key and reading it are
+/// the same claim.
+///
+/// # Errors
+///
+/// Returns `PluginError::Config` naming the first section carrying such a key,
+/// the keys, and the two ways out.
+pub(crate) fn reject_apl_keys_without_a_visitor(
+    raw: &serde_yaml::Value,
+) -> Result<(), Box<PluginError>> {
+    fn apl_keys_in(scope: ConfigScope, map: &serde_yaml::Mapping) -> Vec<&str> {
+        map.keys()
+            .filter_map(serde_yaml::Value::as_str)
+            .filter(|name| {
+                scope
+                    .keys()
+                    .any(|key| key.name == *name && key.owner == KeyOwner::Apl)
+            })
+            .collect()
+    }
+
+    fn check(
+        path: &str,
+        scope: ConfigScope,
+        yaml: &serde_yaml::Value,
+    ) -> Result<(), Box<PluginError>> {
+        let Some(map) = yaml.as_mapping() else {
+            return Ok(()); // Shape is the typed parse's to report.
+        };
+        let found = apl_keys_in(scope, map);
+        if found.is_empty() {
+            return Ok(());
+        }
+        let label = if found.len() == 1 { "key" } else { "keys" };
+        Err(Box::new(PluginError::Config {
+            message: format!(
+                "`{path}` declares the {label} `{}`, which only an APL config visitor reads, and \
+                 no visitor is registered. praxis-policy-core has no field for the body, so this \
+                 load would drop it and enforce nothing. Register the APL runtime's visitor \
+                 (`praxis_policy_apl_runtime::register_apl`) before loading, or write \
+                 `engine_settings.dispatch: hooks` and fire each plugin at the hooks its own \
+                 `hooks:` declares",
+                found.join("`, `")
+            ),
+        }))
+    }
+
+    fn check_bundles(
+        prefix: &str,
+        scope: ConfigScope,
+        bundles: Option<&serde_yaml::Value>,
+    ) -> Result<(), Box<PluginError>> {
+        let Some(map) = bundles.and_then(serde_yaml::Value::as_mapping) else {
+            return Ok(());
+        };
+        for (name, bundle) in map {
+            check(
+                &format!("{prefix}.{}", name.as_str().unwrap_or("?")),
+                scope,
+                bundle,
+            )?;
+        }
+        Ok(())
+    }
+
+    if let Some(global) = raw.get("global") {
+        check("global", ConfigScope::Global, global)?;
+        check_bundles(
+            "global.defaults",
+            ConfigScope::EntityDefault,
+            global.get("defaults"),
+        )?;
+    }
+    check_bundles("groups", ConfigScope::Group, raw.get("groups"))?;
+    if let Some(routes) = raw.get("routes").and_then(serde_yaml::Value::as_sequence) {
+        for (i, route) in routes.iter().enumerate() {
+            check(&format!("routes[{i}]"), ConfigScope::Route, route)?;
+        }
+    }
+    Ok(())
+}
+
 /// Levenshtein distance, for suggesting the name an operator meant.
 /// Two rows rather than the full matrix; the strings are hook names, so
 /// both stay short.
@@ -1631,7 +1759,7 @@ pub(crate) fn reject_mode_conflicts(raw: &serde_yaml::Value) -> Result<(), Box<P
         DispatchMode::Hooks => reject_policy_keys_in_hook_mode(raw),
         DispatchMode::Policy => {
             reject_activation_lists_in_policy_mode(raw)?;
-            reject_plugin_conditions_in_policy_mode(raw)
+            reject_plugin_dispatch_keys_in_policy_mode(raw)
         },
     }
 }
@@ -1713,34 +1841,60 @@ fn reject_activation_lists_in_policy_mode(raw: &serde_yaml::Value) -> Result<(),
     )
 }
 
-/// Reject a per-plugin `conditions:` under `dispatch: policy`, where a policy
-/// decides dispatch and nothing consults the condition.
+/// Reject the two per-plugin dispatch keys under `dispatch: policy`, where a
+/// policy decides dispatch and neither is consulted.
 ///
-/// `priority:` is deliberately not rejected beside it: the registry orders every
-/// hook's entries by trusted priority in both modes, so a policy-mode config's
-/// `priority:` still decides what runs first.
-fn reject_plugin_conditions_in_policy_mode(
+/// `conditions:` narrows which requests a plugin fires for, and a policy already
+/// decided that by naming the plugin in a step.
+///
+/// `priority:` orders the entries the registry holds for one hook, and policy
+/// dispatch never hands it more than one. Effects run in document order
+/// (`praxis-policy-apl-core`'s `evaluate_effects`), a `run(name)` step invokes the
+/// single entry that name resolves to, and the runtime passes the executor a
+/// one-entry slice, so there is no pair of policy-selected plugins left to order.
+/// Identity resolution is declaration order too and reads no priority. This used
+/// to be accepted on the claim that the registry still ordered by it, which is
+/// true of the registry and not of anything policy dispatch asks the registry
+/// for: the key was inert, which is the ambiguity this work exists to remove.
+///
+/// Only a *declared* key is rejected, which is why this reads the raw YAML. The
+/// typed model defaults `priority`, so a host that set the default cannot be
+/// told apart from one that set nothing; see [`reject_mode_conflicts_typed`].
+fn reject_plugin_dispatch_keys_in_policy_mode(
     raw: &serde_yaml::Value,
 ) -> Result<(), Box<PluginError>> {
     let Some(plugins) = raw.get("plugins").and_then(serde_yaml::Value::as_sequence) else {
         return Ok(());
     };
     for plugin in plugins {
-        if plugin.get("conditions").is_none() {
-            continue;
-        }
         let name = plugin
             .get("name")
             .and_then(serde_yaml::Value::as_str)
             .unwrap_or("?");
-        return Err(Box::new(PluginError::Config {
-            message: format!(
-                "plugin '{name}' declares `conditions:`, which `engine_settings.dispatch: policy` \
-                 does not accept; a policy decides dispatch there, so the condition is never \
-                 consulted. Narrow the policy that names the plugin, or write \
-                 `engine_settings.dispatch: hooks` to keep the condition"
-            ),
-        }));
+        if plugin.get("conditions").is_some() {
+            return Err(Box::new(PluginError::Config {
+                message: format!(
+                    "plugin '{name}' declares `conditions:`, which \
+                     `engine_settings.dispatch: policy` does not accept; a policy decides \
+                     dispatch there, so the condition is never consulted. Narrow the policy that \
+                     names the plugin, or write `engine_settings.dispatch: hooks` to keep the \
+                     condition"
+                ),
+            }));
+        }
+        if plugin.get("priority").is_some() {
+            return Err(Box::new(PluginError::Config {
+                message: format!(
+                    "plugin '{name}' declares `priority:`, which \
+                     `engine_settings.dispatch: policy` does not accept; it orders the entries \
+                     one hook holds, and policy dispatch never runs more than one at a time. \
+                     Effects run in the order the document writes them, and a `run(name)` step \
+                     invokes the one plugin it names, so the priority is never consulted. Order \
+                     the steps under `authorization:` instead, or write \
+                     `engine_settings.dispatch: hooks` to order by priority"
+                ),
+            }));
+        }
     }
     Ok(())
 }
@@ -1760,8 +1914,14 @@ fn reject_plugin_conditions_in_policy_mode(
 /// and reaches the plugin — the chain-wide replacement for an activation list.
 /// A visitor also reports the same fault better: per plugin, and for configs
 /// this cannot see, such as one declaring routes that still name nothing.
-/// Without a visitor no other check runs at all, and a policy-mode config is
-/// then inert in a way nothing would say out loud.
+///
+/// It is no longer the only visitor-less check, and it never covered the worst
+/// case: it passes as soon as the document declares any route, group, default, or
+/// global authentication block, so a route carrying `authorization:` satisfied it
+/// while its policy went nowhere.
+/// [`reject_apl_keys_without_a_visitor`] is what closes that. This one still
+/// earns its place for the document that declares plugins and no scope at all,
+/// where there is no APL key to find.
 ///
 /// # Errors
 ///
@@ -1790,6 +1950,123 @@ pub(crate) fn reject_policy_mode_with_nothing_to_dispatch(
              `authorization:` block, or `engine_settings.dispatch: hooks` to fire each plugin \
              at the hooks its own `hooks:` declares",
             names.join("`, `")
+        ),
+    }))
+}
+
+/// Reject what the declared dispatch mode does not accept, on the typed model.
+///
+/// The mode-conflict checks ran on raw YAML alone, so the public
+/// [`crate::engine::PolicyEngine::load_config`] and
+/// [`crate::engine::PolicyEngine::from_config`] accepted all three of the shapes
+/// the YAML boundary refuses. A policy-mode activation list was the worst of
+/// them: [`resolve_plugins_for_entity`] returns nothing in that mode, so the
+/// list loaded and sat inert.
+///
+/// The raw checks stay. They name YAML paths (`routes[0]`,
+/// `global.defaults.tool`) that a typed model cannot reconstruct, and a document
+/// deserves the better message; this is the backstop for the host that never had
+/// YAML. Both run from one place per boundary, so neither can drift ahead.
+///
+/// `priority:` has no check here, and cannot: the field is
+/// `#[serde(default = "default_priority")]`, so a host that set the default is
+/// indistinguishable from one that set nothing, and refusing the default value
+/// would refuse every `PluginConfig` a caller builds. The raw check catches a
+/// *declared* `priority:`, which is the unambiguous half.
+///
+/// # Errors
+///
+/// Returns `PluginError::Config` naming the offending shape and the mode that
+/// rejects it.
+pub(crate) fn reject_mode_conflicts_typed(config: &PolicyConfig) -> Result<(), Box<PluginError>> {
+    if config.dispatch_mode().is_policy() {
+        reject_typed_activation_lists(config)?;
+        return reject_typed_plugin_conditions(config);
+    }
+    reject_typed_policy_scopes(config)
+}
+
+/// A non-empty activation list under `dispatch: policy`, at either scope that
+/// carries one.
+///
+/// A non-empty `Vec` is unambiguously a host-built list: the override *mapping*
+/// deserializes to an empty one (see [`deserialize_plugin_refs`]), so YAML cannot
+/// produce a non-empty `Vec` that the raw check did not already refuse.
+fn reject_typed_activation_lists(config: &PolicyConfig) -> Result<(), Box<PluginError>> {
+    let route_lists = config
+        .routes
+        .iter()
+        .enumerate()
+        .filter(|(_, route)| !route.plugins.is_empty())
+        .map(|(i, _)| format!("routes[{i}]"));
+    let bundle_lists = config
+        .global
+        .bundles
+        .iter()
+        .filter(|(_, bundle)| !bundle.plugins.is_empty())
+        .map(|(name, _)| format!("groups.{name}"));
+    let default_lists = config
+        .global
+        .defaults
+        .iter()
+        .filter(|(_, entry)| !entry.plugins.is_empty())
+        .map(|(entity, _)| format!("global.defaults.{entity}"));
+    let Some(path) = route_lists.chain(bundle_lists).chain(default_lists).next() else {
+        return Ok(());
+    };
+    Err(Box::new(PluginError::Config {
+        message: format!(
+            "`{path}` carries a `plugins:` activation list, which \
+             `engine_settings.dispatch: policy` does not accept; a policy invokes a plugin with a \
+             `run(name)` step under `authorization:`, and a step under `global.authorization:` \
+             reaches every route. The list is inert in that mode, so accepting it would enforce \
+             nothing. A `plugins:` mapping stays valid, overriding `config`, `capabilities`, and \
+             `on_error` for a plugin a step names"
+        ),
+    }))
+}
+
+/// A per-plugin `conditions:` under `dispatch: policy`, where a policy decides
+/// dispatch and nothing consults the condition.
+fn reject_typed_plugin_conditions(config: &PolicyConfig) -> Result<(), Box<PluginError>> {
+    let Some(plugin) = config.plugins.iter().find(|p| !p.conditions.is_empty()) else {
+        return Ok(());
+    };
+    Err(Box::new(PluginError::Config {
+        message: format!(
+            "plugin '{}' carries `conditions:`, which `engine_settings.dispatch: policy` does not \
+             accept; a policy decides dispatch there, so the condition is never consulted. Narrow \
+             the policy that names the plugin, or write `engine_settings.dispatch: hooks` to keep \
+             the condition",
+            plugin.name
+        ),
+    }))
+}
+
+/// The policy-mode scopes under `dispatch: hooks`, which resolves none of them.
+fn reject_typed_policy_scopes(config: &PolicyConfig) -> Result<(), Box<PluginError>> {
+    let found: Vec<&str> = [
+        (!config.routes.is_empty(), "routes"),
+        (!config.global.bundles.is_empty(), "groups"),
+        (!config.global.defaults.is_empty(), "global.defaults"),
+        (
+            config.global.authentication.is_some(),
+            "global.authentication",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(present, name)| present.then_some(name))
+    .collect();
+    if found.is_empty() {
+        return Ok(());
+    }
+    let label = if found.len() == 1 { "scope" } else { "scopes" };
+    Err(Box::new(PluginError::Config {
+        message: format!(
+            "`engine_settings.dispatch: hooks` does not accept the {label} `{}`, which only \
+             `dispatch: policy` resolves; under `hooks` a plugin fires at the hooks its own \
+             `hooks:` declares, narrowed by its own `conditions:`",
+            found.join("`, `")
         ),
     }))
 }
@@ -1877,10 +2154,12 @@ fn reject_reserved_route_names(config: &PolicyConfig) -> Result<(), Box<PluginEr
 
 /// Validate a parsed config for structural correctness.
 ///
-/// This checks declared hook names plus the *structural* plugin activation
-/// lists (`route.plugins` / `policy_group.plugins` sequences), which no document
-/// can fill any more — `reject_mode_conflicts` refuses the shape, so the walk
-/// guards a host that built its [`PolicyConfig`] in Rust. It deliberately
+/// This checks declared hook names plus the *references* in the structural plugin
+/// activation lists (`route.plugins` / `policy_group.plugins` sequences): a name
+/// no declaration matches is a load error here in either mode. Whether a
+/// non-empty list is *allowed* is [`reject_mode_conflicts_typed`]'s question, not
+/// this one; this walk used to claim it guarded a host-built list and only ever
+/// checked that the names existed. It deliberately
 /// does NOT validate APL plugin references, neither `run(...)` policy steps
 /// nor the APL per-plugin override *map* (which
 /// [`deserialize_plugin_refs`] folds into an empty structural `Vec`, leaving
@@ -2252,11 +2531,18 @@ fn score_http_match(selector: &HttpSelector, path: &str, method: Option<&str>) -
 /// bundle names, so tags stay the single substrate (runtime-injectable and
 /// metadata-bearing).
 ///
-/// One reader is left, [`authentication_layers`]. The other went with the
-/// activation lists, and the orchestrator that layers a bundle's
-/// `authorization:` reads `meta.tags` directly, so a route joining a bundle
-/// through `groups:` inherits its authentication steps but not its policy. That
-/// gap predates this and is not closed here.
+/// Both chains read this, which is the point. [`authentication_layers`] always
+/// did; the orchestrator that layers a bundle's `authorization:` read
+/// `meta.tags` directly, so a route joining a bundle through `groups:` inherited
+/// its authentication steps and not its policy. With the activation lists gone,
+/// authorization layering is most of what a bundle is for, so that was a
+/// fail-open and not a metadata asymmetry: the route installed no handler at all.
+/// [`route_bundle_names`] is how the orchestrator reads it.
+///
+/// Order is load-bearing beyond deduplication. `meta.tags` in declaration order
+/// followed by `groups:` in declaration order is what makes `replace_inherited:`
+/// well defined at bundle scope, and the policy layers have to stack in the same
+/// order the authentication layers do.
 fn route_static_tags(route: &RouteEntry) -> impl Iterator<Item = &str> {
     let meta_tags = route
         .meta
@@ -2264,6 +2550,27 @@ fn route_static_tags(route: &RouteEntry) -> impl Iterator<Item = &str> {
         .flat_map(|m| m.tags.iter().map(String::as_str));
     let group_tags = route.groups.iter().flat_map(StringOrList::as_names);
     meta_tags.chain(group_tags)
+}
+
+/// The bundle names a route joins, in the order their layers stack: `meta.tags`
+/// first, in declaration order, then `groups:`.
+///
+/// The orchestrator's read of `route_static_tags`, so the policy chain and the
+/// authentication chain cannot disagree about which bundles a route is in. It
+/// used to read `meta.tags` alone, which left `groups:` inheriting authentication
+/// and not authorization. Both readers are private, so neither is linked here.
+///
+/// Deduplicated, first-seen wins. A name written in both spellings is one
+/// membership: stacking its layer twice would run the bundle's steps twice.
+///
+/// Static tags only. A tag the host injected at runtime contributes no bundle
+/// here, the same way it contributes none of a bundle's `authentication:` steps.
+pub fn route_bundle_names(route: &RouteEntry) -> Vec<String> {
+    let mut seen = HashSet::new();
+    route_static_tags(route)
+        .filter(|name| seen.insert(*name))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The entity type a route selects on and the names it contributes, or `None`
@@ -2862,7 +3169,6 @@ plugins:
     kind: builtin
     hooks: [cmf.tool_pre_invoke]
     mode: sequential
-    priority: 5
     config:
       max_requests: 100
 "#;
@@ -3674,12 +3980,220 @@ plugins:
         assert!(message.contains("pii-scan"), "{message}");
     }
 
-    /// `priority:` is not rejected beside `conditions:`. The registry sorts
-    /// every hook's entries by it in both modes, so a policy-mode config's
-    /// priority still decides what runs first.
+    /// A `PolicyConfig` a host built in Rust, with nothing normalized. The typed
+    /// boundary is what these cases exercise: `parse_config` would refuse the
+    /// same documents earlier, on the raw YAML, which is exactly why the typed
+    /// checks were missing for so long.
+    fn typed_config(yaml: &str) -> PolicyConfig {
+        let mut config: PolicyConfig = serde_yaml::from_str(yaml).expect("deserialize");
+        fold_groups_into_bundles(&mut config);
+        config
+    }
+
+    /// The worst of the three: `resolve_plugins_for_entity` returns nothing in
+    /// policy mode, so an activation list that reached the typed boundary loaded
+    /// and then sat inert. Every scope that can carry one.
     #[test]
-    fn a_plugin_priority_loads_in_policy_mode() {
-        let config = parse_config(
+    fn a_typed_activation_list_is_rejected_in_policy_mode() {
+        for (path, yaml) in [
+            ("routes[0]", "routes:\n  - tool: t\n    plugins: [audit]\n"),
+            ("groups.hr", "groups:\n  hr:\n    plugins: [audit]\n"),
+            (
+                "global.defaults.tool",
+                "global:\n  defaults:\n    tool:\n      plugins: [audit]\n",
+            ),
+        ] {
+            let mut config = typed_config(yaml);
+            // The override mapping deserializes to an empty Vec, so a non-empty
+            // one only ever comes from a host. Set it by hand to be that host.
+            let refs = vec![PluginRouteRef::Name("audit".to_owned())];
+            match path {
+                "routes[0]" => config.routes[0].plugins = refs,
+                "groups.hr" => {
+                    config.global.bundles.get_mut("hr").expect("bundle").plugins = refs;
+                },
+                _ => {
+                    config
+                        .global
+                        .defaults
+                        .get_mut("tool")
+                        .expect("default")
+                        .plugins = refs;
+                },
+            }
+            let message = reject_mode_conflicts_typed(&config)
+                .expect_err("an activation list is inert in policy mode")
+                .to_string();
+            assert!(message.contains(path), "must name the scope: {message}");
+            assert!(message.contains("run(name)"), "{message}");
+            assert!(message.contains("dispatch: policy"), "{message}");
+        }
+    }
+
+    /// Hook mode has no activation-list scope left to carry one, since `routes:`
+    /// and `groups:` are its own load errors. What it does instead is resolve
+    /// every declared plugin, so the check must not stand in the way of that.
+    #[test]
+    fn hook_mode_still_resolves_every_declared_plugin() {
+        let config = typed_config(
+            "engine_settings:\n  dispatch: hooks\nplugins:\n  - name: audit\n    kind:              builtin\n    hooks: [cmf.tool_pre_invoke]\n",
+        );
+        reject_mode_conflicts_typed(&config).expect("a bare hook-mode config is what hooks is for");
+        assert_eq!(resolve_plugins_for_entity(&config).len(), 1);
+    }
+
+    /// The typed twin of `a_plugin_condition_is_rejected_in_policy_mode`.
+    #[test]
+    fn a_typed_plugin_condition_is_rejected_in_policy_mode() {
+        let config = typed_config(
+            "plugins:\n  - name: pii-scan\n    kind: builtin\n    hooks:              [cmf.tool_pre_invoke]\n    conditions:\n      - tools: [get_compensation]\n",
+        );
+        let message = reject_mode_conflicts_typed(&config)
+            .expect_err("a condition is never consulted in policy mode")
+            .to_string();
+        assert!(message.contains("`conditions:`"), "{message}");
+        assert!(message.contains("pii-scan"), "{message}");
+    }
+
+    /// And the hook-mode half: the policy-mode scopes resolve nothing there.
+    #[test]
+    fn a_typed_policy_scope_is_rejected_in_hook_mode() {
+        let hooks = "engine_settings:\n  dispatch: hooks\n";
+        for (scope, yaml) in [
+            ("routes", "routes:\n  - tool: t\n"),
+            ("groups", "groups:\n  hr:\n    description: x\n"),
+            (
+                "global.defaults",
+                "global:\n  defaults:\n    tool:\n      description: x\n",
+            ),
+            (
+                "global.authentication",
+                "global:\n  authentication: [jwt]\n",
+            ),
+        ] {
+            let config = typed_config(&format!("{hooks}{yaml}"));
+            let message = reject_mode_conflicts_typed(&config)
+                .expect_err("hook mode resolves no policy scope")
+                .to_string();
+            assert!(message.contains(scope), "must name the scope: {message}");
+            assert!(message.contains("dispatch: hooks"), "{message}");
+        }
+    }
+
+    /// The shape that shares the key and must not be caught: a `plugins:` mapping
+    /// is an override for a plugin a step names, and it deserializes to an empty
+    /// structural `Vec`.
+    #[test]
+    fn a_typed_plugin_override_mapping_still_loads_in_policy_mode() {
+        let config = typed_config(
+            r#"
+plugins:
+  - name: audit
+    kind: builtin
+    hooks: [cmf.tool_pre_invoke]
+routes:
+  - tool: t
+    plugins:
+      audit:
+        on_error: ignore
+"#,
+        );
+        assert!(
+            config.routes[0].plugins.is_empty(),
+            "the mapping folds into an empty structural Vec"
+        );
+        reject_mode_conflicts_typed(&config)
+            .expect("an override mapping is not an activation list");
+    }
+
+    /// Every section that can carry an APL key, refused when no visitor can read
+    /// it. The check is on the raw document, so it is exercised here rather than
+    /// through an engine.
+    ///
+    /// The document that motivated it is the first case: a route declaring an
+    /// unconditional `deny`, which used to load clean, install no handler, and
+    /// enforce nothing.
+    #[test]
+    fn an_apl_key_is_rejected_when_no_visitor_can_read_it() {
+        for (path, key, yaml) in [
+            (
+                "routes[0]",
+                "authorization",
+                "routes:\n  - tool: t\n    authorization:\n      pre_invocation:\n        - \
+                 \"deny('always')\"\n",
+            ),
+            (
+                "routes[0]",
+                "result",
+                "routes:\n  - tool: t\n    result:\n      ssn: redact\n",
+            ),
+            (
+                "routes[0]",
+                "args",
+                "routes:\n  - tool: t\n    args:\n      id: str\n",
+            ),
+            (
+                "routes[0]",
+                "response",
+                "routes:\n  - tool: t\n    response:\n      status: 403\n",
+            ),
+            (
+                "global",
+                "authorization",
+                "global:\n  authorization:\n    pre_invocation: [\"deny\"]\n",
+            ),
+            ("global", "pdp", "global:\n  pdp:\n    - kind: cel\n"),
+            (
+                "groups.hr",
+                "authorization",
+                "groups:\n  hr:\n    authorization:\n      pre_invocation: [\"deny\"]\n",
+            ),
+            (
+                "global.defaults.tool",
+                "authorization",
+                "global:\n  defaults:\n    tool:\n      authorization:\n        pre_invocation: \
+                 [\"deny\"]\n",
+            ),
+        ] {
+            let raw: serde_yaml::Value = serde_yaml::from_str(yaml).expect("probe YAML parses");
+            let message = reject_apl_keys_without_a_visitor(&raw)
+                .expect_err("an APL key with no visitor enforces nothing")
+                .to_string();
+            assert!(message.contains(path), "must name the section: {message}");
+            assert!(message.contains(key), "must name the key: {message}");
+            assert!(message.contains("dispatch: hooks"), "{message}");
+            assert!(message.contains("register_apl"), "{message}");
+        }
+    }
+
+    /// A document with no APL key is unaffected, whatever else it declares. The
+    /// check is about a body praxis-policy-core cannot read, not about policy
+    /// mode.
+    #[test]
+    fn a_document_with_no_apl_key_needs_no_visitor() {
+        for yaml in [
+            "routes:\n  - tool: t\n    meta:\n      tags: [hr]\n",
+            "routes:\n  - tool: t\n    authentication: [jwt]\n",
+            "groups:\n  hr:\n    description: x\n",
+            "global:\n  authentication: [jwt]\n",
+            "engine_settings:\n  dispatch: hooks\nplugins: []\n",
+        ] {
+            let raw: serde_yaml::Value = serde_yaml::from_str(yaml).expect("probe YAML parses");
+            reject_apl_keys_without_a_visitor(&raw)
+                .unwrap_or_else(|e| panic!("`{yaml}` carries no APL key: {e}"));
+        }
+    }
+
+    /// `priority:` is rejected beside `conditions:`, for the same reason: policy
+    /// dispatch never hands the registry more than one entry to order.
+    ///
+    /// This asserted the opposite, on the claim that the registry sorts by
+    /// priority in both modes. It does, and policy dispatch never asks it to:
+    /// effects run in document order, a `run(name)` step invokes one named entry,
+    /// and the runtime passes the executor a one-entry slice.
+    #[test]
+    fn a_plugin_priority_is_rejected_in_policy_mode() {
+        let message = parse_config(
             r#"
 engine_settings:
   dispatch: policy
@@ -3690,7 +4204,47 @@ plugins:
     priority: 20
 "#,
         )
-        .expect("policy mode consults priority, so it stays legal");
+        .expect_err("nothing consults a priority in policy mode")
+        .to_string();
+        assert!(message.contains("`priority:`"), "{message}");
+        assert!(message.contains("dispatch: policy"), "{message}");
+        assert!(message.contains("dispatch: hooks"), "{message}");
+        assert!(message.contains("pii-scan"), "{message}");
+    }
+
+    /// The default is policy, so a document that never mentions dispatch is
+    /// checked as policy mode. That is most of what the rejection reaches.
+    #[test]
+    fn a_plugin_priority_is_rejected_with_no_dispatch_declared() {
+        let message = parse_config(
+            r#"
+plugins:
+  - name: pii-scan
+    kind: builtin
+    hooks: [cmf.tool_pre_invoke]
+    priority: 20
+"#,
+        )
+        .expect_err("the absent key means policy")
+        .to_string();
+        assert!(message.contains("`priority:`"), "{message}");
+    }
+
+    /// And hook mode keeps it, which is the escape the message names.
+    #[test]
+    fn a_plugin_priority_loads_in_hook_mode() {
+        let config = parse_config(
+            r#"
+engine_settings:
+  dispatch: hooks
+plugins:
+  - name: pii-scan
+    kind: builtin
+    hooks: [cmf.tool_pre_invoke]
+    priority: 20
+"#,
+        )
+        .expect("hook mode orders a hook's entries by priority");
         assert_eq!(config.plugins[0].priority, 20);
     }
 

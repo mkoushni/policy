@@ -14,6 +14,7 @@ authorizaton = "authorizaton"
 confg = "confg"
 dispath = "dispath"
 gobal = "gobal"
+inherted = "inherted"
 invocaton = "invocaton"
 
 # Alternate spellings that are correct English. typos-cli prefers the other form;

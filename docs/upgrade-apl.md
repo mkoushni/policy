@@ -46,7 +46,10 @@ fires at every hook its own `hooks:` list names.
 The two modes now reject each other's keys by name, so a document is legal in one
 mode only. Under `dispatch: hooks`, `routes:`, `groups:`, `global:`, and
 `global.defaults:` are load errors. Under `dispatch: policy`, a per-plugin
-`conditions:` is a load error. `priority:` stays legal in both.
+`conditions:` and a per-plugin `priority:` are both load errors: a policy decides
+which plugin runs, and it never runs more than one at a time, so neither key is
+consulted. `priority:` stays legal under `dispatch: hooks`, which is where it
+orders a hook's entries. In policy mode, order the steps under `authorization:`.
 
 A stale top-level `plugin_settings:` fails the load naming `engine_settings`,
 rather than loading with its contents dropped.

@@ -824,6 +824,22 @@ pub fn parse_rule(line: &str, source: &str) -> Result<Rule, ParseError> {
         )
     };
 
+    // A field operation is not a rule. `result.x | redact` used to compile as a
+    // disjunction of two truthy attributes and take the default deny, so a
+    // pipeline written one position too high enforced something its author never
+    // asked for. Reported before the predicate parse, so the message names the
+    // position rather than a predicate that happened to lex.
+    if let Some(field) = field_operation_in_rule_position(predicate_str) {
+        return Err(ParseError::Rule {
+            rule: trimmed.to_owned(),
+            msg: format!(
+                "`{field}` is a field operation, and this is effect position: a rule here is a \
+                 predicate with an optional `allow`/`deny`. Move the chain under `args:` or \
+                 `result:`, keyed by the field it names"
+            ),
+        });
+    }
+
     if is_require_form(predicate_str) && effects.iter().any(|e| matches!(e, Effect::Allow)) {
         return Err(ParseError::Rule {
             rule: trimmed.to_owned(),
@@ -876,16 +892,51 @@ fn normalize_not(e: Expression) -> Expression {
     }
 }
 
-/// Whether a rule's predicate half is a `require(...)` call.
+/// Whether a rule's predicate half *is* a `require(...)` call, as opposed to
+/// containing one.
 ///
 /// Textual because the rule grammar is textual at this level: a rule is a
 /// predicate, a colon and an action, and this asks which of the two shapes the
 /// predicate is so the action can be checked against it. The predicate itself is
 /// parsed by `parse_predicate` like any other.
+///
+/// The call has to consume the whole predicate. A prefix test made the guard
+/// asymmetric: `require(a) & b: allow` was refused while `a & require(b): allow`
+/// was accepted, though the grammar documents both as legal composition and
+/// restricts only a rule whose *whole* predicate is the call. Do not simplify
+/// this back to `starts_with`.
 fn is_require_form(s: &str) -> bool {
-    let s = s.trim_start();
-    s.strip_prefix("require")
-        .is_some_and(|rest| rest.trim_start().starts_with('('))
+    let Some(rest) = s.trim().strip_prefix("require") else {
+        return false;
+    };
+    // The predicate lexer skips whitespace between the name and its `(`, so
+    // `require (a)` is the same shape and has to be caught with it.
+    let normalized = format!("require{}", rest.trim_start());
+    // `extract_call_args` reads the outermost matching parens and already refuses
+    // anything after the `)` it closed on, so asking it is the exact-form test.
+    extract_call_args(&normalized, "require").is_some()
+}
+
+/// The field path a rule line names, when the line is really a field operation.
+///
+/// Deliberately narrow. `result.x | result.y: deny` is a **legal** disjunction of
+/// two truthy attributes and has to keep compiling, so an `args.`/`result.` head
+/// is not enough on its own. What separates the two is whether any later segment
+/// is a stage rather than another attribute path, which [`parse_stage`] is the
+/// authority on: widen this by hand and the two answers drift.
+fn field_operation_in_rule_position(predicate: &str) -> Option<&str> {
+    let segments = split_top_level(predicate.trim(), b'|');
+    let (head, rest) = segments.split_first()?;
+    let head = head.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    if !(head.starts_with("args.") || head.starts_with("result.")) {
+        return None;
+    }
+    rest.iter()
+        .any(|seg| parse_stage(seg.trim()).is_ok())
+        .then_some(head)
 }
 
 fn detect_step_kind(s: &str) -> Option<&'static str> {
@@ -1674,30 +1725,13 @@ fn parse_step_map(m: &serde_yaml::Mapping, source: &str) -> Result<Step, ParseEr
         _ => {},
     }
 
-    // Split the key into "dialect" + optional "(args)" portion.
-    let (dialect_str, paren_args) = if let Some(open) = key.find('(') {
-        let close = key.rfind(')').ok_or_else(|| ParseError::Rule {
-            rule: key.to_owned(),
-            msg: "missing `)` in PDP call signature".into(),
-        })?;
-        // The argument is read as a literal, so a resolver receives the path the
-        // author wrote. This site stripped nothing, so `opa("hr/deny")` handed the
-        // resolver `"hr/deny"` with the quotes still on it.
-        let raw = key.get(open + 1..close).ok_or_else(|| ParseError::Rule {
-            rule: key.to_owned(),
-            msg: "malformed `()` in PDP call signature".into(),
-        })?;
-        let inside = literal_value(raw).map_err(|msg| ParseError::Rule {
-            rule: key.to_owned(),
-            msg,
-        })?;
-        let dialect = key.get(..open).unwrap_or(key).trim();
-        (dialect, Some(inside))
-    } else {
-        (key.trim(), None)
-    };
-
-    let dialect = PdpDialect::from_key(dialect_str);
+    // Everything left is a PDP call, and the key set is closed. This used to
+    // split at `(` and hand the prefix to `PdpDialect::from_key`, which made
+    // every unhandled key a custom dialect: `whens:` compiled to a PDP lookup
+    // instead of failing, and `pdp(workload):` resolved `pdp` rather than
+    // `workload`, so the resolver registered for `workload` could never be
+    // reached.
+    let (dialect, paren_args) = parse_pdp_key(key)?;
 
     // Extract args + on_deny/on_allow.
     // Cedar: body map carries args fields directly + on_deny/on_allow.
@@ -1727,7 +1761,101 @@ fn has_key(m: &serde_yaml::Mapping, key: &str) -> bool {
 /// reaction list as a predicate-with-effects map.
 fn is_known_pdp_dialect(key: &str) -> bool {
     let base = key.find('(').and_then(|i| key.get(..i)).unwrap_or(key);
-    matches!(base.trim(), "cedar" | "opa" | "authzen" | "nemo" | "cel")
+    let base = base.trim();
+    // `pdp` counts. A sequence body is not a valid PDP shape either way, but
+    // routing `pdp(x): [deny]` through the PDP path reports "body must be a map"
+    // rather than trying to read `pdp(x)` as a predicate.
+    base == PDP_CUSTOM_KEY || PdpDialect::from_builtin_key(base).is_some()
+}
+
+/// The key that names a custom dialect: `pdp(name):`.
+const PDP_CUSTOM_KEY: &str = "pdp";
+
+/// What a step map may be keyed on, for the error that names the closed set.
+const STEP_MAP_KEYS: &str = "`when:` with `do:`, `sequential:`, `parallel:`, \
+                            `delegate:`, `restrict:`, a built-in PDP dialect \
+                            (`cedar:`, `cel:`, `opa:`, `authzen:`, `nemo:`), or \
+                            `pdp(name):` for a custom dialect";
+
+/// The dialect a step-map key names, and the call signature it carries.
+///
+/// Three productions, and nothing else: `pdp(name)` names a custom dialect, a
+/// built-in dialect names itself either bare or with a call signature, and any
+/// other key is a misspelling.
+///
+/// `pdp(name)` carries no call signature, because the parens hold the dialect
+/// name. A custom resolver reads its arguments from the body map, the way
+/// `cedar:` does.
+fn parse_pdp_key(key: &str) -> Result<(PdpDialect, Option<String>), ParseError> {
+    let trimmed = key.trim();
+    // A key quoted in YAML keeps the separator the parse already consumed
+    // (`- 'opa("p/q"):':`), so one trailing colon is redundant rather than
+    // content. Tolerated here so the check below is about dropped text.
+    let trimmed = trimmed.strip_suffix(':').map_or(trimmed, str::trim_end);
+    let Some((name, inside)) = split_call_key(trimmed)? else {
+        return PdpDialect::from_builtin_key(trimmed)
+            .map(|d| (d, None))
+            .ok_or_else(|| unknown_step_map_key(trimmed));
+    };
+    if name == PDP_CUSTOM_KEY {
+        if inside.is_empty() {
+            return Err(ParseError::Rule {
+                rule: trimmed.to_owned(),
+                msg: "`pdp(name):` names the custom dialect to route to, so the name must not \
+                      be empty"
+                    .to_owned(),
+            });
+        }
+        return Ok((PdpDialect::Custom(inside), None));
+    }
+    PdpDialect::from_builtin_key(name)
+        .map(|d| (d, Some(inside)))
+        .ok_or_else(|| unknown_step_map_key(trimmed))
+}
+
+/// Split `name(literal)` into its two halves, or `None` when the key carries no
+/// call signature.
+///
+/// The closing paren has to terminate the key. Without that, trailing text after
+/// the `)` was read as part of neither half and silently dropped.
+fn split_call_key(key: &str) -> Result<Option<(&str, String)>, ParseError> {
+    let Some(open) = key.find('(') else {
+        return Ok(None);
+    };
+    let close = key.rfind(')').ok_or_else(|| ParseError::Rule {
+        rule: key.to_owned(),
+        msg: "missing `)` in PDP call signature".into(),
+    })?;
+    let after = key.get(close + 1..).unwrap_or("");
+    if close < open || !after.trim().is_empty() {
+        return Err(ParseError::Rule {
+            rule: key.to_owned(),
+            msg: "the `)` must end a PDP call signature, with nothing after it".into(),
+        });
+    }
+    // The argument is read as a literal, so a resolver receives the path the
+    // author wrote. This site stripped nothing, so `opa("hr/deny")` handed the
+    // resolver `"hr/deny"` with the quotes still on it.
+    let raw = key.get(open + 1..close).ok_or_else(|| ParseError::Rule {
+        rule: key.to_owned(),
+        msg: "malformed `()` in PDP call signature".into(),
+    })?;
+    let inside = literal_value(raw).map_err(|msg| ParseError::Rule {
+        rule: key.to_owned(),
+        msg,
+    })?;
+    Ok(Some((key.get(..open).unwrap_or(key).trim(), inside)))
+}
+
+/// A step-map key outside the closed set, named beside what is accepted.
+fn unknown_step_map_key(key: &str) -> ParseError {
+    ParseError::Rule {
+        rule: key.to_owned(),
+        msg: format!(
+            "`{key}:` is not a step-map key. Accepted: {STEP_MAP_KEYS}. A custom PDP dialect is \
+             written `pdp({key}):`, not `{key}:`"
+        ),
+    }
 }
 
 /// Parse the canonical `- when: X` `do: Y` rule form. `Y`
@@ -3000,6 +3128,31 @@ fn reject_empty_authorization(
 ///
 /// `authorization:` is the only place the two phase lists appear, and a block
 /// naming neither is refused rather than read as empty.
+/// Compile one declared `args:` / `result:` entry into its pipeline.
+///
+/// A declared entry with no stages is a load error, while the public
+/// [`parse_pipeline`] keeps answering an empty input with an empty pipeline. Two
+/// positions, two answers: that entry point takes a field value that may be
+/// absent, and absent is not malformed. Here the author named a field and then
+/// left its chain empty, which used to compile to a no-op `FieldRule`.
+fn compile_declared_pipeline(half: &str, field: &str, chain: &str) -> Result<Pipeline, ParseError> {
+    let pipeline = parse_pipeline(chain).map_err(|e| ParseError::Rule {
+        rule: format!("{half}.{field}: {chain:?}"),
+        msg: format!("{e}"),
+    })?;
+    if pipeline.stages.is_empty() {
+        return Err(ParseError::Rule {
+            rule: format!("{half}.{field}: {chain:?}"),
+            msg: format!(
+                "`{half}.{field}:` declares no stages. A field entry names an operation to run on \
+                 the field, so an empty chain is a no-op the author did not mean; remove the \
+                 entry or give it a stage"
+            ),
+        });
+    }
+    Ok(pipeline)
+}
+
 fn compile_apl_blocks(source: &str, raw: RouteYaml) -> Result<CompiledRoute, ParseError> {
     reject_empty_authorization(source, raw.authorization.as_ref())?;
     let mut route = CompiledRoute::new(source);
@@ -3020,27 +3173,18 @@ fn compile_apl_blocks(source: &str, raw: RouteYaml) -> Result<CompiledRoute, Par
         let step = parse_step(entry, &format!("{source}.post_invocation[{i}]"))?;
         route.post_invocation.push(step_to_top_level_effect(step)?);
     }
-    for (field, chain) in &raw.args {
-        let pipeline = parse_pipeline(chain).map_err(|e| ParseError::Rule {
-            rule: format!("args.{field}: {chain:?}"),
-            msg: format!("{e}"),
-        })?;
-        route.args.push(FieldRule {
-            field: field.clone(),
-            pipeline,
-            source: format!("{source}.args.{field}"),
-        });
-    }
-    for (field, chain) in &raw.result {
-        let pipeline = parse_pipeline(chain).map_err(|e| ParseError::Rule {
-            rule: format!("result.{field}: {chain:?}"),
-            msg: format!("{e}"),
-        })?;
-        route.result.push(FieldRule {
-            field: field.clone(),
-            pipeline,
-            source: format!("{source}.result.{field}"),
-        });
+    for (half, entries, out) in [
+        ("args", &raw.args, &mut route.args),
+        ("result", &raw.result, &mut route.result),
+    ] {
+        for (field, chain) in entries {
+            let pipeline = compile_declared_pipeline(half, field, chain)?;
+            out.push(FieldRule {
+                field: field.clone(),
+                pipeline,
+                source: format!("{source}.{half}.{field}"),
+            });
+        }
     }
     route.plugin_overrides = raw.plugins;
     Ok(route)
@@ -4787,13 +4931,18 @@ route:
         }
     }
 
+    /// A custom dialect is `pdp(name):`, and a bare unknown key is a misspelling.
+    ///
+    /// This asserted the opposite: a bare `my_engine:` became
+    /// `Custom("my_engine")`, which made every typo a PDP lookup and left
+    /// `pdp(my_engine):` resolving a dialect called `pdp`.
     #[test]
-    fn compile_pdp_unknown_dialect_becomes_custom() {
+    fn compile_pdp_custom_dialect_is_named_in_the_parens() {
         let yaml = r#"
 route:
   authorization:
     pre_invocation:
-      - my_engine:
+      - pdp(my_engine):
           on_deny: [deny]
 "#;
         let route = compile_test_route("custom_pdp", yaml).unwrap();
@@ -4803,6 +4952,18 @@ route:
             },
             other => panic!("expected Pdp, got {other:?}"),
         }
+
+        let bare = r#"
+route:
+  authorization:
+    pre_invocation:
+      - my_engine:
+          on_deny: [deny]
+"#;
+        let err = compile_test_route("custom_pdp", bare)
+            .expect_err("a bare unknown key is not a custom dialect")
+            .to_string();
+        assert!(err.contains("pdp(my_engine)"), "{err}");
     }
 
     #[tokio::test]

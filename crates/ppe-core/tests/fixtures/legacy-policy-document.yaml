@@ -24,7 +24,6 @@ plugins:
     kind: identity/jwt
     hooks: [identity.resolve]
     mode: sequential
-    priority: 10
     on_error: fail
     capabilities:
       # Fetching a JWKS is an outbound call, and PPE performs no HTTP of
@@ -51,7 +50,6 @@ plugins:
     kind: identity/jwt
     hooks: [identity.resolve]
     mode: sequential
-    priority: 20
     on_error: fail
     capabilities:
       # Fetching a JWKS is an outbound call, and PPE performs no HTTP of
@@ -83,7 +81,6 @@ plugins:
     kind: delegator/oauth
     hooks: [token.delegate]
     mode: sequential
-    priority: 30
     on_error: fail
     capabilities:
       # Fetching from an IdP is an outbound call, and PPE performs no
@@ -118,7 +115,6 @@ plugins:
     kind: validator/pii-scan
     hooks: [cmf.tool_pre_invoke]
     mode: sequential
-    priority: 25
     on_error: fail
     config:
       detect:
@@ -140,8 +136,6 @@ plugins:
       - cmf.prompt_pre_invoke
       - cmf.resource_pre_fetch
     mode: sequential
-    priority: 90    # fires AFTER policy / delegate so the record
-                    # reflects the final decision + minted tokens
     on_error: ignore  # observation failures don't halt traffic
     capabilities:
       - read_subject
@@ -164,7 +158,6 @@ plugins:
     kind: delegator/oauth
     hooks: [token.delegate]
     mode: sequential
-    priority: 31
     on_error: fail
     capabilities:
       # Fetching from an IdP is an outbound call, and PPE performs no
@@ -198,7 +191,6 @@ plugins:
     kind: elicitation/ciba
     hooks: [elicit]
     mode: sequential
-    priority: 40
     on_error: fail
     capabilities:
       # Fetching a JWKS is an outbound call, and PPE performs no HTTP of

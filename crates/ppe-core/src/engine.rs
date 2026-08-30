@@ -442,6 +442,11 @@ fn normalize_and_validate(
 ) -> Result<PolicyConfig, Box<PluginError>> {
     crate::config::fold_groups_into_bundles(&mut config);
     crate::config::validate_config(&config)?;
+    // After the fold, so the bundle walk sees top-level `groups:` in the store
+    // every resolver reads. All three load entry points share this function,
+    // which is what makes the typed and YAML boundaries agree by construction
+    // rather than by two check lists that can drift.
+    crate::config::reject_mode_conflicts_typed(&config)?;
     crate::config::reject_policy_mode_with_nothing_to_dispatch(&config, has_visitor)?;
     Ok(config)
 }
@@ -955,6 +960,13 @@ impl PolicyEngine {
         crate::config::reject_unknown_route_keys(&raw, &visitor_route_keys)?;
         crate::config::reject_unknown_section_keys(&raw, &visitor_route_keys)?;
         crate::config::reject_mode_conflicts(&raw)?;
+        // Before `load_config`, deliberately. A visitor error is documented as
+        // not rolled back, so a check that ran after the walk would leave the
+        // snapshot live on the very config it rejected. This one decides from
+        // the document alone and can run first.
+        if visitors.is_empty() {
+            crate::config::reject_apl_keys_without_a_visitor(&raw)?;
+        }
         // Visitors below read the normalized routes and plugin declarations, so
         // this runs here rather than being left to `load_config`. Both steps
         // are idempotent, so `load_config` repeating them is redundant work on
@@ -3504,12 +3516,10 @@ plugins:
     kind: test/drop_reentrant
     hooks: [test_hook]
     mode: sequential
-    priority: 10
   - name: never_reached
     kind: test/drop_reentrant
     hooks: [test_hook]
     mode: sequential
-    priority: 20
 ";
         let policy_config = parse_fixture_config(yaml).unwrap();
 
@@ -5393,9 +5403,14 @@ plugins:
     hooks: [test_hook]
 "#;
 
-    /// A route joining a top-level `groups:` bundle. Resolving the group
-    /// is what gives the route the group's plugins; skipping the merge
-    /// leaves the route with an unknown-group reference.
+    /// A route joining a top-level `groups:` bundle. Resolving the group is what
+    /// makes the membership valid; skipping the merge leaves the route joining a
+    /// group the bundle store does not hold.
+    ///
+    /// The bundle and the route used to carry `plugins: [allow_plugin]`
+    /// activation lists, which the typed boundary now refuses in policy mode the
+    /// way the YAML boundary always did. They were incidental: what this pins is
+    /// the fold, and the `groups:` membership is what depends on it.
     const GROUP_YAML: &str = r#"
 engine_settings:
   dispatch: policy
@@ -5405,11 +5420,10 @@ plugins:
     hooks: [test_hook]
 groups:
   privileged:
-    plugins: [allow_plugin]
+    description: needs the fold to be resolvable
 routes:
   - tool: secret_tool
     groups: [privileged]
-    plugins: [allow_plugin]
 "#;
 
     #[test]
@@ -5629,7 +5643,6 @@ plugins:
     kind: test/allow
     hooks: [test_hook]
     mode: sequential
-    priority: 10
 routes:
   - tool: get_compensation
 "#;
@@ -5691,12 +5704,10 @@ plugins:
     kind: test/allow
     hooks: [test_hook]
     mode: sequential
-    priority: 1
   - name: denier
     kind: test/deny
     hooks: [test_hook]
     mode: sequential
-    priority: 10
 routes:
   - tool: get_compensation
 "#;
@@ -6163,7 +6174,6 @@ plugins:
     kind: test/record
     hooks: [identity.resolve]
     mode: sequential
-    priority: 10
     config:
       max_requests: 100
 routes:
@@ -6458,7 +6468,6 @@ plugins:
     kind: test/init_tracking
     hooks: [identity.resolve]
     mode: sequential
-    priority: 10
     config:
       max_requests: 100
 routes:
@@ -6621,7 +6630,6 @@ plugins:
     kind: test/host_probe
     hooks: [identity.resolve]
     mode: sequential
-    priority: 10
     capabilities: [perform_http]
     config:
       max_requests: 100
@@ -6742,7 +6750,6 @@ plugins:
     kind: test/error_on_invoke
     hooks: [identity.resolve]
     mode: sequential
-    priority: 10
     on_error: disable
 routes:
   - tool: get_compensation
