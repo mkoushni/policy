@@ -7439,6 +7439,21 @@ groups:
     // Route annotations and small accessors
     // =====================================================================
 
+    /// `remove_route_annotation` had no caller anywhere. Removing an annotation
+    /// that is not there must be a no-op rather than a panic, since a caller
+    /// tearing down routes cannot know which ones were annotated.
+    #[test]
+    fn removing_an_absent_route_annotation_is_a_no_op() {
+        let mgr = PolicyEngine::default();
+        mgr.remove_route_annotation("tool", "never-annotated", None, "cmf.tool_pre_invoke");
+        mgr.remove_route_annotation(
+            "tool",
+            "never-annotated",
+            Some("scope"),
+            "cmf.tool_pre_invoke",
+        );
+    }
+
     /// `plugin_names` is how a host enumerates what loaded. It had no test, so
     /// nothing checked it reports the configured names rather than an empty list.
     #[test]
