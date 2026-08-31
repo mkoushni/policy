@@ -111,6 +111,10 @@ No author lines, no path lines.
   `reason`
 - `[workspace.lints]` in `Cargo.toml` is the
   authority
+- `dead_code` is denied. Keep an unused public item
+  only with a reason that names the host or other
+  out-of-tree caller. Do not silence it for future
+  work; delete the item.
 
 ### Tests
 
