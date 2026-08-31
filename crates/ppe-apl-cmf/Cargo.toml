@@ -25,6 +25,11 @@ serde_json = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 async-trait = { workspace = true }
+# The compiler's test scaffolding. praxis-policy-apl-core is also a normal
+# dependency, so cargo unifies the feature into this crate's non-test build too;
+# that is accepted rather than worked around, since the feature adds one module
+# and no behavior.
+praxis-policy-apl-core = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

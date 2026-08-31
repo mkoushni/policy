@@ -35,10 +35,12 @@ const ALARM: &str = "delegation_without_identity_resolution";
 /// A route delegating the caller's credential, with nothing configured
 /// to validate it.
 const NO_IDENTITY: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - tool: get_compensation
-    apl:
+    authorization:
       pre_invocation:
         - "delegate(workday-oauth, target: workday-api, permissions: [read_compensation])"
 "#;
@@ -46,12 +48,14 @@ routes:
 /// The same route with an `authentication:` block, which is what
 /// identity resolution keys on.
 const WITH_IDENTITY: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - tool: get_compensation
     authentication:
       - corp-jwt
-    apl:
+    authorization:
       pre_invocation:
         - "delegate(workday-oauth, target: workday-api, permissions: [read_compensation])"
 "#;
@@ -59,10 +63,12 @@ routes:
 /// The delegation carries no caller credential, so identity resolution
 /// has nothing to say about it and a warning would be noise.
 const THIS_WORKLOAD: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - tool: get_compensation
-    apl:
+    authorization:
       pre_invocation:
         - "delegate(workday-oauth, target: workday-api, subject: this_workload)"
 "#;

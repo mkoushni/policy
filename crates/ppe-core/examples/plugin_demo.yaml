@@ -3,27 +3,22 @@
 
 # CPEX Plugin Demo Configuration
 #
-# Three plugins, policy groups with tag-based activation,
-# and routes that map tools to different plugin combinations.
+# Four plugins under hook dispatch: each declares the hooks it fires
+# at, and the two that must not fire everywhere narrow themselves with
+# their own `conditions:`.
+#
+# This demo registers no APL visitor, so it has no `run(name)` step to
+# invoke a plugin from — `dispatch: hooks` is what activates plugins
+# here. `routes:`, `groups:`, and `global:` are load errors in this
+# mode; a config that wants route- or tag-scoped activation writes a
+# policy under `dispatch: policy` instead.
 
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: hooks
   plugin_timeout: 30
 
-global:
-  policies:
-    # "all" is reserved — these plugins fire on every invocation
-    all:
-      plugins: [identity-resolver]
-    # "pii" group — activated when a route has the "pii" tag
-    pii:
-      plugins: [pii-guard]
-    # "external_authz" group — activated when a route has the
-    # "needs_remote_authz" tag. Fires the async RemoteAuthz plugin.
-    external_authz:
-      plugins: [remote-authz]
-
 plugins:
+  # No `conditions:` — fires on every invocation of both hooks.
   - name: identity-resolver
     kind: builtin/identity
     hooks: [demo.tool_pre_invoke, demo.tool_post_invoke]
@@ -31,12 +26,16 @@ plugins:
     priority: 10
     on_error: fail
 
+  # Narrowed to the one PII-carrying tool. `tools:` matches
+  # `meta.entity_name` exactly when `meta.entity_type` is `tool`.
   - name: pii-guard
     kind: builtin/pii
     hooks: [demo.tool_pre_invoke]
     mode: sequential
     priority: 20
     on_error: fail
+    conditions:
+      - tools: [get_compensation]
     config:
       clearance_level: confidential
 
@@ -50,6 +49,8 @@ plugins:
     mode: sequential
     priority: 30
     on_error: fail
+    conditions:
+      - tools: [query_external_data]
 
   - name: audit-logger
     kind: builtin/audit
@@ -57,31 +58,3 @@ plugins:
     mode: fire_and_forget
     priority: 100
     on_error: ignore
-
-routes:
-  # HR compensation tool — contains PII, gets full security stack
-  - tool: get_compensation
-    meta:
-      tags: [pii, hr]
-    plugins:
-      - audit-logger
-
-  # Public department listing — standard security only
-  - tool: list_departments
-    plugins:
-      - audit-logger
-
-  # Tool that requires remote authz — triggers the async plugin
-  # on top of the standard "all" policy stack. The "external_authz"
-  # tag matches the policy group of the same name, which fires
-  # remote-authz.
-  - tool: query_external_data
-    meta:
-      tags: [external_authz]
-    plugins:
-      - audit-logger
-
-  # Wildcard — catch-all for unmatched tools
-  - tool: "*"
-    plugins:
-      - audit-logger

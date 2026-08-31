@@ -9,8 +9,8 @@
 // # Hierarchy stacking
 //
 // Each `visit_*` call carries a single block of raw YAML. The visitor
-// finds the `apl:` sub-block (if any), compiles it to a `CompiledRoute`,
-// and stashes it in interior state:
+// collects the policy terms written on it (if any), compiles them to a
+// `CompiledRoute`, and stashes it in interior state:
 //
 //   visit_global       → state.global_layer
 //   visit_default      → state.default_layers[entity_type]
@@ -21,21 +21,45 @@
 //
 //   effective = global
 //   effective.apply_layer(default_layer_for(entity_type))
-//   for tag in route.meta.tags { effective.apply_layer(tag_layer(tag)) }
-//   effective.apply_layer(route_apl_block)
+//   for name in route_bundle_names(route) { effective.apply_layer(tag_layer(name)) }
+//   effective.apply_layer(route_policy_block)
 //
 // then construct one `AplRouteHandler` per phase (Pre, Post) and call
 // `annotate_route` for each `(entity_type, entity_name, scope, hook)`.
 //
+// The `(entity_type, entity_name)` pairs come from
+// `praxis_policy_core::config::route_entity_identity`, the one place a
+// route maps to the names it is known by, so the key annotated here is
+// the key a request resolves to. The bundle names come from
+// `route_bundle_names` for the same reason: it is the one place a route maps to
+// the bundles it joins, so the policy chain and the authentication chain cannot
+// disagree about the membership or the order it stacks in.
+//
+// # A policy body replaces the route's plugin chain
+//
+// An annotated route dispatches its compiled body instead of the plugin
+// lineup praxis-policy-core would have resolved, so the `all` group, the
+// entity-type defaults, tag bundles, and the route's own `plugins:` list only
+// run for those requests when a policy step names them. That has always held
+// for entity routes, and an `http:` route carrying a body is the same
+// substitution. `visit_route` names each `http:` route whose own `plugins:`
+// list that silences, so a specific configuration reports it rather than
+// leaving an operator to find this paragraph.
+//
 // # Hook names per entity type
 //
-// Each entity type binds to its own CMF hook pair:
+// Each entity type binds to its own hook pair:
 //
 //   * `tool:`     → `cmf.tool_pre_invoke`     / `cmf.tool_post_invoke`
 //   * `llm:`      → `cmf.llm_input`           / `cmf.llm_output`
 //   * `prompt:`   → `cmf.prompt_pre_invoke`   / `cmf.prompt_post_invoke`
 //   * `resource:` → `cmf.resource_pre_fetch`  / `cmf.resource_post_fetch`
-//   * entity-less HTTP → `cmf.http_request`   / `cmf.http_response`
+//   * `http:`     → `http.request`            / `http.response`
+//
+// The global HTTP catch-all installs under the same pair, under the
+// reserved global name rather than a route's own. An `http:` route
+// resolves only under `engine_settings.dispatch: policy`, which is
+// the default; the global catch-all installs either way.
 //
 // The mapping lives in [`hook_pair_for_entity`]. Hosts fire
 // `mgr.invoke_named::<CmfHook>("cmf.llm_input", ...)` for LLM
@@ -46,17 +70,21 @@
 // tool-family pair, for callers that wired against the v0 constants.
 // The per-entity dispatch is the load-bearing path now.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock, Weak};
 
 use praxis_policy_core::cmf::constants::{
     ENTITY_HTTP, ENTITY_LLM, ENTITY_NAME_GLOBAL, ENTITY_PROMPT, ENTITY_RESOURCE, ENTITY_TOOL,
-    HOOK_CMF_HTTP_REQUEST, HOOK_CMF_HTTP_RESPONSE, HOOK_CMF_LLM_INPUT, HOOK_CMF_LLM_OUTPUT,
-    HOOK_CMF_PROMPT_POST_INVOKE, HOOK_CMF_PROMPT_PRE_INVOKE, HOOK_CMF_RESOURCE_POST_FETCH,
-    HOOK_CMF_RESOURCE_PRE_FETCH, HOOK_CMF_TOOL_POST_INVOKE, HOOK_CMF_TOOL_PRE_INVOKE,
+    HOOK_CMF_LLM_INPUT, HOOK_CMF_LLM_OUTPUT, HOOK_CMF_PROMPT_POST_INVOKE,
+    HOOK_CMF_PROMPT_PRE_INVOKE, HOOK_CMF_RESOURCE_POST_FETCH, HOOK_CMF_RESOURCE_PRE_FETCH,
+    HOOK_CMF_TOOL_POST_INVOKE, HOOK_CMF_TOOL_PRE_INVOKE,
 };
-use praxis_policy_core::config::RouteEntry;
+use praxis_policy_core::config::{
+    PluginRouteRef, RouteEntry, route_bundle_names, route_entity_identity,
+};
 use praxis_policy_core::engine::PolicyEngine;
+use praxis_policy_core::http_hook::{HOOK_HTTP_REQUEST, HOOK_HTTP_RESPONSE};
+use praxis_policy_core::identity::HOOK_IDENTITY_RESOLVE;
 use praxis_policy_core::plugin::PluginConfig;
 use praxis_policy_core::visitor::{ConfigVisitor, VisitorError};
 
@@ -68,7 +96,7 @@ use praxis_policy_apl_core::step::{PdpFactory, PdpResolver};
 
 use crate::dispatch_plan::DispatchCache;
 use crate::pdp_router::PdpRouter;
-use crate::route_handler::{AplRouteHandler, Phase};
+use crate::route_handler::{AplRouteHandler, HookFamily, Phase};
 use crate::session_store::{SessionStore, SessionStoreFactory};
 
 /// Legacy alias for the tool-family pre hook. Kept exported for
@@ -79,7 +107,7 @@ pub const HOOK_PRE: &str = HOOK_CMF_TOOL_PRE_INVOKE;
 /// Legacy alias for the tool-family post hook. See `HOOK_PRE`.
 pub const HOOK_POST: &str = HOOK_CMF_TOOL_POST_INVOKE;
 
-/// Resolve the (pre, post) CMF hook pair for an `entity_type`. Drives
+/// Resolve the (pre, post) hook pair for an `entity_type`. Drives
 /// per-entity `annotate_route` calls so an `llm:` route annotates on
 /// `cmf.llm_input` / `cmf.llm_output` rather than the tool-family
 /// hooks. Returns `None` for unknown entity types — the visitor logs
@@ -95,7 +123,7 @@ pub fn hook_pair_for_entity(entity_type: &str) -> Option<(&'static str, &'static
         ENTITY_LLM => Some((HOOK_CMF_LLM_INPUT, HOOK_CMF_LLM_OUTPUT)),
         ENTITY_PROMPT => Some((HOOK_CMF_PROMPT_PRE_INVOKE, HOOK_CMF_PROMPT_POST_INVOKE)),
         ENTITY_RESOURCE => Some((HOOK_CMF_RESOURCE_PRE_FETCH, HOOK_CMF_RESOURCE_POST_FETCH)),
-        ENTITY_HTTP => Some((HOOK_CMF_HTTP_REQUEST, HOOK_CMF_HTTP_RESPONSE)),
+        ENTITY_HTTP => Some((HOOK_HTTP_REQUEST, HOOK_HTTP_RESPONSE)),
         _ => None,
     }
 }
@@ -105,7 +133,7 @@ pub fn hook_pair_for_entity(entity_type: &str) -> Option<(&'static str, &'static
 /// load); the layer fields are populated as the visitor walks
 /// `global` / `defaults` / `policies` / `routes`; `pdp_router` is
 /// populated by both code-supplied resolvers (`register_pdp`) and
-/// unified-config-driven entries under `global.apl.pdp[]` (built
+/// unified-config-driven entries under `global.pdp[]` (built
 /// during `visit_global`).
 #[derive(Default)]
 struct VisitorState {
@@ -114,6 +142,18 @@ struct VisitorState {
     default_layers: HashMap<String, CompiledRoute>,
     tag_layers: HashMap<String, CompiledRoute>,
     pdp_router: PdpRouter,
+    /// Each declared plugin's name against the hooks its own `hooks:` names.
+    /// Filled by `visit_plugins`, which runs before any section is walked.
+    declared_plugin_hooks: HashMap<String, Vec<String>>,
+    /// Each plugin a policy reaches, against the hooks it is reached under.
+    /// Filled as routes are walked, where the entity family fixes the hook pair,
+    /// and read by `visit_complete` for the narrowing report only.
+    reached_plugin_hooks: HashMap<String, HashSet<String>>,
+    /// Every plugin any policy names, whatever the scope. Reachability reads
+    /// this rather than `reached_plugin_hooks`, because a `global:`,
+    /// `global.defaults:`, or bundle layer reaches its plugins even in a config
+    /// with no `routes:` for it to stack onto, and no hook is known there.
+    reached_plugin_names: HashSet<String>,
 }
 
 /// APL implementation of [`praxis_policy_core::visitor::ConfigVisitor`]. Construct
@@ -126,7 +166,7 @@ struct VisitorState {
 ///
 /// 1. **Code-supplied** via `register_pdp` (or `AplOptions.pdps`) —
 ///    the host built the resolver in code and hands it in.
-/// 2. **Config-supplied** via `global.apl.pdp[]` blocks in the unified
+/// 2. **Config-supplied** via `global.pdp[]` blocks in the unified
 ///    config — the visitor sees the block, looks up a factory by
 ///    `kind`, and constructs the resolver during `visit_global`.
 ///
@@ -137,7 +177,7 @@ pub struct AplConfigVisitor {
     state: RwLock<VisitorState>,
     dispatch_cache: Arc<DispatchCache>,
     /// Active session store. Behind a `RwLock` because a
-    /// `global.apl.session_store` block can swap it during the
+    /// `global.session_store` block can swap it during the
     /// config walk (`visit_global`), which runs before route handlers
     /// capture the store in `visit_route`. Only touched during the
     /// single-threaded config walk — never on the request hot path,
@@ -159,10 +199,10 @@ pub struct AplConfigVisitor {
     /// can set this to an empty set.
     base_capabilities: std::collections::HashSet<String>,
     /// Factories the visitor consults when it encounters a
-    /// `global.apl.pdp[]` entry. Keyed by the factory's `kind()` —
+    /// `global.pdp[]` entry. Keyed by the factory's `kind()` —
     /// matches the `kind:` field in the YAML block.
     pdp_factories: HashMap<String, Arc<dyn PdpFactory>>,
-    /// Factories the visitor consults for a `global.apl.session_store`
+    /// Factories the visitor consults for a `global.session_store`
     /// block. Keyed by the factory's `kind()`. Empty by default, in
     /// which case the constructor-supplied store (typically
     /// `MemorySessionStore`) stays active.
@@ -217,7 +257,7 @@ impl AplConfigVisitor {
 
     /// Register a PDP factory by its `kind()`. Called during
     /// `register_apl` setup; the visitor uses these to instantiate
-    /// resolvers from `global.apl.pdp[]` config blocks.
+    /// resolvers from `global.pdp[]` config blocks.
     pub fn register_pdp_factory(&mut self, factory: Arc<dyn PdpFactory>) {
         self.pdp_factories
             .insert(factory.kind().to_owned(), factory);
@@ -226,13 +266,13 @@ impl AplConfigVisitor {
     /// Register a `SessionStoreFactory` by its `kind()`. Called during
     /// `register_apl` setup; the visitor uses these to swap in the
     /// config-selected session store when it sees a
-    /// `global.apl.session_store` block.
+    /// `global.session_store` block.
     pub fn register_session_store_factory(&mut self, factory: Arc<dyn SessionStoreFactory>) {
         self.session_store_factories
             .insert(factory.kind().to_owned(), factory);
     }
 
-    /// Parse the optional `global.apl.session_store` block and swap the
+    /// Parse the optional `global.session_store` block and swap the
     /// active store. Looks up the factory by `kind`, builds the store,
     /// and replaces the constructor-supplied default. Runs during
     /// `visit_global` — before `visit_route` clones the store into each
@@ -243,21 +283,21 @@ impl AplConfigVisitor {
         block: &serde_yaml::Value,
     ) -> Result<(), VisitorError> {
         let map = block.as_mapping().ok_or_else(|| {
-            "global.apl.session_store must be a mapping with a `kind:` field".to_owned()
+            "global.session_store must be a mapping with a `kind:` field".to_owned()
         })?;
         let kind = map
             .get(serde_yaml::Value::String("kind".to_owned()))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "global.apl.session_store missing required `kind:` field".to_owned())?;
+            .ok_or_else(|| "global.session_store missing required `kind:` field".to_owned())?;
         let factory = self.session_store_factories.get(kind).ok_or_else(|| {
             format!(
-                "global.apl.session_store declared kind='{kind}' but no factory is registered for that \
+                "global.session_store declared kind='{kind}' but no factory is registered for that \
                  kind — host must call register_session_store_factory(...) before load_config_yaml"
             )
         })?;
-        let store = factory.build(block).map_err(|e| {
-            format!("global.apl.session_store (kind='{kind}') failed to build: {e}")
-        })?;
+        let store = factory
+            .build(block)
+            .map_err(|e| format!("global.session_store (kind='{kind}') failed to build: {e}"))?;
         *self
             .session_store
             .write()
@@ -265,7 +305,7 @@ impl AplConfigVisitor {
         Ok(())
     }
 
-    /// Load the static `data.*` tree from a `global.apl.attribute_files`
+    /// Load the static `data.*` tree from a `global.attribute_files`
     /// list and install it. Paths resolve relative to the process CWD
     /// (the config is loaded from a string, so there is no config-file
     /// directory to anchor to). Fail-fast: a missing file or a same-leaf
@@ -286,7 +326,7 @@ impl AplConfigVisitor {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !current.is_empty() {
                 tracing::info!(
-                    "global.apl.attribute_files present but an attribute tree was already \
+                    "global.attribute_files present but an attribute tree was already \
                      injected via set_attribute_tree — keeping the injected tree \
                      (injected > attribute_files)"
                 );
@@ -298,7 +338,7 @@ impl AplConfigVisitor {
         for (i, entry) in entries.iter().enumerate() {
             let s = entry
                 .as_str()
-                .ok_or_else(|| format!("global.apl.attribute_files[{i}] must be a string path"))?;
+                .ok_or_else(|| format!("global.attribute_files[{i}] must be a string path"))?;
             paths.push(std::path::PathBuf::from(s));
         }
         if paths.is_empty() {
@@ -307,7 +347,7 @@ impl AplConfigVisitor {
 
         let tree = crate::attribute_source::FileAttributeSource::new(paths)
             .load()
-            .map_err(|e| format!("global.apl.attribute_files failed to load: {e}"))?;
+            .map_err(|e| format!("global.attribute_files failed to load: {e}"))?;
         *self
             .attribute_tree
             .write()
@@ -326,7 +366,7 @@ impl AplConfigVisitor {
         self
     }
 
-    /// Parse one entry from `global.apl.pdp[]`. Reads `kind`, dispatches
+    /// Parse one entry from `global.pdp[]`. Reads `kind`, dispatches
     /// to the matching factory, installs the resulting resolver into
     /// the internal `PdpRouter`. Called per entry during `visit_global`.
     ///
@@ -337,22 +377,22 @@ impl AplConfigVisitor {
         entry: &serde_yaml::Value,
         index: usize,
     ) -> Result<(), VisitorError> {
-        let map = entry.as_mapping().ok_or_else(|| {
-            format!("global.apl.pdp[{index}] must be a mapping with a `kind:` field")
-        })?;
+        let map = entry
+            .as_mapping()
+            .ok_or_else(|| format!("global.pdp[{index}] must be a mapping with a `kind:` field"))?;
         let kind = map
             .get(serde_yaml::Value::String("kind".to_owned()))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("global.apl.pdp[{index}] missing required `kind:` field"))?;
+            .ok_or_else(|| format!("global.pdp[{index}] missing required `kind:` field"))?;
         let factory = self.pdp_factories.get(kind).ok_or_else(|| {
             format!(
-                "global.apl.pdp[{index}] declared kind='{kind}' but no factory is registered for that kind — \
+                "global.pdp[{index}] declared kind='{kind}' but no factory is registered for that kind — \
                  host must call register_pdp_factory(...) before load_config_yaml"
             )
         })?;
         let resolver = factory
             .build(entry)
-            .map_err(|e| format!("global.apl.pdp[{index}] (kind='{kind}') failed to build: {e}"))?;
+            .map_err(|e| format!("global.pdp[{index}] (kind='{kind}') failed to build: {e}"))?;
         let mut state = self
             .state
             .write()
@@ -393,6 +433,46 @@ impl AplConfigVisitor {
     }
 }
 
+/// The plugin names an `authentication:` block on a section lists.
+///
+/// praxis-policy-core parses this block for its own resolution and hands the
+/// visitor only raw YAML for `global:` and `groups.<tag>:`, so reading the
+/// reference set means re-reading the key. The two accepted shapes are a list
+/// of steps and an object carrying `steps:`, and a step is a bare name or a map
+/// with `name:` — spelled out here rather than deserialized, because the type
+/// that models the block derives only the object shape and its two-shape
+/// reader is private to praxis-policy-core.
+///
+/// A shape this does not recognize yields nothing. That is safe in the
+/// direction that matters: praxis-policy-core has already rejected a malformed
+/// block by the time a visitor runs, so an unreadable one here is a shape that
+/// parsed, and the worst case is naming a plugin as unreached that something
+/// does reach. The tests below pin both shapes for that reason.
+fn authentication_step_names(yaml: &serde_yaml::Value) -> Vec<String> {
+    let Some(block) = yaml.get("authentication") else {
+        return Vec::new();
+    };
+    let steps = match block {
+        serde_yaml::Value::Sequence(items) => items,
+        serde_yaml::Value::Mapping(_) => match block.get("steps") {
+            Some(serde_yaml::Value::Sequence(items)) => items,
+            _ => return Vec::new(),
+        },
+        _ => return Vec::new(),
+    };
+    steps
+        .iter()
+        .filter_map(|step| match step {
+            serde_yaml::Value::String(name) => Some(name.clone()),
+            serde_yaml::Value::Mapping(_) => step
+                .get("name")
+                .and_then(serde_yaml::Value::as_str)
+                .map(ToOwned::to_owned),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Read-only baseline for APL predicates: enough to make
 /// `authenticated`, `role.*`, `perm.*`, `subject.*`, `claim.*`,
 /// `subject.teams`, `security.labels`, `delegated`, `delegation.*`,
@@ -427,6 +507,155 @@ fn default_base_capabilities() -> std::collections::HashSet<String> {
     .collect()
 }
 
+impl AplConfigVisitor {
+    /// Tally the plugins a compiled route reaches, against the hook each half
+    /// installs under.
+    ///
+    /// Called with the fully stacked route, so a plugin a `global:`,
+    /// `global.defaults:`, or bundle layer names is counted for every route
+    /// that layer reached. That is the whole point: a step under
+    /// `global.authorization:` reaches a plugin exactly by stacking onto the
+    /// routes below it.
+    fn record_reached_plugins(&self, route: &CompiledRoute, hook_pre: &str, hook_post: &str) {
+        let (pre, post) = crate::dispatch_plan::collect_plugin_names_by_half(route);
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (names, hook) in [(pre, hook_pre), (post, hook_post)] {
+            for name in names {
+                state.reached_plugin_names.insert(name.clone());
+                state
+                    .reached_plugin_hooks
+                    .entry(name)
+                    .or_default()
+                    .insert(hook.to_owned());
+            }
+        }
+    }
+
+    /// Tally the plugins a layer's steps name, without a hook.
+    ///
+    /// One caller: `visit_global`. Its layer is the exception, because it is the
+    /// one scope that installs a handler of its own, the entity-less HTTP
+    /// catch-all, and so governs every request that resolves no route. A config
+    /// with no `routes:` at all still reaches those plugins, which is why this
+    /// cannot wait for a route.
+    ///
+    /// `global.defaults.<entity>:` and a bundle install nothing and match nothing:
+    /// they only stack onto routes, and `visit_route` records what the *effective*
+    /// route reaches, layers included. They used to record here too, which made
+    /// an orphan group or an unused entity default report its plugins as
+    /// reachable when no dispatch path existed. The hook pair is unknown here
+    /// either way, since it is fixed by the route's entity family.
+    ///
+    /// The reference set is [`crate::dispatch_plan::collect_plugin_names_by_half`]'s,
+    /// merged: a layer has no hook to split the halves by, but it has to name
+    /// the same plugins a route's tally would. The union collector beside it
+    /// omits delegation and elicitation, which is right for a dispatch plan
+    /// (those resolve under their own hook families and live in their own maps)
+    /// and wrong here, where a `delegate(...)` in a `global:` block with no
+    /// route under it was reported as reaching nothing and failed the load.
+    fn record_reached_layer_names(&self, route: &CompiledRoute) {
+        let (pre, post) = crate::dispatch_plan::collect_plugin_names_by_half(route);
+        let names: Vec<String> = pre.into_iter().chain(post).collect();
+        if names.is_empty() {
+            return;
+        }
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.reached_plugin_names.extend(names);
+    }
+
+    /// Tally the plugins an `authentication:` block names. Those reach the
+    /// identity hook, which no policy step installs under.
+    fn record_authentication_names(&self, names: &[String]) {
+        if names.is_empty() {
+            return;
+        }
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for name in names {
+            state.reached_plugin_names.insert(name.clone());
+            state
+                .reached_plugin_hooks
+                .entry(name.clone())
+                .or_default()
+                .insert(HOOK_IDENTITY_RESOLVE.to_owned());
+        }
+    }
+
+    /// Fail the load for a declared plugin no policy reaches, and warn for one
+    /// reached on fewer hooks than it declares. Policy dispatch only.
+    ///
+    /// The report is per plugin rather than per config: a config declaring
+    /// three plugins and naming one reaches *something*, and a config-wide
+    /// "reaches nothing" test would pass it while two plugins sit inert. Under
+    /// `dispatch: policy` an unreached plugin never runs, so an operator who
+    /// declared it is looking at a gap in enforcement with nothing to read.
+    ///
+    /// Narrowing is a warning, not an error: a plugin declaring three hooks
+    /// and named by a step on one may be exactly what was meant. It is
+    /// reported because it is equally often not.
+    fn report_unreachable_plugins(&self, mgr: &Arc<PolicyEngine>) -> Result<(), VisitorError> {
+        // Hook dispatch fires each plugin at the hooks its own `hooks:` names,
+        // so a plugin no step reaches is what that mode looks like rather than a
+        // fault. Both checks below only mean anything under `policy`.
+        if !mgr.dispatch_mode().is_policy() {
+            return Ok(());
+        }
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut unreached: Vec<&str> = state
+            .declared_plugin_hooks
+            .keys()
+            .filter(|name| !state.reached_plugin_names.contains(*name))
+            .map(String::as_str)
+            .collect();
+        if !unreached.is_empty() {
+            unreached.sort_unstable();
+            return Err(format!(
+                "`engine_settings.dispatch: policy` reaches a plugin only from a step that names \
+                 it, and no step names `{}`, so it can never run. Add a `run(name)` step under an \
+                 `authorization:` block, name it in an `authentication:` list, or drop the \
+                 declaration",
+                unreached.join("`, `")
+            )
+            .into());
+        }
+
+        for (name, declared) in &state.declared_plugin_hooks {
+            let Some(reached) = state.reached_plugin_hooks.get(name) else {
+                continue;
+            };
+            let uncovered: Vec<&str> = declared
+                .iter()
+                .filter(|hook| !reached.contains(*hook))
+                .map(String::as_str)
+                .collect();
+            if !uncovered.is_empty() {
+                tracing::warn!(
+                    alarm = "plugin_narrowed_by_policy",
+                    plugin = %name,
+                    uncovered = ?uncovered,
+                    "this plugin declares hooks no policy step reaches it under, so it no longer \
+                     runs there. Under `dispatch: hooks` it would fire at every hook it declares. \
+                     Add a step on the uncovered hooks if the coverage was meant to be wider, or \
+                     narrow the plugin's own `hooks:` to match what the policy asks for",
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 impl ConfigVisitor for AplConfigVisitor {
     fn name(&self) -> &str {
         "apl"
@@ -448,7 +677,15 @@ impl ConfigVisitor for AplConfigVisitor {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.plugin_registry.clear();
+        // A load starts the reachability tally over. `visit_plugins` runs once
+        // per load before any section, so it is the only place that can.
+        state.declared_plugin_hooks.clear();
+        state.reached_plugin_hooks.clear();
+        state.reached_plugin_names.clear();
         for cfg in plugins {
+            state
+                .declared_plugin_hooks
+                .insert(cfg.name.clone(), cfg.hooks.clone());
             let decl = PluginDeclaration {
                 name: cfg.name.clone(),
                 kind: cfg.kind.clone(),
@@ -463,30 +700,34 @@ impl ConfigVisitor for AplConfigVisitor {
         Ok(())
     }
 
+    fn visit_complete(&self, mgr: &Arc<PolicyEngine>) -> Result<(), VisitorError> {
+        self.report_unreachable_plugins(mgr)
+    }
+
     fn visit_global(
         &self,
         mgr: &Arc<PolicyEngine>,
         yaml: &serde_yaml::Value,
     ) -> Result<(), VisitorError> {
-        reject_legacy_apl_keys("global", yaml)?;
+        self.record_authentication_names(&authentication_step_names(yaml));
         let Some(apl_block) = apl_subblock(yaml) else {
-            // No `apl:` wrapper and no flat DSL keys — there is nothing to
-            // compile or install. But a bare `global: { response: {...} }`
-            // (a denyWith with no accompanying policy) would otherwise be
-            // dropped here silently, before the `response_subblock` read
-            // below ever runs. Warn so this fail-open-by-omission case gets
-            // the same signal as the args/policy-empty case handled further
-            // down, rather than vanishing without a trace.
+            // No policy term on the section — there is nothing to compile or
+            // install. But a bare `global: { response: {...} }` (a denyWith
+            // with no accompanying policy) would otherwise be dropped here
+            // silently, before the `response_subblock` read below ever runs.
+            // Warn so this fail-open-by-omission case gets the same signal as
+            // the no-steps case handled further down, rather than vanishing
+            // without a trace.
             if response_yaml_block(yaml).is_some_and(|v| !v.is_null()) {
                 tracing::warn!(
-                    "APL visitor: global.response is set but global.apl has no policy/args block \
-                     — the entity-less HTTP catch-all handler will not install, so this response can never fire",
+                    "APL visitor: global.response is set but global declares no authorization \
+                     block — the entity-less HTTP catch-all handler will not install, so this response can never fire",
                 );
             }
             return Ok(());
         };
 
-        // Process `apl.pdp[]` before stacking the pre/post-invocation
+        // Process `global.pdp[]` before stacking the pre/post-invocation
         // layer — route handlers that reference PDPs need them
         // resolvable by the time `visit_route` runs.
         if let Some(pdp_entries) = apl_block.get("pdp").and_then(|v| v.as_sequence()) {
@@ -495,32 +736,28 @@ impl ConfigVisitor for AplConfigVisitor {
             }
         }
 
-        // Process an optional `global.apl.session_store` block: swap the
+        // Process an optional `global.session_store` block: swap the
         // active store before `visit_route` clones it into handlers.
         if let Some(block) = apl_block.get("session_store") {
             self.build_session_store_from_config(block)?;
         }
 
-        // Process an optional `global.apl.attribute_files` list: load +
+        // Process an optional `global.attribute_files` list: load +
         // merge the static `data.*` tree before `visit_route` clones it
         // into handlers. A tree already injected via `set_attribute_tree`
         // takes precedence (injected > attribute_files > none).
         if let Some(files) = apl_block.get("attribute_files") {
-            let entries = files.as_sequence().ok_or_else(|| {
-                "global.apl.attribute_files must be a list of file paths".to_owned()
-            })?;
+            let entries = files
+                .as_sequence()
+                .ok_or_else(|| "global.attribute_files must be a list of file paths".to_owned())?;
             self.build_attribute_tree_from_config(entries)?;
         }
 
-        // The `pdp:` / `session_store:` sub-keys aren't APL DSL fields;
-        // strip them before handing the block to
-        // `compile_policy_block_value` so the compiler doesn't see unknown
-        // keys. `compile_policy_block_value` accepts maps with
-        // `authorization:` / `pre_invocation:` / `post_invocation:` /
-        // `args:` / `result:` / `plugins:` (and inert fields it ignores),
-        // so a shallow strip on a clone is enough.
-        let policy_only = strip_non_dsl_keys(&apl_block);
-        let mut compiled = compile_policy_block_value("global.apl", &policy_only)
+        // The wiring keys aren't APL terms; strip them before handing the
+        // block to `compile_policy_block_value` so the compiler only sees
+        // what it models.
+        let policy_only = strip_wiring_keys(&apl_block);
+        let mut compiled = compile_policy_block_value("global", &policy_only)
             .map_err(|e| -> VisitorError { Box::new(e) })?;
         // A `response:` block at the global scope is the catch-all denyWith.
         compiled.response = response_subblock(yaml, "global");
@@ -537,14 +774,13 @@ impl ConfigVisitor for AplConfigVisitor {
         // same mapping the entity routes below read, so the phase a hook
         // installs under is decided in one place. `None` is unreachable for
         // ENTITY_HTTP; skipping rather than crashing matches visit_routes.
-        let installs_pre_handler = http_catchall_should_install(&compiled);
-        let installs_post_handler = http_catchall_response_should_install(&compiled);
+        let installs_pre_handler = declares_pre_phase(&compiled);
+        let installs_post_handler = declares_post_phase(&compiled);
         if !installs_pre_handler && !installs_post_handler && compiled.response.is_some() {
             tracing::warn!(
-                "APL visitor: global.response is set but global.apl declares no steps \
-                 (`args:`/`policy:` for the request half, `result:`/`post_invocation:` for the \
-                 response half), so no entity-less HTTP handler installs and this response can \
-                 never fire",
+                "APL visitor: global.response is set but global declares no steps \
+                 (`pre_invocation:` for the request half, `post_invocation:` for the response \
+                 half), so no entity-less HTTP handler installs and this response can never fire",
             );
         }
         if (installs_pre_handler || installs_post_handler)
@@ -601,6 +837,7 @@ impl ConfigVisitor for AplConfigVisitor {
             }
         }
 
+        self.record_reached_layer_names(&compiled);
         self.state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -614,15 +851,24 @@ impl ConfigVisitor for AplConfigVisitor {
         entity_type: &str,
         yaml: &serde_yaml::Value,
     ) -> Result<(), VisitorError> {
-        let source = format!("global.defaults.{entity_type}.apl");
-        reject_legacy_apl_keys(&source, yaml)?;
-        warn_if_response_at_unsupported_scope(yaml, &format!("global.defaults.{entity_type}"));
+        let source = format!("global.defaults.{entity_type}");
+        // Before the early return, the way a bundle and a route both do: an
+        // entity default's `authentication:` list reaches its plugins whether
+        // or not the block carries a policy body.
+        self.record_authentication_names(&authentication_step_names(yaml));
+        warn_if_response_at_unsupported_scope(yaml, &source);
         let Some(apl_block) = apl_subblock(yaml) else {
             return Ok(());
         };
-        warn_if_global_only_key_at_nonglobal_scope(&source, &apl_block);
         let compiled = compile_policy_block_value(&source, &apl_block)
             .map_err(|e| -> VisitorError { Box::new(e) })?;
+        // A default layer reaches only its own entity type, so a field stage
+        // declared here for `http` is as unreadable as one on the route.
+        reject_field_stages_without_fields(entity_type, &source, &compiled)?;
+        // No reachability tally here. This installs no handler and matches no
+        // request: it stacks onto routes, and `visit_route` records what the
+        // effective route reaches. Recording at compile time meant a default for
+        // an entity type no route declares reported its plugins as reachable.
         self.state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -637,15 +883,19 @@ impl ConfigVisitor for AplConfigVisitor {
         tag: &str,
         yaml: &serde_yaml::Value,
     ) -> Result<(), VisitorError> {
-        let source = format!("global.policies.{tag}.apl");
-        reject_legacy_apl_keys(&source, yaml)?;
-        warn_if_response_at_unsupported_scope(yaml, &format!("global.policies.{tag}"));
+        let source = format!("groups.{tag}");
+        self.record_authentication_names(&authentication_step_names(yaml));
+        warn_if_response_at_unsupported_scope(yaml, &source);
         let Some(apl_block) = apl_subblock(yaml) else {
             return Ok(());
         };
-        warn_if_global_only_key_at_nonglobal_scope(&source, &apl_block);
         let compiled = compile_policy_block_value(&source, &apl_block)
             .map_err(|e| -> VisitorError { Box::new(e) })?;
+        // No reachability tally here, for the reason in `visit_default`. A group
+        // installs no handler and matches no request on its own: a route has to
+        // carry its name. Recording at compile time meant an orphan group nothing
+        // joins reported its plugins as reachable, which is the fail-open the
+        // per-plugin check exists to close.
         self.state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -660,26 +910,35 @@ impl ConfigVisitor for AplConfigVisitor {
         yaml: &serde_yaml::Value,
         parsed: &RouteEntry,
     ) -> Result<(), VisitorError> {
+        // Before any early return: an `authentication:` list reaches its
+        // plugins whether or not the route carries a policy body, so a route
+        // that contributes no APL block still contributes references. Read off
+        // the typed route here, which praxis-policy-core has already resolved
+        // to both shapes.
+        if let Some(identity) = parsed.authentication.as_ref() {
+            let names: Vec<String> = identity.steps.iter().map(|s| s.name.clone()).collect();
+            self.record_authentication_names(&names);
+        }
+
         // Extract the route's APL block (if any) and the entity identity
         // we need for annotate_route. A route without an APL block AND
         // without inherited layers contributes nothing — skip.
-        reject_legacy_apl_keys("route", yaml)?;
         let route_apl = apl_subblock(yaml);
-        let (entity_type, entity_names) = if let Some(e) = entity_identity(parsed) {
-            e
-        } else {
-            tracing::warn!("APL visitor: route has no tool/resource/prompt/llm match — skipping",);
+        let Some((entity_type, entity_names)) = route_entity_identity(parsed) else {
+            tracing::warn!(
+                "APL visitor: route declares no tool/resource/prompt/llm/http selector, skipping",
+            );
             return Ok(());
         };
-        if let Some(block) = &route_apl {
-            warn_if_global_only_key_at_nonglobal_scope(&format!("routes.{entity_type}"), block);
-        }
         let scope = parsed.meta.as_ref().and_then(|m| m.scope.clone());
-        let tags: Vec<String> = parsed
-            .meta
-            .as_ref()
-            .map(|m| m.tags.clone())
-            .unwrap_or_default();
+        // Both membership spellings, in the order their layers stack. This read
+        // `parsed.meta.tags` alone, so a route joining a bundle through `groups:`
+        // inherited the bundle's `authentication:` (which praxis-policy-core
+        // resolves through the same ordered stream) and none of its
+        // `authorization:`. With the activation lists gone that was a fail-open
+        // rather than a metadata asymmetry: no layer contributed anything, so the
+        // route installed no handler and was governed by nothing.
+        let bundles: Vec<String> = route_bundle_names(parsed);
 
         // Snapshot the dispatch state once outside the per-entity loop.
         // `visit_plugins` populated the registry before any `visit_route`
@@ -712,7 +971,7 @@ impl ConfigVisitor for AplConfigVisitor {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
 
             // Stack least-to-most-specific. Each apply_layer call appends
-            // policy/post_policy steps and merges args/result/plugin_overrides
+            // pre/post-invocation steps and merges args/result/plugin_overrides
             // by field; the resulting CompiledRoute represents the route's
             // effective policy in evaluation order.
             let mut effective = CompiledRoute::new(&route_key);
@@ -722,17 +981,22 @@ impl ConfigVisitor for AplConfigVisitor {
             if let Some(layer) = state.default_layers.get(entity_type).cloned() {
                 effective.apply_layer(layer);
             }
-            for tag in &tags {
-                if let Some(layer) = state.tag_layers.get(tag).cloned() {
+            for bundle in &bundles {
+                if let Some(layer) = state.tag_layers.get(bundle).cloned() {
                     effective.apply_layer(layer);
                 }
             }
             drop(state);
 
             if let Some(block) = &route_apl {
-                let source = format!("routes.{route_key}.apl");
+                let source = format!("routes.{route_key}");
                 let route_layer = compile_policy_block_value(&source, block)
                     .map_err(|e| -> VisitorError { Box::new(e) })?;
+                reject_field_stages_without_fields(
+                    entity_type,
+                    &format!("route '{route_key}'"),
+                    &route_layer,
+                )?;
                 effective.apply_layer(route_layer);
             }
 
@@ -780,10 +1044,26 @@ impl ConfigVisitor for AplConfigVisitor {
                 mgr.as_ref(),
             );
 
+            // A handler is about to install, so the substitution is certain
+            // from here. Reported once per route: the body and the `plugins:`
+            // list are the same for every name the selector contributes.
+            if idx == 0 {
+                let displaced = displaced_plugin_chain(entity_type, parsed);
+                if !displaced.is_empty() {
+                    tracing::warn!(
+                        route = %route_key,
+                        plugins = %displaced.join(", "),
+                        "APL visitor: this `http:` route's policy body dispatches in place of its \
+                         plugin chain, so the plugins it lists run only where a policy step names \
+                         them",
+                    );
+                }
+            }
+
             // Plugin-mode validation for `parallel:` blocks.
             // `praxis-policy-apl-core::Effect::validate_parallel_purity` already rejected
             // FieldOp / Delegate at parse time; this pass checks that every
-            // `plugin(X)` inside a `parallel:` must reference a plugin whose
+            // `run(X)` inside a `parallel:` must reference a plugin whose
             // mode admits concurrent execution (Audit / Concurrent /
             // FireAndForget). Sequential / Transform plugins would silently
             // lose their mutations inside cloned branches. This is about
@@ -804,22 +1084,35 @@ impl ConfigVisitor for AplConfigVisitor {
                 return Err(err_msg.into());
             }
 
+            // Each half installs only when the effective route declares steps
+            // for it, the way the global catch-all already decides.
+            let installs_pre = declares_pre_phase(&effective);
+            let installs_post = declares_post_phase(&effective);
+
             let route_arc = Arc::new(effective);
 
-            // Resolve the entity-specific CMF hook pair. The visitor's
-            // entity_identity() already filtered out unknown types, but
-            // hook_pair_for_entity returning None would just skip the
-            // annotation rather than crash — defense in depth.
+            // Resolve the entity-specific hook pair. `route_entity_identity`
+            // only names entity types this maps, but hook_pair_for_entity
+            // returning None would just skip the annotation rather than crash,
+            // as defense in depth.
             let (hook_pre, hook_post) = if let Some(pair) = hook_pair_for_entity(entity_type) {
                 pair
             } else {
                 tracing::warn!(
                     entity_type,
                     entity_name,
-                    "APL visitor: no CMF hook pair for entity_type — skipping route",
+                    "APL visitor: no hook pair for entity_type — skipping route",
                 );
                 continue;
             };
+
+            // Tally what this route reaches, for the load-time report in
+            // `visit_complete`. Once per route rather than per entity name:
+            // the steps and the hook pair are the same for every name a route
+            // contributes, so the first is representative.
+            if idx == 0 {
+                self.record_reached_plugins(&route_arc, hook_pre, hook_post);
+            }
 
             // Snapshot the static attribute tree (set before the walk).
             // Each handler captures its own `Arc` clone — shared, not copied.
@@ -829,45 +1122,86 @@ impl ConfigVisitor for AplConfigVisitor {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
 
-            // Install Pre + Post handlers. Each handler instance is bound to
-            // ONE phase so the executor can pick the right entry-point off
-            // the (entity_type, entity_name, scope, hook_name) key.
-            install_handler(
-                mgr,
-                entity_type,
-                entity_name,
-                scope.clone(),
-                hook_pre,
-                Phase::Pre,
-                Arc::clone(&route_arc),
-                &plugin_registry,
-                &self.dispatch_cache,
-                &session_store,
-                &self.engine,
-                Some(Arc::clone(&pdp_router_arc)),
-                &self.base_capabilities,
-                Arc::clone(&attribute_tree),
-            );
-            install_handler(
-                mgr,
-                entity_type,
-                entity_name,
-                scope.clone(),
-                hook_post,
-                Phase::Post,
-                route_arc,
-                &plugin_registry,
-                &self.dispatch_cache,
-                &session_store,
-                &self.engine,
-                Some(Arc::clone(&pdp_router_arc)),
-                &self.base_capabilities,
-                attribute_tree,
-            );
+            // Install the halves the route declares. Each handler instance is
+            // bound to ONE phase so the executor can pick the right entry-point
+            // off the (entity_type, entity_name, scope, hook_name) key. The two
+            // predicates cover all four phases between them, so a route that
+            // reached here declares at least one and installs at least one
+            // handler.
+            if installs_pre {
+                install_handler(
+                    mgr,
+                    entity_type,
+                    entity_name,
+                    scope.clone(),
+                    hook_pre,
+                    Phase::Pre,
+                    Arc::clone(&route_arc),
+                    &plugin_registry,
+                    &self.dispatch_cache,
+                    &session_store,
+                    &self.engine,
+                    Some(Arc::clone(&pdp_router_arc)),
+                    &self.base_capabilities,
+                    Arc::clone(&attribute_tree),
+                );
+            }
+            if installs_post {
+                install_handler(
+                    mgr,
+                    entity_type,
+                    entity_name,
+                    scope.clone(),
+                    hook_post,
+                    Phase::Post,
+                    route_arc,
+                    &plugin_registry,
+                    &self.dispatch_cache,
+                    &session_store,
+                    &self.engine,
+                    Some(Arc::clone(&pdp_router_arc)),
+                    &self.base_capabilities,
+                    attribute_tree,
+                );
+            }
         }
 
         Ok(())
     }
+}
+
+/// Refuse an `args:` or `result:` block declared at a scope that reaches only
+/// a payload with no fields. Today that is the `http:` selector: an HTTP
+/// exchange reaches a policy through its extensions, and `HttpPayload` has
+/// nothing for a field path to address, so such a stage would read nothing and
+/// rewrite nothing.
+///
+/// `scope` is the label the refusal names, already spelled the way its caller
+/// names the declaration. Called for each scope whose reach is one entity type,
+/// which is what gives it a payload to check: a route's own block and
+/// `global.defaults.<entity>`. A bundle is shared by routes of several entity
+/// types, and `global:` accepts neither block at all.
+fn reject_field_stages_without_fields(
+    entity_type: &str,
+    scope: &str,
+    layer: &CompiledRoute,
+) -> Result<(), VisitorError> {
+    if entity_type != ENTITY_HTTP {
+        return Ok(());
+    }
+    let block = if !layer.args.is_empty() {
+        "args"
+    } else if !layer.result.is_empty() {
+        "result"
+    } else {
+        return Ok(());
+    };
+    Err(format!(
+        "{scope}: an `http:` route cannot declare a `{block}:` block, because a \
+         generic HTTP request carries no message for a field path to address. Read the request \
+         from the `http.*` attributes under `pre_invocation:` (or `post_invocation:`) instead."
+    )
+    .into())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -887,6 +1221,21 @@ fn install_handler(
     base_capabilities: &std::collections::HashSet<String>,
     attribute_tree: Arc<AttributeTree>,
 ) {
+    // The family decides which payload the handler accepts, and it is read off
+    // the same entity type that chose the hook name, so the two cannot
+    // disagree. An entity type with no family has no hook pair either, so the
+    // install sites never reach this; skipping and logging matches what they
+    // already do when `hook_pair_for_entity` returns `None`.
+    let Some(family) = HookFamily::for_entity(entity_type) else {
+        tracing::warn!(
+            entity_type,
+            entity_name,
+            hook_name,
+            "APL visitor: no hook family for entity_type — skipping handler install",
+        );
+        return;
+    };
+
     // Capability gating at the synthetic-handler boundary. praxis-policy-core's
     // executor calls `filter_extensions(&ext, &caps)` before every
     // handler invoke — including this one. If the synthetic handler
@@ -928,7 +1277,7 @@ fn install_handler(
             if phase == Phase::Pre { "pre" } else { "post" }
         ),
         kind: "builtin".to_owned(),
-        // The annotated handler covers exactly one CMF hook name.
+        // The annotated handler covers exactly one hook name.
         hooks: vec![hook_name.to_owned()],
         capabilities,
         ..Default::default()
@@ -937,6 +1286,7 @@ fn install_handler(
         plugin_config.clone(),
         route,
         phase,
+        family,
         Arc::clone(plugin_registry),
         Arc::clone(dispatch_cache),
         Arc::clone(session_store),
@@ -946,67 +1296,45 @@ fn install_handler(
     if let Some(pdp) = pdp {
         handler = handler.with_pdp(pdp);
     }
-    mgr.annotate_route(
+    let replaced = mgr.annotate_route(
         entity_type.to_owned(),
         entity_name.to_owned(),
-        scope,
+        scope.clone(),
         hook_name.to_owned(),
         Arc::new(handler),
         plugin_config,
     );
-}
-
-/// Pick the route's entity identities from the first non-None match
-/// field. v0: tool > resource > prompt > llm precedence. A list-form
-/// match (`tool: [a, b]`) yields one annotation per element so each
-/// request gets routed by its specific name.
-fn entity_identity(route: &RouteEntry) -> Option<(&'static str, Vec<String>)> {
-    if let Some(t) = &route.tool {
-        return Some(("tool", names_of(t)));
-    }
-    if let Some(r) = &route.resource {
-        return Some(("resource", names_of(r)));
-    }
-    if let Some(p) = &route.prompt {
-        return Some(("prompt", names_of(p)));
-    }
-    if let Some(l) = &route.llm {
-        return Some(("llm", names_of(l)));
-    }
-    None
-}
-
-fn names_of(sol: &praxis_policy_core::config::StringOrList) -> Vec<String> {
-    match sol {
-        praxis_policy_core::config::StringOrList::Single(p) => vec![p.as_str().to_owned()],
-        praxis_policy_core::config::StringOrList::List(v) => v.clone(),
+    if replaced {
+        // A handler already stood at these coordinates and has just been
+        // dropped. Nothing in the table records where it came from, so saying
+        // so is the only way an operator learns one policy body silently lost
+        // to another.
+        tracing::warn!(
+            entity_type,
+            entity_name,
+            scope = scope.as_deref(),
+            hook_name,
+            "APL visitor: replaced an existing policy handler at these route \
+             coordinates; only the later one evaluates",
+        );
     }
 }
 
-/// Warn when an APL block carries a global-only wiring key
-/// ([`GLOBAL_ONLY_NON_DSL_KEYS`]: `pdp`, `session_store`) at a scope that
-/// cannot act on it. Only [`AplConfigVisitor::visit_global`] builds PDPs
-/// and selects the session store (they are process-global PPE wiring); a
-/// `pdp:` / `session_store:` written under a default / policy-bundle /
-/// route block is folded into the policy body and silently discarded by
-/// `compile_policy_block_value`. Surfacing it here turns that quiet no-op
-/// into an actionable signal. Applies to both the flat and `apl:`-wrapped
-/// forms — neither is processed off the global scope.
-fn warn_if_global_only_key_at_nonglobal_scope(scope: &str, apl_block: &serde_yaml::Value) {
-    for key in GLOBAL_ONLY_NON_DSL_KEYS {
-        if apl_block.get(key).is_some() {
-            tracing::warn!(
-                scope,
-                key,
-                "APL visitor: this key is only honored under the top-level `global:` block; \
-                 the declaration at this scope is ignored",
-            );
-        }
+/// The `plugins:` an `http:` route lists that its compiled policy body stands
+/// in for. Empty for every other selector and for a route listing none, so a
+/// configuration declaring no `http:` route gains no diagnostic.
+///
+/// Called where a handler is about to install, which is what makes the
+/// substitution certain rather than possible.
+fn displaced_plugin_chain<'a>(entity_type: &str, route: &'a RouteEntry) -> Vec<&'a str> {
+    if entity_type != ENTITY_HTTP {
+        return Vec::new();
     }
+    route.plugins.iter().map(PluginRouteRef::name).collect()
 }
 
 /// Load-time lint: warn when an APL `plugins:` override is declared for a
-/// plugin that no `plugin(...)` / `run(...)` policy step (or `delegate(...)`
+/// plugin that no `run(...)` / `run(...)` policy step (or `delegate(...)`
 /// step) in the effective route references. The `plugins:` map only
 /// *configures* a plugin — policy steps do the *activating* — so an
 /// unreferenced override has no effect and is almost always a typo or a
@@ -1034,60 +1362,18 @@ fn warn_unreferenced_plugin_overrides(route: &CompiledRoute) {
     }
 }
 
-/// APL sub-keys that are PPE *wiring*, not policy DSL: they are honored
-/// only under the top-level `global:` block (where `visit_global` acts on
-/// them) and are stripped before the remainder is handed to
-/// `compile_policy_block_value`, which doesn't model them. Kept as a single
-/// source of truth shared by [`strip_non_dsl_keys`] and
-/// [`warn_if_global_only_key_at_nonglobal_scope`].
-const GLOBAL_ONLY_NON_DSL_KEYS: [&str; 3] = ["pdp", "session_store", "attribute_files"];
-
-/// Legacy APL config keys, mapped to their replacements. The flat-key path
-/// in [`apl_subblock`] only copies recognized keys into the synthetic block,
-/// so a config still using an old name would otherwise be *silently dropped*
-/// here — a fail-open for `policy` / `post_policy`. We reject them loudly.
-/// (The `apl:`-wrapped form is caught downstream by praxis-policy-apl-core instead.)
-const RENAMED_APL_KEYS: [(&str, &str); 2] = [
-    (
-        "policy",
-        "authorization.pre_invocation (or flat pre_invocation)",
-    ),
-    (
-        "post_policy",
-        "authorization.post_invocation (or flat post_invocation)",
-    ),
-];
-
-/// Fail loudly when a section carries a renamed legacy APL key directly
-/// (flat form). Guards the fail-open where the flat-key filter in
-/// [`apl_subblock`] would otherwise drop an unrecognized `policy:` block.
-fn reject_legacy_apl_keys(scope: &str, yaml: &serde_yaml::Value) -> Result<(), VisitorError> {
-    let Some(map) = yaml.as_mapping() else {
-        return Ok(());
-    };
-    for (old, new) in RENAMED_APL_KEYS {
-        if map.contains_key(serde_yaml::Value::String(old.to_owned())) {
-            return Err(format!(
-                "in `{scope}`: config field `{old}` was renamed to `{new}` — update your config",
-            )
-            .into());
-        }
-    }
-    Ok(())
-}
-
-/// Strip the global-only wiring sub-keys ([`GLOBAL_ONLY_NON_DSL_KEYS`])
-/// from an `apl:` mapping so the remainder can be handed to
-/// `compile_policy_block_value` (which doesn't model PDP / session-store
-/// declarations — those are PPE wiring concerns). Returns a clone of the
-/// mapping with those keys removed; the original is left intact.
-fn strip_non_dsl_keys(apl_block: &serde_yaml::Value) -> serde_yaml::Value {
+/// Strip the engine wiring keys
+/// ([`praxis_policy_core::config::global_wiring_keys`]) from a section's policy
+/// block so the remainder can be handed to `compile_policy_block_value`, which
+/// models PDP, session-store, and attribute-file declarations nowhere. Returns
+/// a clone of the mapping with those keys removed; the original is left intact.
+fn strip_wiring_keys(apl_block: &serde_yaml::Value) -> serde_yaml::Value {
     let Some(map) = apl_block.as_mapping() else {
         return apl_block.clone();
     };
     let mut cloned = map.clone();
-    for key in GLOBAL_ONLY_NON_DSL_KEYS {
-        cloned.remove(serde_yaml::Value::String(key.to_owned()));
+    for key in praxis_policy_core::config::global_wiring_keys() {
+        cloned.remove(serde_yaml::Value::String(key.name.to_owned()));
     }
     serde_yaml::Value::Mapping(cloned)
 }
@@ -1108,58 +1394,25 @@ fn on_error_to_string(on_err: &praxis_policy_core::plugin::OnError) -> String {
     on_err.to_string()
 }
 
-/// APL keys recognized directly on a section (route / global / defaults /
-/// policy-bundle) when the `apl:` wrapper is omitted. Includes the policy
-/// DSL terms plus the global-only wiring keys ([`GLOBAL_ONLY_NON_DSL_KEYS`]):
-/// `pdp` and `session_store` are accepted flat for parse symmetry with their
-/// `apl:`-wrapped form, but only `visit_global` acts on them — at other
-/// scopes they are inert and flagged by
-/// [`warn_if_global_only_key_at_nonglobal_scope`].
-/// `plugins` is intentionally absent here — it is shape-ambiguous (a
-/// structural plugin-ref *list* vs an apl-override *map*) and handled
-/// separately in [`apl_subblock`].
+/// Assemble a section's APL block from the terms written directly on it.
 ///
-/// `authorization` is the nested `{ pre_invocation, post_invocation }`
-/// block; it is copied through verbatim and un-nested by praxis-policy-apl-core's
-/// `compile_policy_block_value`, so nesting lives in exactly one place.
-const FLAT_APL_KEYS: [&str; 7] = [
-    "pre_invocation",
-    "post_invocation",
-    "authorization",
-    "args",
-    "result",
-    "pdp",
-    "session_store",
-];
-
-/// Pull a section's APL block out of its raw YAML.
-///
-/// The explicit `apl:` wrapper (`route -> apl -> authorization`) takes
-/// precedence. When it is absent, APL terms written directly on the
-/// section (`route -> authorization`) are accepted too: a synthetic block is
-/// assembled from the recognized [`FLAT_APL_KEYS`] present on the
-/// container, plus `plugins` when (and only when) it is a *mapping* —
-/// the apl-override shape. A structural `plugins:` *list*
-/// (`RouteEntry` / `PolicyGroup`) is left untouched. Returns `None`
-/// when neither a wrapper nor any flat APL key is present — callers
-/// treat that as "no contribution from this section" and move on.
+/// One path: the recognized
+/// [`praxis_policy_core::config::section_apl_block_keys`] present on the
+/// container are copied into a synthetic block, plus `plugins` when (and only
+/// when) it is a *mapping* — the apl-override shape. A structural `plugins:`
+/// *list* (`RouteEntry` / `PolicyGroup`) is left untouched. Returns `None`
+/// when the section carries no APL key at all — callers treat that as "no
+/// contribution from this section" and move on.
 fn apl_subblock(yaml: &serde_yaml::Value) -> Option<serde_yaml::Value> {
-    // Explicit `apl:` wrapper wins.
-    if let Some(block) = yaml.get("apl") {
-        return if block.is_null() {
-            None
-        } else {
-            Some(block.clone())
-        };
-    }
-
-    // Fallback: APL terms written directly on the section, with no
-    // `apl:` nesting. Copy only the unambiguous APL keys so structural
-    // keys (tool / identity / defaults / ...) are never misread.
+    // Copy only the unambiguous APL keys so structural keys
+    // (tool / authentication / defaults / ...) are never misread.
     let mut block = serde_yaml::Mapping::new();
-    for key in FLAT_APL_KEYS {
-        if let Some(value) = yaml.get(key) {
-            block.insert(serde_yaml::Value::String(key.to_owned()), value.clone());
+    for key in praxis_policy_core::config::section_apl_block_keys() {
+        if let Some(value) = yaml.get(key.name) {
+            block.insert(
+                serde_yaml::Value::String(key.name.to_owned()),
+                value.clone(),
+            );
         }
     }
     // `plugins` only in its apl-override (map) shape; a list is the
@@ -1180,50 +1433,37 @@ fn apl_subblock(yaml: &serde_yaml::Value) -> Option<serde_yaml::Value> {
     }
 }
 
-/// Whether the entity-less HTTP catch-all handler (Pre-phase only) should
-/// install for a compiled `global` layer. Gate on both Pre-phase steps
-/// (`args` + `policy`, via [`CompiledRoute::declared_phases`]), not
-/// `policy` alone — an operator whose `global.apl` has only an `args:`
-/// admission block (no `policy:`) must still get the catch-all installed,
-/// or entity-less HTTP traffic silently bypasses it entirely (fail-open by
-/// omission).
-fn http_catchall_should_install(compiled: &CompiledRoute) -> bool {
+/// Whether a compiled layer declares Pre-phase steps, which is what decides
+/// whether the Pre-phase handler installs. Read for the entity-less HTTP
+/// catch-all and, in `visit_routes`, for every route's own effective layers,
+/// so one rule decides both. Gate on both Pre-phase steps (`args` +
+/// `pre_invocation`, via [`CompiledRoute::declared_phases`]), not
+/// `pre_invocation` alone: a route whose
+/// only Pre-phase declaration is an `args:` field pipeline must still get a
+/// handler, or its request half silently bypasses the policy entirely
+/// (fail-open by omission).
+fn declares_pre_phase(compiled: &CompiledRoute) -> bool {
     let declared = compiled.declared_phases();
     declared.contains(praxis_policy_apl_core::rules::Phase::Args)
-        || declared.contains(praxis_policy_apl_core::rules::Phase::Policy)
+        || declared.contains(praxis_policy_apl_core::rules::Phase::PreInvocation)
 }
 
-/// Whether the entity-less HTTP response handler should install. The
-/// mirror of [`http_catchall_should_install`] on the post side, gating on
-/// `result` + `post_policy`, so a `global.apl` that only authorizes gets
-/// no response handler and a host that never fires `cmf.http_response`
-/// sees no change either way.
-fn http_catchall_response_should_install(compiled: &CompiledRoute) -> bool {
+/// Whether a compiled layer declares Post-phase steps. The mirror of
+/// [`declares_pre_phase`] on the post side, gating on `result` +
+/// `post_invocation`, so a layer that only authorizes gets no post handler and
+/// a host that never fires the post hook sees no change either way.
+fn declares_post_phase(compiled: &CompiledRoute) -> bool {
     let declared = compiled.declared_phases();
     declared.contains(praxis_policy_apl_core::rules::Phase::Result)
-        || declared.contains(praxis_policy_apl_core::rules::Phase::PostPolicy)
+        || declared.contains(praxis_policy_apl_core::rules::Phase::PostInvocation)
 }
 
-/// `response:` is not an APL DSL term (it never enters [`apl_subblock`]'s
-/// [`FLAT_APL_KEYS`]) — it is documented and tested as a sibling of `apl:`
-/// (`global: { apl: {...}, response: {...} }`). But an operator who mirrors
-/// the `pdp:` / `session_store:` convention (which *do* work identically
-/// whether flat or nested under `apl:`) may reasonably nest `response:`
-/// inside `apl:` too. Accept both spellings so that mistake degrades to
-/// "the other spelling wins," not "silently dropped."
-///
-/// PRECEDENCE — deliberately the INVERSE of [`apl_subblock`]. `apl_subblock`
-/// makes an explicit `apl:` wrapper win *entirely* over flat top-level keys
-/// (for `policy:`/`pdp:`/`session_store:`); here the top-level sibling
-/// `response:` wins over an `apl:`-nested one. This is intentional, not an
-/// oversight: the top-level sibling is the documented, already-shipped,
-/// tested form, so preferring it preserves backward compatibility, and the
-/// choice can only affect the *rendered denial shape* (status/body/headers)
-/// — never an Allow/Deny outcome. Do NOT "align" this with `apl_subblock`'s
-/// wrapper-wins rule without a deliberate compatibility decision.
+/// A section's `response:` block, the transpiled `denyWith`. Not an APL term:
+/// it never enters the constructive set [`apl_subblock`] copies, because the
+/// policy compiler does not model it. It sits beside the policy terms on the
+/// section, and one spelling is the only spelling.
 fn response_yaml_block(yaml: &serde_yaml::Value) -> Option<&serde_yaml::Value> {
     yaml.get("response")
-        .or_else(|| yaml.get("apl").and_then(|apl| apl.get("response")))
 }
 
 /// Warn when a `response:` block appears at a scope that never renders it.
@@ -1269,9 +1509,26 @@ fn response_subblock(yaml: &serde_yaml::Value, route_key: &str) -> Option<DenyRe
     reason = "tests"
 )]
 mod tests {
-    use super::{apl_subblock, http_catchall_should_install, response_subblock};
+    use std::sync::Arc;
+
+    use super::{
+        AplConfigVisitor, ConfigVisitor as _, DispatchCache, ENTITY_HTTP, ENTITY_NAME_GLOBAL,
+        ENTITY_TOOL, HOOK_CMF_TOOL_PRE_INVOKE, HOOK_HTTP_REQUEST, HOOK_HTTP_RESPONSE, PluginConfig,
+        PluginRouteRef, PolicyEngine, RouteEntry, apl_subblock, declares_post_phase,
+        declares_pre_phase, displaced_plugin_chain, response_subblock,
+    };
+    use crate::session_store::MemorySessionStore;
     use praxis_policy_apl_core::pipeline::{FieldRule, Pipeline, Stage, TypeCheck};
     use praxis_policy_apl_core::rules::{CompiledRoute, Effect};
+    use praxis_policy_core::cmf::enums::Role;
+    use praxis_policy_core::cmf::{CmfHook, Message, MessagePayload};
+    use praxis_policy_core::config::{HttpSelector, Pattern, StringOrList};
+    use praxis_policy_core::error::PluginViolation;
+    use praxis_policy_core::extensions::{Extensions, HttpExtension, MetaExtension};
+    use praxis_policy_core::factory::{PluginFactory, PluginInstance};
+    use praxis_policy_core::hooks::adapter::TypedHandlerAdapter;
+    use praxis_policy_core::hooks::trait_def::{HookHandler, PluginResult};
+    use praxis_policy_core::http_hook::{HttpHook, HttpPayload};
 
     fn yaml(s: &str) -> serde_yaml::Value {
         serde_yaml::from_str(s).expect("valid yaml")
@@ -1296,16 +1553,16 @@ mod tests {
 
     #[test]
     fn http_catchall_installs_for_args_only_global_block() {
-        // Regression for the fail-open-by-omission gap: a `global.apl` with
-        // only `args:` (no `policy:`) must still get the entity-less HTTP
+        // Regression for the fail-open-by-omission gap: a `global:` block with
+        // only `args:` (no steps) must still get the entity-less HTTP
         // catch-all installed. Before the fix this gated on
-        // `!compiled.policy.is_empty()` alone, so an args-only admission
+        // `!compiled.pre_invocation.is_empty()` alone, so an args-only admission
         // block silently disabled authorization for all entity-less HTTP
         // traffic.
         let mut route = CompiledRoute::new("global");
         route.args.push(field_rule("http.method"));
         assert!(
-            http_catchall_should_install(&route),
+            declares_pre_phase(&route),
             "an args-only global block must still install the catch-all handler"
         );
     }
@@ -1313,24 +1570,61 @@ mod tests {
     #[test]
     fn http_catchall_installs_for_policy_only_global_block() {
         let mut route = CompiledRoute::new("global");
-        route.policy.push(deny_effect());
-        assert!(http_catchall_should_install(&route));
+        route.pre_invocation.push(deny_effect());
+        assert!(declares_pre_phase(&route));
     }
 
     #[test]
     fn http_catchall_does_not_install_for_empty_or_post_only_global_block() {
         let empty = CompiledRoute::new("global");
         assert!(
-            !http_catchall_should_install(&empty),
+            !declares_pre_phase(&empty),
             "an empty global block has nothing to evaluate; installing would be a no-op handler"
         );
 
         let mut post_only = CompiledRoute::new("global");
-        post_only.post_policy.push(deny_effect());
+        post_only.post_invocation.push(deny_effect());
         assert!(
-            !http_catchall_should_install(&post_only),
-            "post_policy never runs on the Pre-phase-only catch-all, so it must not gate installation"
+            !declares_pre_phase(&post_only),
+            "post_invocation never runs on the Pre-phase-only catch-all, so it must not gate installation"
         );
+    }
+
+    /// Every `Phase` must be claimed by exactly one install predicate, or a
+    /// route declaring only that phase installs no handler and evaluates
+    /// nothing. The match below is exhaustive, so a fifth variant fails to
+    /// compile here instead of silently installing nothing.
+    #[test]
+    fn every_phase_is_claimed_by_exactly_one_install_predicate() {
+        use praxis_policy_apl_core::rules::Phase;
+        for phase in [
+            Phase::Args,
+            Phase::PreInvocation,
+            Phase::Result,
+            Phase::PostInvocation,
+        ] {
+            let mut route = CompiledRoute::new("r");
+            let is_pre = match phase {
+                Phase::Args => {
+                    route.args.push(field_rule("a"));
+                    true
+                },
+                Phase::PreInvocation => {
+                    route.pre_invocation.push(deny_effect());
+                    true
+                },
+                Phase::Result => {
+                    route.result.push(field_rule("r"));
+                    false
+                },
+                Phase::PostInvocation => {
+                    route.post_invocation.push(deny_effect());
+                    false
+                },
+            };
+            assert_eq!(declares_pre_phase(&route), is_pre, "pre for {phase:?}");
+            assert_eq!(declares_post_phase(&route), !is_pre, "post for {phase:?}");
+        }
     }
 
     #[test]
@@ -1353,28 +1647,16 @@ mod tests {
         assert!(response_subblock(&v, "tool:*").is_none());
     }
 
+    /// One spelling, one precedence rule: `response:` is read from the section
+    /// and nowhere else, so a nested one is an unknown key rather than a
+    /// second-choice source.
     #[test]
-    fn response_subblock_nested_under_apl_wrapper_is_read() {
-        // An operator mirroring the pdp:/session_store: convention (which
-        // work identically flat or nested under `apl:`) may nest `response:`
-        // under `apl:` too. It must not be silently absorbed.
-        let v =
-            yaml("tool: \"*\"\napl:\n  policy:\n    - \"deny\"\n  response:\n    status: 401\n");
-        let resp = response_subblock(&v, "tool:*").expect("nested response present");
-        assert_eq!(resp.status, Some(401));
-    }
-
-    #[test]
-    fn response_subblock_top_level_wins_over_nested_apl_form() {
+    fn response_subblock_reads_the_section_and_nothing_nested() {
         let v = yaml(
-            "tool: \"*\"\napl:\n  policy:\n    - \"deny\"\n  response:\n    status: 401\nresponse:\n  status: 403\n",
+            "tool: \"*\"\nauthorization:\n  pre_invocation:\n    - \"deny\"\nresponse:\n  status: 403\n",
         );
         let resp = response_subblock(&v, "tool:*").expect("response present");
-        assert_eq!(
-            resp.status,
-            Some(403),
-            "top-level sibling response takes precedence over the nested apl: form"
-        );
+        assert_eq!(resp.status, Some(403));
     }
 
     #[test]
@@ -1389,6 +1671,48 @@ mod tests {
         );
     }
 
+    /// The report an operator gets for the one case where something they wrote
+    /// stops firing: an `http:` route whose policy body stands in for the
+    /// `plugins:` it also lists.
+    #[test]
+    fn an_http_route_listing_plugins_names_them_as_displaced() {
+        let route = RouteEntry {
+            http: Some(HttpSelector::prefix("/v1/files")),
+            plugins: vec![
+                PluginRouteRef::Name("corp-jwt".to_owned()),
+                PluginRouteRef::Name("audit".to_owned()),
+            ],
+            ..RouteEntry::default()
+        };
+        assert_eq!(
+            displaced_plugin_chain(ENTITY_HTTP, &route),
+            ["corp-jwt", "audit"],
+            "the report names what stops firing, in the order it was written"
+        );
+    }
+
+    /// Nothing an operator wrote is displaced, so there is nothing to say.
+    #[test]
+    fn an_http_route_listing_no_plugins_displaces_nothing() {
+        let route = RouteEntry {
+            http: Some(HttpSelector::exact("/healthz")),
+            ..RouteEntry::default()
+        };
+        assert!(displaced_plugin_chain(ENTITY_HTTP, &route).is_empty());
+    }
+
+    /// The substitution is as old as entity routes, so reporting it for one
+    /// would be new noise on a configuration nobody edited.
+    #[test]
+    fn an_entity_route_listing_plugins_is_not_reported() {
+        let route = RouteEntry {
+            tool: Some(StringOrList::Single(Pattern::new("get_compensation"))),
+            plugins: vec![PluginRouteRef::Name("corp-jwt".to_owned())],
+            ..RouteEntry::default()
+        };
+        assert!(displaced_plugin_chain(ENTITY_TOOL, &route).is_empty());
+    }
+
     #[test]
     fn warn_if_response_at_unsupported_scope_is_a_safe_noop() {
         use super::warn_if_response_at_unsupported_scope;
@@ -1397,36 +1721,17 @@ mod tests {
         let with_response = yaml("policy:\n  - \"deny\"\nresponse:\n  status: 403\n");
         let without = yaml("policy:\n  - \"deny\"\n");
         warn_if_response_at_unsupported_scope(&with_response, "global.defaults.tool");
-        warn_if_response_at_unsupported_scope(&with_response, "global.policies.some-tag");
+        warn_if_response_at_unsupported_scope(&with_response, "groups.some-tag");
         warn_if_response_at_unsupported_scope(&without, "global.defaults.tool");
     }
 
     #[test]
-    fn apl_wrapper_is_returned_as_is() {
-        let v = yaml("apl:\n  pre_invocation:\n    - \"deny\"\n");
-        let block = apl_subblock(&v).expect("wrapper present");
+    fn a_policy_term_on_the_section_is_collected() {
+        let v = yaml("tool: get_weather\nauthorization:\n  pre_invocation:\n    - \"deny\"\n");
+        let block = apl_subblock(&v).expect("authorization recognized");
         assert!(
-            block.get("pre_invocation").is_some(),
-            "wrapper block exposes pre_invocation"
-        );
-    }
-
-    #[test]
-    fn null_apl_wrapper_is_none() {
-        let v = yaml("apl: null\n");
-        assert!(
-            apl_subblock(&v).is_none(),
-            "explicit null apl => no contribution"
-        );
-    }
-
-    #[test]
-    fn flat_pre_invocation_without_wrapper_is_collected() {
-        let v = yaml("tool: get_weather\npre_invocation:\n  - \"deny\"\n");
-        let block = apl_subblock(&v).expect("flat pre_invocation recognized");
-        assert!(
-            block.get("pre_invocation").is_some(),
-            "flat pre_invocation lifted into the block"
+            block.get("authorization").is_some(),
+            "the `authorization:` block is lifted into the synthetic block"
         );
         assert!(
             block.get("tool").is_none(),
@@ -1435,12 +1740,11 @@ mod tests {
     }
 
     #[test]
-    fn flat_session_store_without_wrapper_is_collected() {
-        // A `session_store:` written directly on `global:` (no `apl:`
-        // wrapper) must be lifted into the block so `visit_global` can act
-        // on it — symmetric with the `apl:`-wrapped form and with `pdp:`.
+    fn a_session_store_on_the_section_is_collected() {
+        // `session_store:` on `global:` is lifted into the block so
+        // `visit_global` can act on it, the same way `pdp:` is.
         let v = yaml("session_store:\n  kind: valkey\n  endpoint: localhost:6379\n");
-        let block = apl_subblock(&v).expect("flat session_store recognized");
+        let block = apl_subblock(&v).expect("session_store recognized");
         let ss = block
             .get("session_store")
             .expect("session_store lifted into the block");
@@ -1448,6 +1752,43 @@ mod tests {
             ss.get("kind").and_then(|k| k.as_str()),
             Some("valkey"),
             "the session_store mapping is preserved intact",
+        );
+    }
+
+    /// `attribute_files:` has no wrapper to hide behind any more, so the block
+    /// is the only path by which `visit_global` can reach it.
+    #[test]
+    fn attribute_files_on_the_section_is_collected() {
+        let v = yaml("attribute_files:\n  - attrs.yaml\n");
+        let block = apl_subblock(&v).expect("attribute_files recognized");
+        assert_eq!(
+            block
+                .get("attribute_files")
+                .and_then(|f| f.as_sequence())
+                .map(Vec::len),
+            Some(1),
+            "the attribute_files list is preserved intact",
+        );
+    }
+
+    /// The wiring keys reach `visit_global` through the block but must never
+    /// reach the policy compiler.
+    #[test]
+    fn the_wiring_keys_are_stripped_before_compilation() {
+        use super::strip_wiring_keys;
+        let block = yaml(
+            "authorization:\n  pre_invocation:\n    - \"deny\"\npdp:\n  - kind: cel\nsession_store:\n  kind: valkey\nattribute_files:\n  - attrs.yaml\n",
+        );
+        let stripped = strip_wiring_keys(&block);
+        for key in ["pdp", "session_store", "attribute_files"] {
+            assert!(
+                stripped.get(key).is_none(),
+                "`{key}` must not reach the policy compiler"
+            );
+        }
+        assert!(
+            stripped.get("authorization").is_some(),
+            "the policy terms survive the strip"
         );
     }
 
@@ -1476,47 +1817,27 @@ mod tests {
         );
     }
 
+    /// A stale `apl:` wrapper contributes nothing: it is not a policy term, so
+    /// the block is assembled from the section's own terms and the wrapper's
+    /// contents are the loader's to reject.
     #[test]
-    fn explicit_wrapper_wins_over_flat_keys() {
-        let v = yaml("apl:\n  pre_invocation:\n    - \"allow\"\npre_invocation:\n  - \"deny\"\n");
-        let block = apl_subblock(&v).expect("wrapper present");
-        let pre_invocation = block
-            .get("pre_invocation")
-            .and_then(|p| p.as_sequence())
-            .expect("pre_invocation sequence");
-        assert_eq!(pre_invocation.len(), 1);
-        assert_eq!(
-            pre_invocation[0].as_str(),
-            Some("allow"),
-            "the explicit apl wrapper takes precedence over flat top-level keys",
+    fn a_stale_apl_wrapper_is_not_a_policy_term() {
+        let v = yaml("apl:\n  authorization:\n    pre_invocation:\n      - \"allow\"\n");
+        assert!(
+            apl_subblock(&v).is_none(),
+            "`apl:` is no longer a key the block is built from"
         );
-    }
-
-    #[test]
-    fn warn_if_global_only_key_at_nonglobal_scope_is_a_safe_noop() {
-        use super::warn_if_global_only_key_at_nonglobal_scope;
-        // The helper only emits a tracing event; it must never panic for
-        // either global-only wiring key (`pdp` / `session_store`), or for
-        // none present. (The drop semantics are exercised end-to-end; here
-        // we just guard the helper's contract.)
-        let with_pdp = yaml("pre_invocation:\n  - \"deny\"\npdp:\n  - kind: cel\n");
-        let with_session_store =
-            yaml("pre_invocation:\n  - \"deny\"\nsession_store:\n  kind: valkey\n");
-        let without = yaml("pre_invocation:\n  - \"deny\"\n");
-        warn_if_global_only_key_at_nonglobal_scope("route", &with_pdp);
-        warn_if_global_only_key_at_nonglobal_scope("routes.tool", &with_session_store);
-        warn_if_global_only_key_at_nonglobal_scope("global.defaults.tool.apl", &without);
     }
 
     #[test]
     fn unreferenced_plugin_override_is_detectable_and_lint_is_safe() {
         use super::{compile_policy_block_value, warn_unreferenced_plugin_overrides};
         // A route configures two plugins but its pre_invocation only activates one:
-        // `used` is referenced by a `plugin(...)` step, `unused` is only
+        // `used` is referenced by a `run(...)` step, `unused` is only
         // configured. The lint relies on `collect_plugin_names` seeing the
         // referenced set; verify that linkage, then that the helper runs.
         let block = yaml(
-            "pre_invocation:\n  - \"plugin(used)\"\n\
+            "authorization:\n  pre_invocation:\n    - \"run(used)\"\n\
              plugins:\n  used:\n    on_error: ignore\n  unused:\n    on_error: ignore\n",
         );
         let route = compile_policy_block_value("test", &block).expect("compiles");
@@ -1537,5 +1858,496 @@ mod tests {
 
         // Must not panic; it warns on `unused` and stays silent on `used`.
         warn_unreferenced_plugin_overrides(&route);
+    }
+
+    /// A route naming no selector has no name to annotate under, so the visitor
+    /// reports it and moves on rather than installing a handler nothing can
+    /// reach. Observed through the engine generation, which only an annotation
+    /// bumps.
+    #[test]
+    fn a_route_with_no_selector_is_skipped_rather_than_annotated() {
+        let engine = Arc::new(PolicyEngine::default());
+        let visitor = AplConfigVisitor::new(
+            Arc::new(DispatchCache::new()),
+            Arc::new(MemorySessionStore::new()),
+            Arc::downgrade(&engine),
+        );
+        let before = engine.config_generation();
+
+        visitor
+            .visit_route(
+                &engine,
+                &yaml("authorization:\n  pre_invocation:\n    - \"deny\"\n"),
+                &RouteEntry::default(),
+            )
+            .expect("a selector-less route is skipped, not a load failure");
+
+        assert_eq!(
+            engine.config_generation(),
+            before,
+            "nothing may be annotated for a route with no name"
+        );
+    }
+
+    // -- Dispatch end to end --
+    //
+    // A compiled policy body reaches a request through the annotation the
+    // visitor installed, so these drive a real engine rather than inspecting
+    // the visitor's own state. Every fixture sets
+    // `engine_settings.dispatch: policy` explicitly, which the `http:`
+    // selector requires and which is also the default.
+
+    /// A plugin that denies whatever reaches it, so a structural chain that
+    /// runs when it should not is visible as a denial with this code.
+    const CHAIN_VIOLATION: &str = "test.structural.chain.fired";
+
+    struct ChainDeny {
+        cfg: PluginConfig,
+    }
+
+    #[async_trait::async_trait]
+    impl praxis_policy_core::plugin::Plugin for ChainDeny {
+        fn config(&self) -> &PluginConfig {
+            &self.cfg
+        }
+    }
+
+    impl HookHandler<HttpHook> for ChainDeny {
+        async fn handle(
+            &self,
+            _payload: &HttpPayload,
+            _extensions: &praxis_policy_core::extensions::Extensions,
+            _ctx: &mut praxis_policy_core::context::PluginContext,
+        ) -> PluginResult<HttpPayload> {
+            PluginResult::deny(PluginViolation::new(
+                CHAIN_VIOLATION,
+                "the route's plugin chain ran",
+            ))
+        }
+    }
+
+    struct ChainDenyFactory;
+
+    impl PluginFactory for ChainDenyFactory {
+        fn create(
+            &self,
+            config: &PluginConfig,
+        ) -> Result<PluginInstance, Box<praxis_policy_core::error::PluginError>> {
+            let plugin = Arc::new(ChainDeny {
+                cfg: config.clone(),
+            });
+            let handler: Arc<dyn praxis_policy_core::registry::AnyHookHandler> =
+                Arc::new(TypedHandlerAdapter::<HttpHook, _>::new(Arc::clone(&plugin)));
+            Ok(PluginInstance {
+                plugin,
+                handlers: vec![(HOOK_HTTP_REQUEST, handler)],
+            })
+        }
+    }
+
+    /// An initialized engine with the APL visitor walked over `yaml`.
+    async fn engine_with(yaml: &str) -> Arc<PolicyEngine> {
+        let mgr = Arc::new(PolicyEngine::default());
+        mgr.register_factory("test/chain-deny", Box::new(ChainDenyFactory));
+        crate::register_apl(&mgr, crate::AplOptions::in_process());
+        mgr.load_config_yaml(yaml).expect("the fixture must load");
+        mgr.initialize().await.expect("initialize");
+        mgr
+    }
+
+    fn payload() -> MessagePayload {
+        MessagePayload {
+            message: Message::text(Role::User, "hi"),
+        }
+    }
+
+    /// A generic HTTP request as a host presents one: the reserved entity
+    /// coordinates plus the request line on its own slot.
+    fn http_request(method: &str, path: Option<&str>) -> Extensions {
+        Extensions {
+            meta: Some(Arc::new(MetaExtension {
+                entity_type: Some(ENTITY_HTTP.to_owned()),
+                entity_name: Some(ENTITY_NAME_GLOBAL.to_owned()),
+                ..Default::default()
+            })),
+            http: Some(Arc::new(HttpExtension {
+                method: Some(method.to_owned()),
+                path: path.map(str::to_owned),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn tool_request(name: &str) -> Extensions {
+        Extensions {
+            meta: Some(Arc::new(MetaExtension {
+                entity_type: Some(ENTITY_TOOL.to_owned()),
+                entity_name: Some(name.to_owned()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// Two `http:` routes, one carrying a body and one carrying nothing.
+    const HTTP_ROUTE_BODIES: &str = r#"
+engine_settings:
+  dispatch: policy
+routes:
+  - http:
+      path_prefix: /v1/files
+    authorization:
+      pre_invocation:
+        - "http.method == 'DELETE': deny"
+  - http: /healthz
+"#;
+
+    #[tokio::test]
+    async fn an_http_prefix_route_evaluates_its_policy_body() {
+        let mgr = engine_with(HTTP_ROUTE_BODIES).await;
+
+        let (denied, _bg) = mgr
+            .invoke_named::<HttpHook>(
+                HOOK_HTTP_REQUEST,
+                HttpPayload,
+                http_request("DELETE", Some("/v1/files/q3.pdf")),
+                None,
+            )
+            .await;
+        assert!(
+            !denied.continue_processing,
+            "the route's body must evaluate for a path its prefix matches"
+        );
+
+        let (allowed, _bg) = mgr
+            .invoke_named::<HttpHook>(
+                HOOK_HTTP_REQUEST,
+                HttpPayload,
+                http_request("GET", Some("/v1/files/q3.pdf")),
+                None,
+            )
+            .await;
+        assert!(
+            allowed.continue_processing,
+            "the body allows a GET; violation = {:?}",
+            allowed.violation
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exact_http_route_with_no_body_inherits_nothing() {
+        let mgr = engine_with(HTTP_ROUTE_BODIES).await;
+
+        let (result, _bg) = mgr
+            .invoke_named::<HttpHook>(
+                HOOK_HTTP_REQUEST,
+                HttpPayload,
+                http_request("DELETE", Some("/healthz")),
+                None,
+            )
+            .await;
+        assert!(
+            result.continue_processing,
+            "the exact route resolved and carries nothing, so the sibling \
+             route's body must not reach it; violation = {:?}",
+            result.violation
+        );
+    }
+
+    /// A declared plugin no route names. Under policy dispatch this no longer
+    /// loads at all, which is a stronger guarantee than the request-time one it
+    /// used to carry: nothing has to run for the gap to be reported.
+    const HTTP_ROUTE_WITHOUT_A_STEP: &str = "
+engine_settings:
+  dispatch: policy
+plugins:
+  - name: chain-deny
+    kind: test/chain-deny
+    hooks: [http.request]
+    mode: sequential
+routes:
+  - http:
+      path_prefix: /v1/files
+";
+
+    /// The same plugin, invoked by the route's own policy body.
+    const HTTP_ROUTE_WITH_A_RUN_STEP: &str = r#"
+engine_settings:
+  dispatch: policy
+plugins:
+  - name: chain-deny
+    kind: test/chain-deny
+    hooks: [http.request]
+    mode: sequential
+routes:
+  - http:
+      path_prefix: /v1/files
+    authorization:
+      pre_invocation:
+        - "run(chain-deny)"
+"#;
+
+    /// A declared plugin runs because a policy step names it, and a config where
+    /// nothing names it does not load.
+    ///
+    /// The unreached half used to be asserted at request time, by observing that
+    /// a deny-always plugin let the request through. It is a load error now, so
+    /// the assertion moved to the load: an operator finds the gap without
+    /// serving a request against it first.
+    #[tokio::test]
+    async fn a_route_reaches_a_plugin_only_through_a_run_step() {
+        let mgr = Arc::new(PolicyEngine::default());
+        mgr.register_factory("test/chain-deny", Box::new(ChainDenyFactory));
+        crate::register_apl(&mgr, crate::AplOptions::in_process());
+        let message = mgr
+            .load_config_yaml(HTTP_ROUTE_WITHOUT_A_STEP)
+            .expect_err("no step names the plugin, so the config cannot dispatch it")
+            .to_string();
+        assert!(
+            message.contains("chain-deny"),
+            "the load error must name the plugin nothing reaches: {message}"
+        );
+
+        let with = engine_with(HTTP_ROUTE_WITH_A_RUN_STEP).await;
+        let (denied, _bg) = with
+            .invoke_named::<HttpHook>(
+                HOOK_HTTP_REQUEST,
+                HttpPayload,
+                http_request("GET", Some("/v1/files/q3.pdf")),
+                None,
+            )
+            .await;
+        let violation = denied.violation.expect("the step's plugin denies");
+        assert_eq!(
+            violation.code, CHAIN_VIOLATION,
+            "a `run(name)` step is what activates a plugin in policy mode"
+        );
+    }
+
+    /// A glob route under one of the four MCP selectors. The annotation is
+    /// installed under the pattern as written, and the lookup is exact
+    /// equality, so a request named by a glob never reaches the body.
+    const GLOB_TOOL_ROUTE: &str = r#"
+engine_settings:
+  dispatch: policy
+routes:
+  - tool: "hr-*"
+    authorization:
+      pre_invocation:
+        - "deny"
+"#;
+
+    #[tokio::test]
+    async fn a_glob_tool_route_still_does_not_evaluate_its_policy_body() {
+        let mgr = engine_with(GLOB_TOOL_ROUTE).await;
+
+        let (allowed, _bg) = mgr
+            .invoke_named::<CmfHook>(
+                HOOK_CMF_TOOL_PRE_INVOKE,
+                payload(),
+                tool_request("hr-lookup"),
+                None,
+            )
+            .await;
+        assert!(
+            allowed.continue_processing,
+            "a name the glob matches does not equal the pattern the handler is \
+             installed under, so the body does not evaluate; violation = {:?}",
+            allowed.violation
+        );
+
+        // The handler exists and its body denies, so the line above is the
+        // lookup and not a missing installation.
+        let (denied, _bg) = mgr
+            .invoke_named::<CmfHook>(
+                HOOK_CMF_TOOL_PRE_INVOKE,
+                payload(),
+                tool_request("hr-*"),
+                None,
+            )
+            .await;
+        assert!(
+            !denied.continue_processing,
+            "the body is installed under the pattern as written"
+        );
+    }
+
+    /// A list selector contributes one name per element.
+    const LIST_TOOL_ROUTE: &str = r#"
+engine_settings:
+  dispatch: policy
+routes:
+  - tool: [alpha, beta]
+    authorization:
+      pre_invocation:
+        - "deny"
+"#;
+
+    #[tokio::test]
+    async fn a_list_tool_route_dispatches_for_every_element() {
+        let mgr = engine_with(LIST_TOOL_ROUTE).await;
+
+        for name in ["alpha", "beta"] {
+            let (denied, _bg) = mgr
+                .invoke_named::<CmfHook>(
+                    HOOK_CMF_TOOL_PRE_INVOKE,
+                    payload(),
+                    tool_request(name),
+                    None,
+                )
+                .await;
+            assert!(
+                !denied.continue_processing,
+                "{name} is one of the names the list contributes"
+            );
+        }
+
+        let (allowed, _bg) = mgr
+            .invoke_named::<CmfHook>(
+                HOOK_CMF_TOOL_PRE_INVOKE,
+                payload(),
+                tool_request("gamma"),
+                None,
+            )
+            .await;
+        assert!(
+            allowed.continue_processing,
+            "a name the list does not contain reaches no handler; violation = {:?}",
+            allowed.violation
+        );
+    }
+
+    /// One `http:` route declaring both halves.
+    const HTTP_ROUTE_BOTH_HALVES: &str = r#"
+engine_settings:
+  dispatch: policy
+routes:
+  - http:
+      path_prefix: /v1/files
+    authorization:
+      pre_invocation:
+        - "http.method == 'DELETE': deny"
+      post_invocation:
+        - "http.method == 'TRACE': deny"
+"#;
+
+    #[tokio::test]
+    async fn both_http_halves_resolve_the_same_route() {
+        let mgr = engine_with(HTTP_ROUTE_BOTH_HALVES).await;
+        assert!(
+            mgr.has_hooks_for(HOOK_HTTP_REQUEST) && mgr.has_hooks_for(HOOK_HTTP_RESPONSE),
+            "a route declaring both halves installs both"
+        );
+
+        let (denied_in, _bg) = mgr
+            .invoke_named::<HttpHook>(
+                HOOK_HTTP_REQUEST,
+                HttpPayload,
+                http_request("DELETE", Some("/v1/files/q3.pdf")),
+                None,
+            )
+            .await;
+        assert!(!denied_in.continue_processing, "the request half enforces");
+
+        let (denied_out, _bg) = mgr
+            .invoke_named::<HttpHook>(
+                HOOK_HTTP_RESPONSE,
+                HttpPayload,
+                http_request("TRACE", Some("/v1/files/q3.pdf")),
+                None,
+            )
+            .await;
+        assert!(
+            !denied_out.continue_processing,
+            "the response half resolves the same route given the request line"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_response_invocation_without_the_request_line_behaves_as_before() {
+        let mgr = engine_with(HTTP_ROUTE_BOTH_HALVES).await;
+
+        let (result, _bg) = mgr
+            .invoke_named::<HttpHook>(
+                HOOK_HTTP_RESPONSE,
+                HttpPayload,
+                http_request("TRACE", None),
+                None,
+            )
+            .await;
+        assert!(
+            result.continue_processing,
+            "with no request line nothing resolves and the global policy \
+             governs, which is what a host that never set it gets today; \
+             violation = {:?}",
+            result.violation
+        );
+    }
+
+    /// A global HTTP policy alongside an explicit catch-all route. The two
+    /// occupy different annotation keys, and each rule below belongs to only
+    /// one of them.
+    const GLOBAL_PLUS_CATCHALL_ROUTE: &str = r#"
+engine_settings:
+  dispatch: policy
+global:
+  authorization:
+    pre_invocation:
+      - "http.method == 'PATCH': deny"
+routes:
+  - http:
+      path_prefix: /
+    authorization:
+      pre_invocation:
+        - "http.method == 'DELETE': deny"
+"#;
+
+    #[tokio::test]
+    async fn an_explicit_catchall_route_and_the_global_policy_both_survive() {
+        let mgr = engine_with(GLOBAL_PLUS_CATCHALL_ROUTE).await;
+
+        let (denied, _bg) = mgr
+            .invoke_named::<HttpHook>(
+                HOOK_HTTP_REQUEST,
+                HttpPayload,
+                http_request("DELETE", Some("/anything/at/all")),
+                None,
+            )
+            .await;
+        assert!(
+            !denied.continue_processing,
+            "the route governs every path it resolves"
+        );
+
+        // Nothing resolves without a request line, which is where the
+        // implicit install under the reserved name applies. Its own rule
+        // still fires there, so the route did not replace its handler.
+        let (denied_global, _bg) = mgr
+            .invoke_named::<HttpHook>(
+                HOOK_HTTP_REQUEST,
+                HttpPayload,
+                http_request("PATCH", None),
+                None,
+            )
+            .await;
+        assert!(
+            !denied_global.continue_processing,
+            "the implicit catch-all still governs what resolves nothing"
+        );
+
+        let (allowed, _bg) = mgr
+            .invoke_named::<HttpHook>(
+                HOOK_HTTP_REQUEST,
+                HttpPayload,
+                http_request("DELETE", None),
+                None,
+            )
+            .await;
+        assert!(
+            allowed.continue_processing,
+            "the route's rule is the route's alone; violation = {:?}",
+            allowed.violation
+        );
     }
 }

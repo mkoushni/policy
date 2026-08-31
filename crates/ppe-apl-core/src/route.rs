@@ -14,7 +14,7 @@
 //   - args: walk field rules; Replace/Omit mutate `payload.args`; Deny halts
 //   - policy: walk steps; Deny halts
 //   - result: only runs if `payload.result.is_some()`; same as args
-//   - post_policy: walks steps; the spec leaves room for "observed only"
+//   - post_invocation: walks steps; the spec leaves room for "observed only"
 //     handling, but praxis-policy-apl-core surfaces the deny — the host (praxis-policy-apl-runtime) chooses
 //     whether to enforce it
 //
@@ -88,10 +88,10 @@ pub struct RouteDecision {
     pub pending: Option<crate::step::PendingElicitation>,
 }
 
-/// Run the **pre-invocation** phases: `args` then `policy`. Used by
+/// Run the **pre-invocation** phases: `args` then `pre_invocation`. Used by
 /// orchestrators bound to a pre-invocation hook — by the time
 /// post-invoke fires, the tool has produced a response, so result/
-/// `post_policy` belong to [`evaluate_post`].
+/// `post_invocation` belong to [`evaluate_post`].
 ///
 /// On a phase Deny, halts and returns immediately. `args_modified` is
 /// set if any args field was rewritten or omitted; `result_modified` is
@@ -155,7 +155,7 @@ pub async fn evaluate_pre(
     }
 
     let policy_eval = evaluate_effects(
-        &route.policy,
+        &route.pre_invocation,
         bag,
         pdp,
         plugins,
@@ -180,7 +180,7 @@ pub async fn evaluate_pre(
 }
 
 /// Run the **post-invocation** phases: `result` (if a response payload
-/// is present) then `post_policy`. Used by orchestrators bound to a
+/// is present) then `post_invocation`. Used by orchestrators bound to a
 /// post-invocation hook.
 ///
 /// On a phase Deny, halts. `result_modified` is set if any result field
@@ -232,7 +232,7 @@ pub async fn evaluate_post(
                             rule_source: rule.source.clone(),
                         },
                         taints,
-                        // `restrict` fires in post_policy (below); a
+                        // `restrict` fires in post_invocation (below); a
                         // result-pipeline deny short-circuits before it.
                         constraints: Vec::new(),
                         args_modified: false,
@@ -245,7 +245,7 @@ pub async fn evaluate_post(
     }
 
     let post_eval = evaluate_effects(
-        &route.post_policy,
+        &route.post_invocation,
         bag,
         pdp,
         plugins,
@@ -256,7 +256,7 @@ pub async fn evaluate_post(
     )
     .await;
     // Same reason as the policy phase: a `do:`-embedded FieldOp may
-    // have rewritten result fields during post_policy.
+    // have rewritten result fields during post_invocation.
     result_modified |= post_eval.result_modified;
     taints.extend(post_eval.taints);
 
@@ -530,18 +530,20 @@ mod tests {
         // decision Allow + pending Some, and the `result:` phase (which
         // would mutate the response) must NOT run.
         let mut route = CompiledRoute::new("payroll");
-        route.policy.push(Effect::Elicit(crate::step::ElicitStep {
-            kind: crate::step::ElicitKind::Approval,
-            plugin_name: "manager-approver".into(),
-            channel: Some("ciba".into()),
-            from: "user.manager".into(),
-            purpose: None,
-            scope: None,
-            timeout: None,
-            config_override: None,
-            on_error: None,
-            source: "payroll.policy[0]".into(),
-        }));
+        route
+            .pre_invocation
+            .push(Effect::Elicit(crate::step::ElicitStep {
+                kind: crate::step::ElicitKind::Approval,
+                plugin_name: "manager-approver".into(),
+                channel: Some("ciba".into()),
+                from: "user.manager".into(),
+                purpose: None,
+                scope: None,
+                timeout: None,
+                config_override: None,
+                on_error: None,
+                source: "payroll.policy[0]".into(),
+            }));
         // A result rule that WOULD mask — proves post didn't run if untouched.
         route
             .result
@@ -616,7 +618,7 @@ mod tests {
         // (args deny short-circuits). If reached, source would be "policy[0]"
         // instead of the args rule's source.
         route
-            .policy
+            .pre_invocation
             .push(Effect::from(deny_rule("policy[0]", "policy denied too")));
 
         let mut bag = AttributeBag::new();
@@ -693,7 +695,7 @@ mod tests {
     async fn policy_deny_halts_before_result() {
         let mut route = CompiledRoute::new("ping");
         route
-            .policy
+            .pre_invocation
             .push(Effect::from(deny_rule("policy[0]", "blocked")));
         // Result rule should never run.
         route
@@ -858,15 +860,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_policy_runs_after_result() {
+    async fn post_invocation_runs_after_result() {
         let mut route = CompiledRoute::new("ping");
-        // Result mutates a field, then post_policy denies.
+        // Result mutates a field, then post_invocation denies.
         route
             .result
             .push(field_rule("ssn", vec![Stage::Redact { condition: None }]));
-        route
-            .post_policy
-            .push(Effect::from(deny_rule("post_policy[0]", "after-the-fact")));
+        route.post_invocation.push(Effect::from(deny_rule(
+            "post_invocation[0]",
+            "after-the-fact",
+        )));
 
         let mut bag = AttributeBag::new();
         let mut payload = RoutePayload::with_result(json!({}), json!({ "ssn": "123" }));
@@ -881,10 +884,10 @@ mod tests {
         )
         .await;
         match r.decision {
-            Decision::Deny { rule_source, .. } => assert_eq!(rule_source, "post_policy[0]"),
-            d => panic!("expected post_policy deny, got {d:?}"),
+            Decision::Deny { rule_source, .. } => assert_eq!(rule_source, "post_invocation[0]"),
+            d => panic!("expected post_invocation deny, got {d:?}"),
         }
-        // Result was still mutated before the post_policy deny fired.
+        // Result was still mutated before the post_invocation deny fired.
         assert!(r.result_modified);
         assert_eq!(payload.result.as_ref().unwrap()["ssn"], json!("[REDACTED]"));
     }
@@ -963,9 +966,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evaluate_post_runs_result_and_post_policy_only() {
+    async fn evaluate_post_runs_result_and_post_invocation_only() {
         // Route with args + result. evaluate_post skips args entirely
-        // (no mutation), runs result + post_policy.
+        // (no mutation), runs result + post_invocation.
         let mut route = CompiledRoute::new("test");
         route
             .args
@@ -1004,7 +1007,7 @@ mod tests {
             .args
             .push(field_rule("id", vec![Stage::Type(TypeCheck::Uuid)]));
         // Policy that would always deny if it ran — assert it doesn't.
-        route.policy.push(Effect::from(Rule::single(
+        route.pre_invocation.push(Effect::from(Rule::single(
             Expression::Always,
             Effect::Deny {
                 reason: Some("policy_should_not_run".into()),
@@ -1041,7 +1044,7 @@ mod tests {
         // Wrapper preserves "deny halts before post" — proves the
         // refactor didn't regress evaluate_route's semantics.
         let mut route = CompiledRoute::new("test");
-        route.policy.push(Effect::from(Rule::single(
+        route.pre_invocation.push(Effect::from(Rule::single(
             Expression::Always,
             Effect::Deny {
                 reason: Some("policy_deny".into()),
@@ -1052,7 +1055,7 @@ mod tests {
         route
             .result
             .push(field_rule("ssn", vec![Stage::Redact { condition: None }]));
-        route.post_policy.push(Effect::Taint {
+        route.post_invocation.push(Effect::Taint {
             label: "should_not_emit".into(),
             scopes: vec![TaintScope::Session],
         });
@@ -1071,7 +1074,7 @@ mod tests {
         .await;
         assert!(matches!(r.decision, Decision::Deny { .. }));
         assert!(!r.result_modified, "post must be skipped on pre-side Deny");
-        // post_policy never ran, so its taint never landed.
+        // post_invocation never ran, so its taint never landed.
         assert!(r.taints.is_empty());
         // Result untouched.
         assert_eq!(

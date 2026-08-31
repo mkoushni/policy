@@ -83,7 +83,7 @@ pub trait SessionStore: Send + Sync {
 }
 
 /// Factory the visitor consults when it encounters a
-/// `global.apl.session_store` block in the unified config. Mirrors
+/// `global.session_store` block in the unified config. Mirrors
 /// [`praxis_policy_apl_core::step::PdpFactory`]: each factory advertises a `kind()`
 /// string matching the YAML block's `kind:` field, and `build` turns the
 /// block into a live store. Registered up front via
@@ -99,7 +99,7 @@ pub trait SessionStoreFactory: Send + Sync {
     fn kind(&self) -> &str;
 
     /// Build a store from its config block. The whole
-    /// `global.apl.session_store` mapping is passed so the factory can
+    /// `global.session_store` mapping is passed so the factory can
     /// read its own keys (endpoint, TLS, auth, prefix, TTL, …).
     /// # Errors
     ///

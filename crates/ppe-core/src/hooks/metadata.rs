@@ -36,6 +36,10 @@
 //
 // Each entry maps a hook name to `HookMetadata`:
 //
+//   * `family` — the hook type whose payload the name carries
+//     (`Some("cmf")`, `Some("http")`), taken from the type itself so
+//     the row cannot drift from it. Registration refuses a handler
+//     built for another family; `None` accepts any.
 //   * `entity_type` — `Some("tool")`, `Some("llm")`, etc. for hooks
 //     tied to an entity type; `None` for hook families that apply
 //     regardless of entity (`identity.resolve`, `token.delegate`).
@@ -54,10 +58,14 @@
 //   * `result:` field stage   → looks for `Post` hooks
 //   * `post_invocation:` step      → looks for `Post` hooks
 //
-// A plugin that wants to discriminate "args field stage" from
-// "pre_invocation step" — both Pre context — inspects `PluginContext::hook_name()`
-// itself. The hook-routing layer doesn't slice phase finer than
-// Pre/Post.
+// The hook-routing layer doesn't slice phase finer than Pre/Post, and
+// `PluginContext` carries no hook name, so a plugin cannot tell an "args
+// field stage" from a "pre_invocation step" from inside the handler. What
+// it can read is the payload and the extensions it was handed: a field
+// stage and a step both pass the whole payload, and a family serving two
+// names distinguishes them by what the host populated (the HTTP family by
+// `HttpExtension::status`, set on the response invocation only). A plugin
+// that needs the distinction registers for one hook name per behavior.
 //
 // # Custom hook metadata
 //
@@ -75,6 +83,7 @@ use std::sync::{OnceLock, RwLock};
 use crate::cmf::constants::CMF_HOOK_METADATA;
 use crate::delegation::hook::DELEGATION_HOOK_METADATA;
 use crate::elicitation::hook::ELICITATION_HOOK_METADATA;
+use crate::http_hook::HTTP_HOOK_METADATA;
 use crate::identity::hook::IDENTITY_HOOK_METADATA;
 
 /// Lifecycle position a hook occupies for dispatcher purposes.
@@ -107,6 +116,15 @@ pub enum HookPhase {
 /// See module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HookMetadata {
+    /// Hook family whose payload this name carries, as a handler reports
+    /// it from [`hook_type_name`][hook_type_name]. `register_for_names`
+    /// and `register_multi_handler` refuse a handler from another family,
+    /// which is what stops a plugin registering on a hook whose payload it
+    /// cannot read. `None` accepts any family: the hook registry is open,
+    /// so a host declaring its own hooks need not name a type.
+    ///
+    /// [hook_type_name]: crate::registry::AnyHookHandler::hook_type_name
+    pub family: Option<&'static str>,
     /// Entity type the hook applies to (`"tool"`, `"llm"`, `"prompt"`,
     /// `"resource"`). `None` means "applies regardless of `entity_type`"
     /// — used for hooks that don't tie to MCP's entity-type taxonomy.
@@ -116,14 +134,16 @@ pub struct HookMetadata {
 }
 
 impl HookMetadata {
-    /// The wildcard default, `entity_type: None` and `phase: Unphased`.
-    /// [`matches`][Self::matches] treats `Unphased` as "matches any
-    /// phase", so a caller substituting this for an absent registry
-    /// entry lets the hook dispatch on the first registered entry.
+    /// The wildcard default: `family: None`, `entity_type: None` and
+    /// `phase: Unphased`. [`matches`][Self::matches] treats `Unphased` as
+    /// "matches any phase", so a caller substituting this for an absent
+    /// registry entry lets the hook dispatch on the first registered entry,
+    /// and `family: None` lets a handler of any family register for it.
     /// Deliberate, not the result of a failed lookup: `lookup` returns
     /// `None` and the caller chooses this.
     pub const fn permissive() -> Self {
         Self {
+            family: None,
             entity_type: None,
             phase: HookPhase::Unphased,
         }
@@ -166,6 +186,7 @@ impl HookMetadata {
 /// unregistered at once rather than one of them quietly.
 const HOOK_TABLES: &[&[(&str, HookMetadata)]] = &[
     CMF_HOOK_METADATA,
+    HTTP_HOOK_METADATA,
     IDENTITY_HOOK_METADATA,
     DELEGATION_HOOK_METADATA,
     ELICITATION_HOOK_METADATA,
@@ -281,13 +302,15 @@ pub fn register_hook_metadata(hook_name: impl Into<String>, meta: HookMetadata) 
 )]
 mod tests {
     use super::*;
+    use crate::cmf::CmfHook;
     use crate::cmf::constants::{
-        ENTITY_LLM, ENTITY_TOOL, HOOK_CMF_HTTP_REQUEST, HOOK_CMF_HTTP_RESPONSE,
-        HOOK_CMF_LLM_OUTPUT, HOOK_CMF_TOOL_PRE_INVOKE,
+        ENTITY_HTTP, ENTITY_LLM, ENTITY_TOOL, HOOK_CMF_LLM_OUTPUT, HOOK_CMF_TOOL_PRE_INVOKE,
     };
-    use crate::delegation::HOOK_TOKEN_DELEGATE;
-    use crate::elicitation::HOOK_ELICIT;
-    use crate::identity::HOOK_IDENTITY_RESOLVE;
+    use crate::delegation::{HOOK_TOKEN_DELEGATE, TokenDelegateHook};
+    use crate::elicitation::{ElicitationHook, HOOK_ELICIT};
+    use crate::hooks::trait_def::HookTypeDef as _;
+    use crate::http_hook::{HOOK_HTTP_REQUEST, HOOK_HTTP_RESPONSE, HttpHook};
+    use crate::identity::{HOOK_IDENTITY_RESOLVE, IdentityHook};
 
     #[test]
     fn cmf_tool_pre_invoke_is_pre_phase_for_tool_entity() {
@@ -352,6 +375,7 @@ mod tests {
     #[test]
     fn matches_filters_by_entity_type_when_set() {
         let tool_pre = HookMetadata {
+            family: None,
             entity_type: Some(ENTITY_TOOL),
             phase: HookPhase::Pre,
         };
@@ -362,6 +386,7 @@ mod tests {
     #[test]
     fn matches_allows_any_entity_when_hook_entity_is_none() {
         let universal = HookMetadata {
+            family: None,
             entity_type: None,
             phase: HookPhase::Pre,
         };
@@ -373,6 +398,7 @@ mod tests {
     #[test]
     fn matches_phase_exactly_unless_unphased() {
         let tool_pre = HookMetadata {
+            family: None,
             entity_type: Some(ENTITY_TOOL),
             phase: HookPhase::Pre,
         };
@@ -383,6 +409,7 @@ mod tests {
     #[test]
     fn matches_unphased_is_wildcard_in_either_direction() {
         let unphased = HookMetadata {
+            family: None,
             entity_type: None,
             phase: HookPhase::Unphased,
         };
@@ -390,6 +417,7 @@ mod tests {
         assert!(unphased.matches(Some(ENTITY_LLM), HookPhase::Post));
 
         let tool_pre = HookMetadata {
+            family: None,
             entity_type: Some(ENTITY_TOOL),
             phase: HookPhase::Pre,
         };
@@ -401,6 +429,7 @@ mod tests {
     #[test]
     fn matches_request_without_entity_type_doesnt_filter_on_it() {
         let tool_pre = HookMetadata {
+            family: None,
             entity_type: Some(ENTITY_TOOL),
             phase: HookPhase::Pre,
         };
@@ -409,16 +438,16 @@ mod tests {
     }
 
     #[test]
-    fn cmf_http_request_is_pre_phase_for_http_entity() {
-        let meta = lookup(HOOK_CMF_HTTP_REQUEST).expect("registered");
-        assert_eq!(meta.entity_type, Some(crate::cmf::constants::ENTITY_HTTP));
+    fn http_request_is_pre_phase_for_http_entity() {
+        let meta = lookup(HOOK_HTTP_REQUEST).expect("registered");
+        assert_eq!(meta.entity_type, Some(ENTITY_HTTP));
         assert_eq!(meta.phase, HookPhase::Pre);
     }
 
     #[test]
-    fn cmf_http_response_is_post_phase_for_http_entity() {
-        let meta = lookup(HOOK_CMF_HTTP_RESPONSE).expect("registered");
-        assert_eq!(meta.entity_type, Some(crate::cmf::constants::ENTITY_HTTP));
+    fn http_response_is_post_phase_for_http_entity() {
+        let meta = lookup(HOOK_HTTP_RESPONSE).expect("registered");
+        assert_eq!(meta.entity_type, Some(ENTITY_HTTP));
         assert_eq!(meta.phase, HookPhase::Post);
     }
 
@@ -431,15 +460,15 @@ mod tests {
 
     #[test]
     fn http_hooks_match_entity_typed_dispatch_as_before() {
-        let request = lookup(HOOK_CMF_HTTP_REQUEST).expect("registered");
-        let response = lookup(HOOK_CMF_HTTP_RESPONSE).expect("registered");
+        let request = lookup(HOOK_HTTP_REQUEST).expect("registered");
+        let response = lookup(HOOK_HTTP_RESPONSE).expect("registered");
         // The visitor installs both under ENTITY_HTTP, so entity-typed
         // dispatch has to keep matching and the other entities must not.
-        assert!(request.matches(Some(crate::cmf::constants::ENTITY_HTTP), HookPhase::Pre));
-        assert!(!request.matches(Some(crate::cmf::constants::ENTITY_HTTP), HookPhase::Post));
+        assert!(request.matches(Some(ENTITY_HTTP), HookPhase::Pre));
+        assert!(!request.matches(Some(ENTITY_HTTP), HookPhase::Post));
         assert!(!request.matches(Some(ENTITY_TOOL), HookPhase::Pre));
-        assert!(response.matches(Some(crate::cmf::constants::ENTITY_HTTP), HookPhase::Post));
-        assert!(!response.matches(Some(crate::cmf::constants::ENTITY_HTTP), HookPhase::Pre));
+        assert!(response.matches(Some(ENTITY_HTTP), HookPhase::Post));
+        assert!(!response.matches(Some(ENTITY_HTTP), HookPhase::Pre));
     }
 
     #[test]
@@ -448,7 +477,8 @@ mod tests {
         // invocations as the constants, so completeness is structural.
         // What this guards is the one gap that leaves: a module table
         // dropped from HOOK_TABLES, which unregisters every hook it owns.
-        assert_eq!(CMF_HOOK_METADATA.len(), 10);
+        assert_eq!(CMF_HOOK_METADATA.len(), 8);
+        assert_eq!(HTTP_HOOK_METADATA.len(), 2);
         assert_eq!(IDENTITY_HOOK_METADATA.len(), 1);
         assert_eq!(DELEGATION_HOOK_METADATA.len(), 1);
         assert_eq!(ELICITATION_HOOK_METADATA.len(), 1);
@@ -460,6 +490,30 @@ mod tests {
                     "{name} is declared but missing from the concatenated table",
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_old_cmf_prefixed_http_names_are_gone() {
+        // The HTTP hooks carry no CMF payload, so the `cmf.` prefix named
+        // the wrong family. A config still spelling the old name has to
+        // fail the registry lookup rather than resolve to anything.
+        for gone in ["cmf.http_request", "cmf.http_response"] {
+            assert_eq!(lookup(gone), None, "{gone} still resolves");
+        }
+    }
+
+    #[test]
+    fn the_cmf_table_holds_no_http_row() {
+        // The rows moved to the HTTP family's own table, so the CMF table
+        // must name only CMF hooks and the HTTP table only HTTP ones.
+        for (name, meta) in CMF_HOOK_METADATA {
+            assert_ne!(meta.entity_type, Some(ENTITY_HTTP), "{name}");
+            assert!(name.starts_with("cmf."), "{name}");
+        }
+        for (name, meta) in HTTP_HOOK_METADATA {
+            assert_eq!(meta.entity_type, Some(ENTITY_HTTP), "{name}");
+            assert!(name.starts_with("http."), "{name}");
         }
     }
 
@@ -481,12 +535,13 @@ mod tests {
         // which the table cannot express. Rewriting the declarations as a
         // macro must not move any of them.
         use crate::cmf::constants::{
-            HOOK_CMF_HTTP_REQUEST, HOOK_CMF_HTTP_RESPONSE, HOOK_CMF_LLM_INPUT, HOOK_CMF_LLM_OUTPUT,
-            HOOK_CMF_PROMPT_POST_INVOKE, HOOK_CMF_PROMPT_PRE_INVOKE, HOOK_CMF_RESOURCE_POST_FETCH,
-            HOOK_CMF_RESOURCE_PRE_FETCH, HOOK_CMF_TOOL_POST_INVOKE, HOOK_CMF_TOOL_PRE_INVOKE,
+            HOOK_CMF_LLM_INPUT, HOOK_CMF_LLM_OUTPUT, HOOK_CMF_PROMPT_POST_INVOKE,
+            HOOK_CMF_PROMPT_PRE_INVOKE, HOOK_CMF_RESOURCE_POST_FETCH, HOOK_CMF_RESOURCE_PRE_FETCH,
+            HOOK_CMF_TOOL_POST_INVOKE, HOOK_CMF_TOOL_PRE_INVOKE,
         };
         use crate::delegation::HOOK_TOKEN_DELEGATE;
         use crate::elicitation::HOOK_ELICIT;
+        use crate::http_hook::{HOOK_HTTP_REQUEST, HOOK_HTTP_RESPONSE};
         use crate::identity::HOOK_IDENTITY_RESOLVE;
 
         for name in [
@@ -498,8 +553,8 @@ mod tests {
             HOOK_CMF_PROMPT_POST_INVOKE,
             HOOK_CMF_RESOURCE_PRE_FETCH,
             HOOK_CMF_RESOURCE_POST_FETCH,
-            HOOK_CMF_HTTP_REQUEST,
-            HOOK_CMF_HTTP_RESPONSE,
+            HOOK_HTTP_REQUEST,
+            HOOK_HTTP_RESPONSE,
             HOOK_IDENTITY_RESOLVE,
             HOOK_TOKEN_DELEGATE,
             HOOK_ELICIT,
@@ -512,11 +567,38 @@ mod tests {
     }
 
     #[test]
+    fn every_builtin_row_names_the_family_its_hooks_carry() {
+        // The row reads the name off the hook type, so it cannot name a
+        // family the type does not have. What is still possible is a row
+        // left without one, which would accept a handler of any family.
+        for (table, family) in [
+            (CMF_HOOK_METADATA, CmfHook::NAME),
+            (HTTP_HOOK_METADATA, HttpHook::NAME),
+            (IDENTITY_HOOK_METADATA, IdentityHook::NAME),
+            (DELEGATION_HOOK_METADATA, TokenDelegateHook::NAME),
+            (ELICITATION_HOOK_METADATA, ElicitationHook::NAME),
+        ] {
+            for (name, meta) in table {
+                assert_eq!(meta.family, Some(family), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn permissive_metadata_names_no_family() {
+        // `None` is what keeps the open registry open: a host restoring
+        // permissive behavior for a hook must not start failing the
+        // registrations that behavior used to accept.
+        assert_eq!(HookMetadata::permissive().family, None);
+    }
+
+    #[test]
     fn register_hook_metadata_overrides_default() {
         let name = "test_custom.overridden_meta";
         register_hook_metadata(
             name,
             HookMetadata {
+                family: None,
                 entity_type: Some("custom"),
                 phase: HookPhase::Pre,
             },

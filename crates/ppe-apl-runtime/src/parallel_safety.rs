@@ -83,8 +83,8 @@ pub fn validate_parallel_plugin_modes<L: PluginModeLookup + ?Sized>(
 ) -> Result<(), String> {
     let mut errors: Vec<String> = Vec::new();
     for (phase_name, effects) in [
-        ("pre_invocation", route.policy.as_slice()),
-        ("post_invocation", route.post_policy.as_slice()),
+        ("pre_invocation", route.pre_invocation.as_slice()),
+        ("post_invocation", route.post_invocation.as_slice()),
     ] {
         for (idx, effect) in effects.iter().enumerate() {
             walk_effect(
@@ -226,7 +226,7 @@ mod tests {
 
     fn route_with_policy(effects: Vec<Effect>) -> CompiledRoute {
         let mut r = CompiledRoute::new("test_route");
-        r.policy = effects;
+        r.pre_invocation = effects;
         r
     }
 
@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn nested_sequential_inside_parallel_still_validates_plugins() {
-        // `parallel: [sequential: [plugin(seq_mode)]]` — the sequential
+        // `parallel: [sequential: [run(seq_mode)]]` — the sequential
         // is just a grouping construct; the plugin still runs inside
         // the parallel branch's cloned state.
         let reg = MockLookup::new().with("mutator", PluginMode::Sequential);
@@ -333,10 +333,10 @@ mod tests {
     }
 
     #[test]
-    fn post_policy_phase_is_validated_too() {
+    fn post_invocation_phase_is_validated_too() {
         let reg = MockLookup::new().with("mutator", PluginMode::Sequential);
         let mut route = CompiledRoute::new("test_route");
-        route.post_policy = vec![rule(vec![parallel_plugin("mutator")])];
+        route.post_invocation = vec![rule(vec![parallel_plugin("mutator")])];
         let err = validate_parallel_plugin_modes(&route, &reg).unwrap_err();
         assert!(err.contains("post_invocation"));
     }

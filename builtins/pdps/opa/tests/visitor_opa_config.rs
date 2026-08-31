@@ -3,7 +3,7 @@
 
 // End-to-end integration: a unified-config YAML that
 //
-//   1. declares an `opa` PDP under `global.apl.pdp[]` with Rego module(s),
+//   1. declares an `opa` PDP under `global.pdp[]` with Rego module(s),
 //   2. attaches an `opa: { query: "..." }` policy step to a route,
 //
 // must flow a real decision from the praxis-policy-core dispatcher through
@@ -43,18 +43,19 @@ use praxis_policy_pdp_opa::OpaPdpFactory;
 // the cmf BagBuilder lifts from the SecurityExtension exposes `subject.id`,
 // which the policy reads as `input.subject.id`.
 const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 global:
-  apl:
-    pdp:
-      - kind: opa
-        modules:
-          - |
-            package authz
-            default allow := false
-            allow if input.subject.id == "alice"
+  pdp:
+    - kind: opa
+      modules:
+        - |
+          package authz
+          default allow := false
+          allow if input.subject.id == "alice"
 routes:
   - tool: get_document
-    apl:
+    authorization:
       pre_invocation:
         - opa:
             query: data.authz.allow
@@ -178,16 +179,17 @@ async fn config_declared_opa_pdp_denies_non_matching_subject() {
 #[tokio::test]
 async fn malformed_on_error_is_rejected_at_load() {
     const BAD_YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 global:
-  apl:
-    pdp:
-      - kind: opa
-        on_error: maybe
-        modules:
-          - "package authz\ndefault allow := false\n"
+  pdp:
+    - kind: opa
+      on_error: maybe
+      modules:
+        - "package authz\ndefault allow := false\n"
 routes:
   - tool: get_document
-    apl:
+    authorization:
       pre_invocation:
         - opa:
             query: data.authz.allow
@@ -209,15 +211,16 @@ routes:
 #[tokio::test]
 async fn missing_query_at_request_time_denies_without_panicking() {
     const NO_QUERY_YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 global:
-  apl:
-    pdp:
-      - kind: opa
-        modules:
-          - "package authz\ndefault allow := false\n"
+  pdp:
+    - kind: opa
+      modules:
+        - "package authz\ndefault allow := false\n"
 routes:
   - tool: get_document
-    apl:
+    authorization:
       pre_invocation:
         - opa:
             on_deny:
@@ -253,20 +256,21 @@ routes:
 #[tokio::test]
 async fn deny_set_idiom_end_to_end() {
     const DENY_SET_YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 global:
-  apl:
-    pdp:
-      - kind: opa
-        modules:
-          - |
-            package authz
-            deny contains msg if {
-                input.subject.id != "alice"
-                msg := "subject not on the allowlist"
-            }
+  pdp:
+    - kind: opa
+      modules:
+        - |
+          package authz
+          deny contains msg if {
+              input.subject.id != "alice"
+              msg := "subject not on the allowlist"
+          }
 routes:
   - tool: get_document
-    apl:
+    authorization:
       pre_invocation:
         - opa:
             query: data.authz.deny
@@ -319,21 +323,22 @@ routes:
 #[tokio::test]
 async fn external_data_is_readable_end_to_end() {
     const DATA_YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 global:
-  apl:
-    pdp:
-      - kind: opa
-        modules:
-          - |
-            package authz
-            default allow := false
-            allow if "reader" in data.roles[input.subject.id]
-        data:
-          roles:
-            alice: [reader]
+  pdp:
+    - kind: opa
+      modules:
+        - |
+          package authz
+          default allow := false
+          allow if "reader" in data.roles[input.subject.id]
+      data:
+        roles:
+          alice: [reader]
 routes:
   - tool: get_document
-    apl:
+    authorization:
       pre_invocation:
         - opa:
             query: data.authz.allow

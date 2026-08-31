@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-// End-to-end integration: APL YAML config → `compile_config` →
+// End-to-end integration: APL YAML config → `compile_test_policy` →
 // `evaluate_route` → `CmfPluginInvoker::invoke` → typed PPE dispatch
 // via `invoke_named::<CmfHook>` → real plugin handler → result mapped
 // back through praxis-policy-apl-core's `Decision`.
@@ -44,9 +44,10 @@ use praxis_policy_core::hooks::trait_def::{HookHandler, PluginResult};
 use praxis_policy_core::plugin::{Plugin, PluginConfig};
 
 use praxis_policy_apl_core::pipeline::TaintScope;
+use praxis_policy_apl_core::test_util::compile_test_policy;
 use praxis_policy_apl_core::{
     AttributeBag, Decision, NoopDelegationInvoker, NoopElicitationInvoker, PdpCall, PdpDecision,
-    PdpDialect, PdpError, PdpResolver, RoutePayload, compile_config, evaluate_route,
+    PdpDialect, PdpError, PdpResolver, RoutePayload, evaluate_route,
 };
 
 use praxis_policy_apl_runtime::{
@@ -198,7 +199,9 @@ impl PluginFactory for DenyPluginFactory {
 async fn manager_with(kind: &str, factory: Box<dyn PluginFactory>) -> Arc<PolicyEngine> {
     let mgr = PolicyEngine::default();
     mgr.register_factory(kind, factory);
-    let yaml = format!("plugins:\n  - name: {kind}\n    kind: {kind}\n");
+    let yaml = format!(
+        "engine_settings:\n  dispatch: hooks\nplugins:\n  - name: {kind}\n    kind: {kind}\n"
+    );
     let cfg = praxis_policy_core::config::parse_config(&yaml).expect("parse_config");
     mgr.load_config(cfg).expect("load_config");
     mgr.initialize().await.expect("initialize");
@@ -219,7 +222,7 @@ fn cmf_payload() -> MessagePayload {
 // Scenarios
 // ---------------------------------------------------------------------
 
-/// Route with one policy step `plugin(scope-gate)`. The PPE plugin
+/// Route with one policy step `run(scope-gate)`. The PPE plugin
 /// registered under that name returns `allow()`. `evaluate_route` must
 /// therefore return `Decision::Allow` end-to-end. The hook name is now
 /// resolved from the root `plugins:` block in YAML — no hardcoded
@@ -231,15 +234,15 @@ plugins:
   - name: scope-gate
     kind: scope-gate
     hooks: [cmf.tool_pre_invoke]
-routes:
-  get_weather:
+route:
+  authorization:
     pre_invocation:
-      - "plugin(scope-gate)"
+      - "run(scope-gate)"
 "#;
 
     let mgr = manager_with("scope-gate", Box::new(AllowPluginFactory)).await;
-    let cfg = compile_config(YAML).expect("compile_config");
-    let route = cfg.routes.get("get_weather").expect("route present");
+    let cfg = compile_test_policy("get_weather", YAML).expect("compile_test_policy");
+    let route = &cfg.route;
     let cache = DispatchCache::new();
     let plan = cache.get_or_build(route, &cfg.plugins, &mgr).await;
     let invoker = Arc::new(
@@ -283,15 +286,15 @@ plugins:
   - name: scope-gate
     kind: scope-gate
     hooks: [cmf.tool_pre_invoke]
-routes:
-  get_weather:
+route:
+  authorization:
     pre_invocation:
-      - "plugin(scope-gate)"
+      - "run(scope-gate)"
 "#;
 
     let mgr = manager_with("scope-gate", Box::new(DenyPluginFactory)).await;
-    let cfg = compile_config(YAML).expect("compile_config");
-    let route = cfg.routes.get("get_weather").expect("route present");
+    let cfg = compile_test_policy("get_weather", YAML).expect("compile_test_policy");
+    let route = &cfg.route;
     let cache = DispatchCache::new();
     let plan = cache.get_or_build(route, &cfg.plugins, &mgr).await;
     let invoker = Arc::new(
@@ -395,7 +398,8 @@ impl PluginFactory for TaintingPluginFactory {
 async fn tainting_manager() -> Arc<PolicyEngine> {
     let mgr = PolicyEngine::default();
     mgr.register_factory("tagger", Box::new(TaintingPluginFactory));
-    let yaml = "plugins:\n  - name: tagger\n    kind: tagger\n    capabilities: [append_labels, read_labels]\n";
+    let yaml = "engine_settings:\n  dispatch: hooks\nplugins:\n  - name: tagger\n    \
+                kind: tagger\n    capabilities: [append_labels, read_labels]\n";
     let cfg = praxis_policy_core::config::parse_config(yaml).expect("parse_config");
     mgr.load_config(cfg).expect("load_config");
     mgr.initialize().await.expect("initialize");
@@ -410,15 +414,15 @@ plugins:
     kind: tagger
     hooks: [cmf.tool_pre_invoke]
     capabilities: [append_labels, read_labels]
-routes:
-  classify:
+route:
+  authorization:
     pre_invocation:
-      - "plugin(tagger)"
+      - "run(tagger)"
 "#;
 
     let mgr = tainting_manager().await;
-    let cfg = compile_config(YAML).expect("compile_config");
-    let route = cfg.routes.get("classify").expect("route present");
+    let cfg = compile_test_policy("classify", YAML).expect("compile_test_policy");
+    let route = &cfg.route;
     let cache = DispatchCache::new();
     let plan = cache.get_or_build(route, &cfg.plugins, &mgr).await;
 
@@ -498,13 +502,13 @@ plugins:
     kind: tagger
     hooks: [cmf.tool_pre_invoke]
     capabilities: [append_labels, read_labels]
-routes:
-  classify:
+route:
+  authorization:
     pre_invocation:
-      - "plugin(tagger)"
+      - "run(tagger)"
 "#;
-    let cfg = compile_config(yaml).expect("compile_config");
-    let route = cfg.routes.get("classify").unwrap();
+    let cfg = compile_test_policy("classify", yaml).expect("compile_test_policy");
+    let route = &cfg.route;
     let plan = DispatchCache::new()
         .get_or_build(route, &cfg.plugins, &mgr)
         .await;
@@ -565,15 +569,15 @@ routes:
 #[tokio::test]
 async fn apl_taint_step_lands_in_security_labels_and_persists() {
     const YAML: &str = r#"
-routes:
-  classify:
+route:
+  authorization:
     pre_invocation:
       - "taint(audit, session)"
 "#;
 
     let mgr = manager_with("noop", Box::new(AllowPluginFactory)).await;
-    let cfg = compile_config(YAML).expect("compile_config");
-    let route = cfg.routes.get("classify").expect("route present");
+    let cfg = compile_test_policy("classify", YAML).expect("compile_test_policy");
+    let route = &cfg.route;
     let plan = DispatchCache::new()
         .get_or_build(route, &cfg.plugins, &mgr)
         .await;
@@ -676,6 +680,8 @@ impl SessionStore for ErrorSessionStore {
 // Tagger route wired through `register_apl` so requests flow through the
 // real `AplRouteHandler::invoke` path (where the fail-closed logic lives).
 const TAGGER_ROUTE_YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: tagger
     kind: tagger
@@ -683,9 +689,9 @@ plugins:
     capabilities: [append_labels, read_labels]
 routes:
   - tool: get_weather
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(tagger)"
+        - "run(tagger)"
 "#;
 
 // Route matching keys on the request's `meta` (entity type + name), so a
@@ -778,6 +784,8 @@ async fn append_failure_fails_request_closed() {
 // violation with the route's custom denyWith too, not just an ordinary
 // `Decision::Deny`.
 const TAGGER_ROUTE_WITH_RESPONSE_YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: tagger
     kind: tagger
@@ -785,9 +793,9 @@ plugins:
     capabilities: [append_labels, read_labels]
 routes:
   - tool: get_weather
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(tagger)"
+        - "run(tagger)"
     response:
       status: 503
       body: "session unavailable"
@@ -884,6 +892,8 @@ async fn persist_failure_carries_route_response() {
 #[tokio::test]
 async fn deny_plus_append_failure_preserves_policy_violation() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: tagger
     kind: tagger
@@ -894,10 +904,10 @@ plugins:
     hooks: [cmf.tool_pre_invoke]
 routes:
   - tool: get_weather
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(tagger)"
-        - "plugin(scope-gate)"
+        - "run(tagger)"
+        - "run(scope-gate)"
 "#;
     let store: Arc<dyn SessionStore> = Arc::new(ErrorSessionStore {
         fail_load: false,
@@ -1012,26 +1022,27 @@ impl praxis_policy_apl_runtime::SessionStoreFactory for RecordingFactory {
     }
 }
 
-/// A `global.apl.session_store { kind: recording-fake }` block makes
+/// A `global.session_store { kind: recording-fake }` block makes
 /// the factory-built store the active one — the default `MemorySessionStore`
 /// passed to `AplOptions` is overridden by config.
 #[tokio::test]
 async fn config_selects_session_store_via_factory() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: tagger
     kind: tagger
     hooks: [cmf.tool_pre_invoke]
     capabilities: [append_labels, read_labels]
 global:
-  apl:
-    session_store:
-      kind: recording-fake
+  session_store:
+    kind: recording-fake
 routes:
   - tool: get_weather
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(tagger)"
+        - "run(tagger)"
 "#;
 
     let recording = Arc::new(RecordingSessionStore::default());
@@ -1078,10 +1089,11 @@ routes:
 #[tokio::test]
 async fn unknown_session_store_kind_fails_config_load() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 global:
-  apl:
-    session_store:
-      kind: nonexistent-backend
+  session_store:
+    kind: nonexistent-backend
 "#;
     let mgr = Arc::new(PolicyEngine::default());
     register_apl(

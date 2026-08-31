@@ -6,14 +6,15 @@
 # Three plugins with different capabilities see different views
 # of the same extensions. Demonstrates capability-gated access
 # across pre-invoke and post-invoke hooks.
+#
+# Hook dispatch: each plugin fires at the hooks its own `hooks:`
+# declares, and none of the three carries `conditions:`, so all three
+# fire on every request. This demo registers no APL visitor, so it has
+# no `run(name)` step to invoke a plugin from; `routes:`, `groups:`,
+# and `global:` are load errors in this mode.
 
-plugin_settings:
-  routing_enabled: true
-
-global:
-  policies:
-    all:
-      plugins: [identity-checker, header-injector, audit-logger]
+engine_settings:
+  dispatch: hooks
 
 plugins:
   - name: identity-checker
@@ -47,7 +48,3 @@ plugins:
     capabilities:
       - read_headers
       - read_labels
-
-routes:
-  - tool: "*"
-    plugins: []

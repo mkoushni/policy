@@ -14,7 +14,7 @@
 //
 //   policy:
 //     - "require(perm.email_send)"
-//     - "plugin(pii-scan)"
+//     - "run(pii-scan)"
 //
 // The plugin registers on whichever CMF pre-invoke hooks the
 // operator declares in YAML (tool / prompt / llm / resource).

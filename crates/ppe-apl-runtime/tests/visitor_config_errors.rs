@@ -3,7 +3,7 @@
 
 // What the APL visitor does with wiring config it cannot honour.
 //
-// `global.apl.pdp` and `global.apl.session_store` name a factory by `kind`. If
+// `global.pdp` and `global.session_store` name a factory by `kind`. If
 // the kind is missing, the block is the wrong shape, or no factory is registered
 // for it, the load has to fail and say which. The alternative is a gateway that
 // starts with no decision point and allows everything a `pdp(...)` step was
@@ -26,13 +26,19 @@ use std::sync::Arc;
 use praxis_policy_apl_runtime::{AplOptions, register_apl};
 use praxis_policy_core::engine::PolicyEngine;
 
+/// The blocks below are all policy-mode keys, so every case declares the mode.
+/// Prefixing it here keeps each literal about the one mistake it encodes.
+fn in_policy_mode(yaml: &str) -> String {
+    format!("engine_settings:\n  dispatch: policy\n{yaml}")
+}
+
 /// Load with the APL visitor installed and no factories registered, and return
 /// the error text. Registering none is the point for most cases here: it is what
 /// an operator hits when they name a `kind` the host never wired up.
 fn load_err(yaml: &str) -> String {
     let mgr = Arc::new(PolicyEngine::default());
     register_apl(&mgr, AplOptions::in_process());
-    match mgr.load_config_yaml(yaml) {
+    match mgr.load_config_yaml(&in_policy_mode(yaml)) {
         Ok(()) => panic!("this config must not load"),
         Err(e) => format!("{e}"),
     }
@@ -41,21 +47,22 @@ fn load_err(yaml: &str) -> String {
 fn loads(yaml: &str) {
     let mgr = Arc::new(PolicyEngine::default());
     register_apl(&mgr, AplOptions::in_process());
-    mgr.load_config_yaml(yaml).expect("this config must load");
+    mgr.load_config_yaml(&in_policy_mode(yaml))
+        .expect("this config must load");
 }
 
 /// The control. Everything below differs from this by one deliberate mistake, so
 /// without it a rejection could be attributable to something else in the block.
 #[test]
 fn a_config_with_no_wiring_block_loads() {
-    loads("plugin_settings:\n  routing_enabled: true\n");
+    loads("");
 }
 
-// ---- global.apl.pdp ----------------------------------------------------
+// ---- global.pdp ----------------------------------------------------
 
 #[test]
 fn a_pdp_entry_that_is_not_a_mapping_is_rejected_with_its_index() {
-    let e = load_err("global:\n  apl:\n    pdp:\n      - just-a-string\n");
+    let e = load_err("global:\n  pdp:\n    - just-a-string\n");
     assert!(
         e.contains("pdp[0]"),
         "the message must index the entry: {e}"
@@ -65,7 +72,7 @@ fn a_pdp_entry_that_is_not_a_mapping_is_rejected_with_its_index() {
 
 #[test]
 fn a_pdp_entry_with_no_kind_is_rejected() {
-    let e = load_err("global:\n  apl:\n    pdp:\n      - policy_text: \"permit\"\n");
+    let e = load_err("global:\n  pdp:\n    - policy_text: \"permit\"\n");
     assert!(e.contains("pdp[0]"), "{e}");
     assert!(
         e.contains("`kind:`"),
@@ -78,7 +85,7 @@ fn a_pdp_entry_with_no_kind_is_rejected() {
 /// `pdp(...)` step that never resolves.
 #[test]
 fn a_pdp_kind_with_no_registered_factory_is_rejected_and_says_what_to_call() {
-    let e = load_err("global:\n  apl:\n    pdp:\n      - kind: nonexistent\n");
+    let e = load_err("global:\n  pdp:\n    - kind: nonexistent\n");
     assert!(
         e.contains("nonexistent"),
         "the message must quote the kind: {e}"
@@ -93,25 +100,25 @@ fn a_pdp_kind_with_no_registered_factory_is_rejected_and_says_what_to_call() {
 /// which one is wrong.
 #[test]
 fn the_reported_index_identifies_which_pdp_entry_failed() {
-    let e = load_err("global:\n  apl:\n    pdp:\n      - kind: cel\n      - kind: alsobad\n");
+    let e = load_err("global:\n  pdp:\n    - kind: cel\n    - kind: alsobad\n");
     assert!(
         e.contains("pdp[0]") || e.contains("pdp[1]"),
         "an index must appear: {e}"
     );
 }
 
-// ---- global.apl.session_store ------------------------------------------
+// ---- global.session_store ------------------------------------------
 
 #[test]
 fn a_session_store_that_is_not_a_mapping_is_rejected() {
-    let e = load_err("global:\n  apl:\n    session_store: just-a-string\n");
+    let e = load_err("global:\n  session_store: just-a-string\n");
     assert!(e.contains("session_store"), "{e}");
     assert!(e.contains("mapping"), "{e}");
 }
 
 #[test]
 fn a_session_store_with_no_kind_is_rejected() {
-    let e = load_err("global:\n  apl:\n    session_store:\n      ttl_seconds: 3600\n");
+    let e = load_err("global:\n  session_store:\n    ttl_seconds: 3600\n");
     assert!(e.contains("session_store"), "{e}");
     assert!(e.contains("`kind:`"), "{e}");
 }
@@ -121,7 +128,7 @@ fn a_session_store_with_no_kind_is_rejected() {
 /// between requests that land on different nodes.
 #[test]
 fn a_session_store_kind_with_no_registered_factory_is_rejected() {
-    let e = load_err("global:\n  apl:\n    session_store:\n      kind: valkey\n");
+    let e = load_err("global:\n  session_store:\n    kind: valkey\n");
     assert!(e.contains("valkey"), "the message must quote the kind: {e}");
     assert!(
         e.contains("register_session_store_factory"),
@@ -129,22 +136,22 @@ fn a_session_store_kind_with_no_registered_factory_is_rejected() {
     );
 }
 
-// ---- renamed and misplaced keys ----------------------------------------
+// ---- removed and misplaced keys ----------------------------------------
 
-/// `identity:` was renamed to `authentication:`, and a stale one is rejected
+/// `identity:` was replaced by `authentication:`, and a stale one is rejected
 /// rather than ignored. An unknown field is dropped silently, which would leave
-/// its authentication steps unrun: a fail-open. Checked at each scope the guard
-/// covers, since one arm per scope means one arm that can be missed.
+/// its authentication steps unrun: a fail-open. Checked at each scope that reads
+/// the block, since one arm per scope means one arm that can be missed.
 #[test]
-fn the_renamed_identity_key_is_rejected_at_every_scope_it_guards() {
+fn the_removed_identity_key_is_rejected_at_every_scope_that_reads_it() {
     for yaml in [
         "global:\n  identity:\n    - kind: jwt\n",
         "global:\n  defaults:\n    tool:\n      identity:\n        - kind: jwt\n",
-        "global:\n  policies:\n    some-tag:\n      identity:\n        - kind: jwt\n",
+        "groups:\n  some-tag:\n    identity:\n      - kind: jwt\n",
     ] {
         let e = load_err(yaml);
         assert!(
-            e.contains("renamed to `authentication`"),
+            e.contains("replaced by `authentication`"),
             "a stale `identity:` must be refused, not dropped: {e}"
         );
     }
@@ -153,7 +160,7 @@ fn the_renamed_identity_key_is_rejected_at_every_scope_it_guards() {
 /// The scope is named, because with several blocks the message is the only thing
 /// pointing at which one to edit.
 #[test]
-fn the_renamed_key_error_names_the_scope() {
+fn the_removed_key_error_names_the_scope() {
     let e = load_err("global:\n  defaults:\n    tool:\n      identity:\n        - kind: jwt\n");
     assert!(
         e.contains("global.defaults.tool"),
@@ -165,14 +172,14 @@ fn the_renamed_key_error_names_the_scope() {
 /// registered knows which one refused the config.
 #[test]
 fn a_visitor_error_is_attributed_to_the_visitor() {
-    let e = load_err("global:\n  apl:\n    pdp:\n      - kind: nonexistent\n");
+    let e = load_err("global:\n  pdp:\n    - kind: nonexistent\n");
     assert!(
         e.contains("apl"),
         "the error must name the visitor that raised it: {e}"
     );
 }
 
-// ---- global.apl.attribute_files ----------------------------------------
+// ---- global.attribute_files ----------------------------------------
 
 /// `attribute_files` supplies the static `data.*` tree a policy reads. Every way
 /// of getting it wrong has to fail the load.
@@ -183,7 +190,7 @@ fn a_visitor_error_is_attributed_to_the_visitor() {
 /// either opens or closes wholesale, with no error anywhere to explain it.
 #[test]
 fn a_malformed_attribute_files_block_is_rejected() {
-    let e = load_err("global:\n  apl:\n    attribute_files: attrs.yaml\n");
+    let e = load_err("global:\n  attribute_files: attrs.yaml\n");
     assert!(
         e.contains("attribute_files"),
         "the message must name the field: {e}"
@@ -193,7 +200,7 @@ fn a_malformed_attribute_files_block_is_rejected() {
 
 #[test]
 fn an_attribute_files_entry_that_is_not_a_path_is_rejected_with_its_index() {
-    let e = load_err("global:\n  apl:\n    attribute_files:\n      - 42\n");
+    let e = load_err("global:\n  attribute_files:\n    - 42\n");
     assert!(
         e.contains("attribute_files[0]"),
         "the message must index the bad entry: {e}"
@@ -203,8 +210,7 @@ fn an_attribute_files_entry_that_is_not_a_path_is_rejected_with_its_index() {
 /// A path that does not exist is a load failure, not an empty tree.
 #[test]
 fn an_attribute_file_that_does_not_exist_is_rejected() {
-    let e =
-        load_err("global:\n  apl:\n    attribute_files:\n      - /nonexistent/praxis-attrs.yaml\n");
+    let e = load_err("global:\n  attribute_files:\n    - /nonexistent/praxis-attrs.yaml\n");
     assert!(
         e.contains("praxis-attrs.yaml") || e.contains("attribute"),
         "the message must point at the file it could not read: {e}"
@@ -215,5 +221,5 @@ fn an_attribute_file_that_does_not_exist_is_rejected() {
 /// this, the rejections above could be coming from the key being present at all.
 #[test]
 fn an_empty_attribute_files_list_loads() {
-    loads("global:\n  apl:\n    attribute_files: []\n");
+    loads("global:\n  attribute_files: []\n");
 }

@@ -31,7 +31,8 @@
     clippy::unwrap_used,
     reason = "test and example code"
 )]
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
@@ -52,7 +53,7 @@ use praxis_policy_apl_runtime::{AplOptions, DispatchCache, MemorySessionStore, r
 // =====================================================================
 // Test plugins — `allow-gate` (passes through) and `deny-gate` (denies).
 // Both register on `cmf.tool_pre_invoke`. APL routes reference them by
-// name via `plugin(<name>)` in the YAML; the visitor stacks them into
+// name via `run(<name>)` in the YAML; the visitor stacks them into
 // the route's compiled steps; the handler dispatches into them through
 // CmfPluginInvoker.
 // =====================================================================
@@ -158,6 +159,61 @@ impl PluginFactory for DenyGateFactory {
     }
 }
 
+/// Counts `count-gate` invocations, for the case that one membership written in
+/// both spellings must run the bundle's step once.
+static COUNT_GATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Records the order the `order-*` gates fired in, for the case that bundle
+/// layers stack in document order.
+static ORDER_LEDGER: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// An allowing gate that records that it ran, under the name it was declared as.
+struct Recorder {
+    cfg: PluginConfig,
+}
+
+#[async_trait]
+impl Plugin for Recorder {
+    fn config(&self) -> &PluginConfig {
+        &self.cfg
+    }
+}
+
+impl HookHandler<CmfHook> for Recorder {
+    async fn handle(
+        &self,
+        _payload: &MessagePayload,
+        _extensions: &Extensions,
+        _ctx: &mut PluginContext,
+    ) -> PluginResult<MessagePayload> {
+        // Each case owns its own names, so the two never touch the same state.
+        // `cargo test` runs a binary's tests as threads in one process, and a
+        // ledger both wrote to would make each flaky in the other's presence.
+        // `cargo nextest` gives a process per test and would have hidden it.
+        if self.cfg.name == "count-gate" {
+            COUNT_GATE_CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        if self.cfg.name.starts_with("order-") {
+            ORDER_LEDGER
+                .lock()
+                .expect("ledger")
+                .push(self.cfg.name.clone());
+        }
+        PluginResult::allow()
+    }
+}
+
+struct RecorderFactory;
+impl PluginFactory for RecorderFactory {
+    fn create(&self, config: &PluginConfig) -> Result<PluginInstance, Box<CoreError>> {
+        let plugin = Arc::new(Recorder {
+            cfg: config.clone(),
+        });
+        let handlers = hooks_for(config, plugin.clone());
+        Ok(PluginInstance { plugin, handlers })
+    }
+}
+
 // =====================================================================
 // Helpers
 // =====================================================================
@@ -175,16 +231,19 @@ fn meta_for_tool(name: &str) -> MetaExtension {
     meta
 }
 
-/// Build a engine with `allow-gate` and `deny-gate` factories registered,
-/// then wire the APL visitor in via `register_apl`. Returns
-/// `Arc<PolicyEngine>` so the caller can dispatch through
-/// `invoke_named`. The visitor self-populates its plugin registry from
-/// praxis-policy-core's parsed `Vec<PluginConfig>` via `visit_plugins` — no host
-/// pre-parse needed.
-async fn build_manager_with_visitor(yaml: &str) -> Arc<PolicyEngine> {
+/// Build an engine with `allow-gate` and `deny-gate` factories registered,
+/// then wire the APL visitor in via `register_apl`. No config is loaded, so
+/// a caller that expects the load to fail can drive `load_config_yaml`
+/// itself. The visitor self-populates its plugin registry from
+/// praxis-policy-core's parsed `Vec<PluginConfig>` via `visit_plugins`, so no
+/// host pre-parse is needed.
+fn manager_with_visitor() -> Arc<PolicyEngine> {
     let mgr = Arc::new(PolicyEngine::default());
     mgr.register_factory("allow-gate", Box::new(AllowGateFactory));
     mgr.register_factory("deny-gate", Box::new(DenyGateFactory));
+    for kind in ["count-gate", "order-a", "order-b"] {
+        mgr.register_factory(kind, Box::new(RecorderFactory));
+    }
 
     register_apl(
         &mgr,
@@ -197,7 +256,12 @@ async fn build_manager_with_visitor(yaml: &str) -> Arc<PolicyEngine> {
             base_capabilities: None,
         },
     );
+    mgr
+}
 
+/// Builds a manager and loads `yaml`, panicking if the load fails.
+async fn build_manager_with_visitor(yaml: &str) -> Arc<PolicyEngine> {
+    let mgr = manager_with_visitor();
     mgr.load_config_yaml(yaml).expect("load_config_yaml");
     mgr.initialize().await.expect("initialize");
     mgr
@@ -207,22 +271,24 @@ async fn build_manager_with_visitor(yaml: &str) -> Arc<PolicyEngine> {
 // Scenarios
 // =====================================================================
 
-/// Route declares an `apl.policy: [plugin(allow-gate)]`. After the
+/// Route declares an `apl.policy: [run(allow-gate)]`. After the
 /// visitor walks the config, `cmf.tool_pre_invoke` for tool `get_weather`
 /// must short-circuit to the APL handler, which dispatches the policy
 /// step into the registered `allow-gate` plugin → allow.
 #[tokio::test]
 async fn visitor_route_with_allow_plugin_returns_allow() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: allow-gate
     kind: allow-gate
     hooks: [cmf.tool_pre_invoke]
 routes:
   - tool: get_weather
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(allow-gate)"
+        - "run(allow-gate)"
 "#;
     let mgr = build_manager_with_visitor(YAML).await;
 
@@ -248,15 +314,17 @@ routes:
 #[tokio::test]
 async fn visitor_route_with_deny_plugin_propagates_violation() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: deny-gate
     kind: deny-gate
     hooks: [cmf.tool_pre_invoke]
 routes:
   - tool: get_weather
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(deny-gate)"
+        - "run(deny-gate)"
 "#;
     let mgr = build_manager_with_visitor(YAML).await;
 
@@ -280,14 +348,16 @@ routes:
 }
 
 /// Hierarchy: global APL policy step runs FIRST, then route APL policy.
-/// Tests `apply_layer` ordering — global's `plugin(allow-gate)` runs and
-/// passes, then route's `plugin(deny-gate)` fires and denies. If the
+/// Tests `apply_layer` ordering — global's `run(allow-gate)` runs and
+/// passes, then route's `run(deny-gate)` fires and denies. If the
 /// global layer had been appended after instead of before, the deny
 /// would have run first and we'd see the deny path; the order assertion
 /// is implicit in the violation reason coming from deny-gate.
 #[tokio::test]
 async fn visitor_stacks_global_then_route_in_order() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: allow-gate
     kind: allow-gate
@@ -296,14 +366,14 @@ plugins:
     kind: deny-gate
     hooks: [cmf.tool_pre_invoke]
 global:
-  apl:
+  authorization:
     pre_invocation:
-      - "plugin(allow-gate)"
+      - "run(allow-gate)"
 routes:
   - tool: get_weather
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(deny-gate)"
+        - "run(deny-gate)"
 "#;
     let mgr = build_manager_with_visitor(YAML).await;
 
@@ -320,22 +390,23 @@ routes:
 }
 
 /// Tag bundle stacks on top of global. A route tagged `pii` inherits
-/// `plugin(deny-gate)` from the tag bundle even though the route itself
+/// `run(deny-gate)` from the tag bundle even though the route itself
 /// declares no APL block — proves tag layers are applied without the
 /// route having to redeclare anything.
 #[tokio::test]
 async fn visitor_applies_tag_bundle_to_tagged_route() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: deny-gate
     kind: deny-gate
     hooks: [cmf.tool_pre_invoke]
-global:
-  policies:
-    pii:
-      apl:
-        pre_invocation:
-          - "plugin(deny-gate)"
+groups:
+  pii:
+    authorization:
+      pre_invocation:
+        - "run(deny-gate)"
 routes:
   - tool: get_weather
     meta:
@@ -357,6 +428,141 @@ routes:
     assert_eq!(violation.reason, "deny-gate fired");
 }
 
+/// The same bundle, joined through `groups:` instead of `meta.tags`. The two
+/// spellings are documented as resolving identically, and they did not: the
+/// visitor read `meta.tags` alone, so this route inherited the bundle's
+/// `authentication:` (which praxis-policy-core resolves through the shared
+/// ordered stream) and none of its `authorization:`.
+///
+/// With the activation lists gone that was a fail-open, not a metadata
+/// asymmetry. No layer contributed anything, so no handler installed and the
+/// route was governed by nothing at all.
+#[tokio::test]
+async fn visitor_applies_tag_bundle_to_a_route_joining_by_groups() {
+    const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
+plugins:
+  - name: deny-gate
+    kind: deny-gate
+    hooks: [cmf.tool_pre_invoke]
+groups:
+  pii:
+    authorization:
+      pre_invocation:
+        - "run(deny-gate)"
+routes:
+  - tool: get_weather
+    groups: pii
+"#;
+    let mgr = build_manager_with_visitor(YAML).await;
+
+    let ext = Extensions {
+        meta: Some(Arc::new(meta_for_tool("get_weather"))),
+        ..Default::default()
+    };
+    let (result, _bg) = mgr
+        .invoke_named::<CmfHook>("cmf.tool_pre_invoke", cmf_payload("hi"), ext, None)
+        .await;
+
+    let violation = result
+        .violation
+        .expect("a `groups:` membership inherits the bundle's authorization");
+    assert_eq!(violation.reason, "deny-gate fired");
+}
+
+/// A route naming the same bundle in both spellings joins it once. `apply_layer`
+/// appends steps, so counting the membership twice would run the bundle's steps
+/// twice.
+#[tokio::test]
+async fn a_bundle_named_in_both_spellings_stacks_once() {
+    const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
+plugins:
+  - name: count-gate
+    kind: count-gate
+    hooks: [cmf.tool_pre_invoke]
+groups:
+  pii:
+    authorization:
+      pre_invocation:
+        - "run(count-gate)"
+routes:
+  - tool: get_weather
+    groups: [pii]
+    meta:
+      tags: [pii]
+"#;
+    COUNT_GATE_CALLS.store(0, Ordering::SeqCst);
+    let mgr = build_manager_with_visitor(YAML).await;
+
+    let ext = Extensions {
+        meta: Some(Arc::new(meta_for_tool("get_weather"))),
+        ..Default::default()
+    };
+    let (result, _bg) = mgr
+        .invoke_named::<CmfHook>("cmf.tool_pre_invoke", cmf_payload("hi"), ext, None)
+        .await;
+
+    assert!(result.continue_processing, "count-gate allows");
+    assert_eq!(
+        COUNT_GATE_CALLS.load(Ordering::SeqCst),
+        1,
+        "one membership, one run of the bundle's step"
+    );
+}
+
+/// Two bundles stack in the order the document writes them: `meta.tags` first,
+/// in declaration order, then `groups:`. That is the order the authentication
+/// chain uses, and the order that makes `replace_inherited:` well defined at
+/// bundle scope, so the policy chain has to match it.
+#[tokio::test]
+async fn two_bundles_stack_in_document_order() {
+    const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
+plugins:
+  - name: order-a
+    kind: order-a
+    hooks: [cmf.tool_pre_invoke]
+  - name: order-b
+    kind: order-b
+    hooks: [cmf.tool_pre_invoke]
+groups:
+  from-groups:
+    authorization:
+      pre_invocation:
+        - "run(order-b)"
+  from-tags:
+    authorization:
+      pre_invocation:
+        - "run(order-a)"
+routes:
+  - tool: get_weather
+    groups: from-groups
+    meta:
+      tags: [from-tags]
+"#;
+    ORDER_LEDGER.lock().expect("ledger").clear();
+    let mgr = build_manager_with_visitor(YAML).await;
+
+    let ext = Extensions {
+        meta: Some(Arc::new(meta_for_tool("get_weather"))),
+        ..Default::default()
+    };
+    let (result, _bg) = mgr
+        .invoke_named::<CmfHook>("cmf.tool_pre_invoke", cmf_payload("hi"), ext, None)
+        .await;
+
+    assert!(result.continue_processing, "both gates allow");
+    assert_eq!(
+        *ORDER_LEDGER.lock().expect("ledger"),
+        vec!["order-a".to_owned(), "order-b".to_owned()],
+        "`meta.tags` stacks before `groups:`"
+    );
+}
+
 /// Scope routing: a scoped annotation overrides the unscoped default for
 /// the matching scope, while requests in other scopes fall back to the
 /// unscoped annotation. Proves the visitor's `meta.scope` propagation is
@@ -368,6 +574,8 @@ async fn visitor_scoped_annotation_overrides_unscoped() {
     // scope `vs-a` must hit the scoped annotation (deny); a request in
     // scope `vs-b` falls back to the unscoped default (allow).
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: allow-gate
     kind: allow-gate
@@ -379,13 +587,13 @@ routes:
   - tool: get_weather
     meta:
       scope: vs-a
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(deny-gate)"
+        - "run(deny-gate)"
   - tool: get_weather
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(allow-gate)"
+        - "run(allow-gate)"
 "#;
     let mgr = build_manager_with_visitor(YAML).await;
 
@@ -423,14 +631,13 @@ routes:
 /// means the visitor installs zero annotations and the engine behaves
 /// exactly as if no visitor was registered. Smokes the no-op path.
 #[tokio::test]
-async fn visitor_with_no_apl_blocks_installs_nothing() {
-    // No `apl:` blocks anywhere — just a route + plugin that wouldn't
-    // be referenced from any APL step.
+async fn visitor_with_no_policy_blocks_installs_nothing() {
+    // No policy block anywhere, just a route. A plugin no step names is a load
+    // error under policy dispatch, asserted in dispatch_mode_e2e, so this config
+    // declares none: what it exercises is the visitor's no-op path.
     const YAML: &str = r#"
-plugins:
-  - name: allow-gate
-    kind: allow-gate
-    hooks: [cmf.tool_pre_invoke]
+engine_settings:
+  dispatch: policy
 routes:
   - tool: anything
 "#;
@@ -444,25 +651,22 @@ routes:
         .invoke_named::<CmfHook>("cmf.tool_pre_invoke", cmf_payload("hi"), ext, None)
         .await;
 
-    // Without APL annotations the route resolves through the legacy
-    // chain. allow-gate is registered but the route doesn't reference
-    // it, so it doesn't fire either. The pipeline returns allow.
+    // Without APL annotations the route resolves through the legacy chain, and
+    // nothing is declared to fire. The pipeline returns allow.
     assert!(result.continue_processing);
     assert!(result.violation.is_none());
 }
 
 /// A bare `global: { response: {...} }` — a denyWith with no accompanying
-/// `apl:` policy/args block — must load cleanly (the visitor warns and moves
+/// policy or args block — must load cleanly (the visitor warns and moves
 /// on) rather than panicking or erroring. `visit_global` returns early when
 /// `apl_subblock` finds no APL terms; this guards that the stranded
 /// `response:` on that early-return path is handled, not silently exploded.
 #[tokio::test]
-async fn global_response_without_apl_block_loads_without_error() {
+async fn global_response_without_a_policy_block_loads_without_error() {
     const YAML: &str = r#"
-plugins:
-  - name: allow-gate
-    kind: allow-gate
-    hooks: [cmf.tool_pre_invoke]
+engine_settings:
+  dispatch: policy
 global:
   response:
     status: 403
@@ -513,15 +717,17 @@ fn meta_for_entity(entity_type: &str, entity_name: &str) -> MetaExtension {
 #[tokio::test]
 async fn llm_route_annotates_on_llm_input_hook() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: allow-gate
     kind: allow-gate
     hooks: [cmf.llm_input]
 routes:
   - llm: gpt-4
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(allow-gate)"
+        - "run(allow-gate)"
 "#;
     let mgr = build_manager_with_visitor(YAML).await;
 
@@ -546,15 +752,17 @@ routes:
 #[tokio::test]
 async fn llm_route_annotates_on_llm_output_hook_for_post_phase() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: allow-gate
     kind: allow-gate
     hooks: [cmf.llm_output]
 routes:
   - llm: gpt-4
-    apl:
+    authorization:
       post_invocation:
-        - "plugin(allow-gate)"
+        - "run(allow-gate)"
 "#;
     let mgr = build_manager_with_visitor(YAML).await;
 
@@ -577,15 +785,17 @@ routes:
 #[tokio::test]
 async fn prompt_route_annotates_on_prompt_pre_invoke_hook() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: allow-gate
     kind: allow-gate
     hooks: [cmf.prompt_pre_invoke]
 routes:
   - prompt: summarize_email
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(allow-gate)"
+        - "run(allow-gate)"
 "#;
     let mgr = build_manager_with_visitor(YAML).await;
 
@@ -608,15 +818,17 @@ routes:
 #[tokio::test]
 async fn resource_route_annotates_on_resource_pre_fetch_hook() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: allow-gate
     kind: allow-gate
     hooks: [cmf.resource_pre_fetch]
 routes:
   - resource: hr://employees/*
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(allow-gate)"
+        - "run(allow-gate)"
 "#;
     let mgr = build_manager_with_visitor(YAML).await;
 
@@ -652,15 +864,17 @@ routes:
 #[tokio::test]
 async fn llm_route_does_not_fire_on_tool_hook() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: deny-gate
     kind: deny-gate
     hooks: [cmf.llm_input]
 routes:
   - llm: gpt-4
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(deny-gate)"
+        - "run(deny-gate)"
 "#;
     let mgr = build_manager_with_visitor(YAML).await;
     let ext = Extensions {
@@ -696,13 +910,15 @@ routes:
 #[tokio::test]
 async fn visitor_compile_error_propagates_from_load_config_yaml() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: allow-gate
     kind: allow-gate
     hooks: [cmf.tool_pre_invoke]
 routes:
   - tool: get_weather
-    apl:
+    authorization:
       pre_invocation:
         - "this-is-not-a-valid-step ::: $$$"
 "#;
@@ -720,20 +936,22 @@ routes:
     );
 }
 
-/// Flat form: a route may declare `pre_invocation:` directly, without the `apl:`
-/// wrapper. The visitor recognizes it identically to the wrapped form.
-/// (Also exercises the `run(...)` plugin alias.)
+/// A route declares its `authorization:` block directly on itself, which is the
+/// only spelling. (Also exercises the `run(...)` plugin alias.)
 #[tokio::test]
-async fn visitor_flat_route_without_apl_wrapper_allows() {
+async fn a_route_policy_term_allows() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: allow-gate
     kind: allow-gate
     hooks: [cmf.tool_pre_invoke]
 routes:
   - tool: get_weather
-    pre_invocation:
-      - "run(allow-gate)"
+    authorization:
+      pre_invocation:
+        - "run(allow-gate)"
 "#;
     let mgr = build_manager_with_visitor(YAML).await;
 
@@ -747,24 +965,27 @@ routes:
 
     assert!(
         result.continue_processing,
-        "flat (no-apl-wrapper) allow path should continue: violation = {:?}",
+        "the allow path should continue: violation = {:?}",
         result.violation
     );
 }
 
-/// Flat form deny mirrors the wrapped deny path — the route's `pre_invocation:`
-/// is honored without an `apl:` wrapper and the violation propagates.
+/// The deny half of the same shape: the route's `authorization:` block is
+/// honored and the violation propagates.
 #[tokio::test]
-async fn visitor_flat_route_without_apl_wrapper_denies() {
+async fn a_route_policy_term_denies() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: deny-gate
     kind: deny-gate
     hooks: [cmf.tool_pre_invoke]
 routes:
   - tool: get_weather
-    pre_invocation:
-      - "plugin(deny-gate)"
+    authorization:
+      pre_invocation:
+        - "run(deny-gate)"
 "#;
     let mgr = build_manager_with_visitor(YAML).await;
 
@@ -776,7 +997,7 @@ routes:
         .invoke_named::<CmfHook>("cmf.tool_pre_invoke", cmf_payload("hi"), ext, None)
         .await;
 
-    assert!(!result.continue_processing, "flat deny path should halt");
+    assert!(!result.continue_processing, "the deny path should halt");
     let violation = result
         .violation
         .expect("deny path must surface a violation");
@@ -784,7 +1005,7 @@ routes:
 }
 
 // =====================================================================
-// Flat `plugins:` MAP form (no `apl:` wrapper) — regression coverage
+// The `plugins:` MAP form — regression coverage
 // for the load-path bug where a route/defaults/policy `plugins:` map
 // failed to deserialize into `Vec<PluginRouteRef>` *before* any visitor
 // ran. The structural parse now tolerates the map (treats it as APL
@@ -793,22 +1014,25 @@ routes:
 // map through the real `load_config_yaml` path the unit tests can't hit.
 // =====================================================================
 
-/// A route with a flat `pre_invocation:` AND a flat `plugins:` *map* override
-/// (no `apl:` wrapper) loads through `load_config_yaml` (previously a
+/// A route with an `authorization:` block AND a `plugins:` *map* override
+/// loads through `load_config_yaml` (previously a
 /// hard `invalid type: map, expected a sequence` error) and the policy
 /// still fires — proving the override map and the activating policy
 /// coexist on the same section.
 #[tokio::test]
 async fn flat_route_with_plugins_map_and_policy_loads_and_denies() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: deny-gate
     kind: deny-gate
     hooks: [cmf.tool_pre_invoke]
 routes:
   - tool: get_weather
-    pre_invocation:
-      - "plugin(deny-gate)"
+    authorization:
+      pre_invocation:
+        - "run(deny-gate)"
     plugins:
       deny-gate:
         on_error: ignore
@@ -833,58 +1057,6 @@ routes:
     assert_eq!(violation.reason, "deny-gate fired");
 }
 
-/// The flat `plugins:` map form must be behaviorally identical to the
-/// `apl: { plugins: {...} }` wrapper form — that equivalence is the
-/// whole point of "the wrapper is optional". An override map alone
-/// declares no phases, so neither form installs an APL handler; whatever
-/// the legacy chain then does, both forms must do the same thing. We
-/// assert the two routes resolve to the same decision rather than
-/// hard-coding the legacy-chain outcome (which this PR doesn't touch).
-#[tokio::test]
-async fn flat_plugins_map_only_matches_wrapped_plugins_map_only() {
-    const FLAT: &str = r#"
-plugins:
-  - name: deny-gate
-    kind: deny-gate
-    hooks: [cmf.tool_pre_invoke]
-routes:
-  - tool: get_weather
-    plugins:
-      deny-gate:
-        on_error: ignore
-"#;
-    const WRAPPED: &str = r#"
-plugins:
-  - name: deny-gate
-    kind: deny-gate
-    hooks: [cmf.tool_pre_invoke]
-routes:
-  - tool: get_weather
-    apl:
-      plugins:
-        deny-gate:
-          on_error: ignore
-"#;
-
-    async fn decide(yaml: &str) -> bool {
-        let mgr = build_manager_with_visitor(yaml).await;
-        let ext = Extensions {
-            meta: Some(Arc::new(meta_for_tool("get_weather"))),
-            ..Default::default()
-        };
-        let (result, _bg) = mgr
-            .invoke_named::<CmfHook>("cmf.tool_pre_invoke", cmf_payload("hi"), ext, None)
-            .await;
-        result.continue_processing
-    }
-
-    assert_eq!(
-        decide(FLAT).await,
-        decide(WRAPPED).await,
-        "flat plugins-map and apl-wrapped plugins-map must resolve identically",
-    );
-}
-
 /// A `plugins:` map at `global.defaults.<entity>` scope loads through
 /// the full pipeline. Before the fix this failed at the structural
 /// `PolicyConfig` parse (the defaults group's `plugins` is also a `Vec`).
@@ -892,6 +1064,8 @@ routes:
 #[tokio::test]
 async fn flat_defaults_plugins_map_loads_through_full_pipeline() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: deny-gate
     kind: deny-gate
@@ -899,8 +1073,9 @@ plugins:
 global:
   defaults:
     tool:
-      pre_invocation:
-        - "plugin(deny-gate)"
+      authorization:
+        pre_invocation:
+          - "run(deny-gate)"
       plugins:
         deny-gate:
           on_error: ignore
@@ -924,5 +1099,115 @@ routes:
     assert_eq!(
         result.violation.expect("deny expected").reason,
         "deny-gate fired"
+    );
+}
+
+// =====================================================================
+// A route installs only the halves it declares
+// =====================================================================
+
+/// A route whose policy body declares only pre-phase steps gains no post
+/// handler. An empty post handler would short-circuit the post hook and
+/// silence whatever the route's own plugin chain had to say there.
+#[tokio::test]
+async fn a_pre_only_entity_route_installs_no_post_handler() {
+    const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
+plugins:
+  - name: allow-gate
+    kind: allow-gate
+    hooks: [cmf.tool_pre_invoke]
+routes:
+  - tool: get_weather
+    authorization:
+      pre_invocation:
+        - "run(allow-gate)"
+"#;
+    let mgr = build_manager_with_visitor(YAML).await;
+
+    assert!(
+        mgr.has_hooks_for("cmf.tool_pre_invoke"),
+        "the declared pre half installs"
+    );
+    assert!(
+        !mgr.has_hooks_for("cmf.tool_post_invoke"),
+        "the route declares no post steps, so no post handler installs",
+    );
+}
+
+/// A route's `plugins:` list beside a pre-only body was one list with two
+/// behaviors on one route: inert on the annotated pre hook, live on the
+/// unannotated post one, decided by which phases the body happened to carry.
+/// The list is a load error now, so the split is unwritable, and a plugin that
+/// must run on the post half is named by a step under `post_invocation:`.
+#[tokio::test]
+async fn a_route_names_its_post_half_plugin_with_a_step() {
+    const SPLIT: &str = r#"
+engine_settings:
+  dispatch: policy
+plugins:
+  - name: allow-gate
+    kind: allow-gate
+    hooks: [cmf.tool_pre_invoke]
+  - name: deny-gate
+    kind: deny-gate
+    hooks: [cmf.tool_post_invoke]
+routes:
+  - tool: get_weather
+    plugins: [deny-gate]
+    authorization:
+      pre_invocation:
+        - "run(allow-gate)"
+"#;
+    let message = manager_with_visitor()
+        .load_config_yaml(SPLIT)
+        .expect_err("the list beside a pre-only body must fail")
+        .to_string();
+    assert!(message.contains("run(name)"), "{message}");
+
+    const STEPS: &str = r#"
+engine_settings:
+  dispatch: policy
+plugins:
+  - name: allow-gate
+    kind: allow-gate
+    hooks: [cmf.tool_pre_invoke]
+  - name: deny-gate
+    kind: deny-gate
+    hooks: [cmf.tool_post_invoke]
+routes:
+  - tool: get_weather
+    authorization:
+      pre_invocation:
+        - "run(allow-gate)"
+      post_invocation:
+        - "run(deny-gate)"
+"#;
+    let mgr = build_manager_with_visitor(STEPS).await;
+
+    let ext = Extensions {
+        meta: Some(Arc::new(meta_for_tool("get_weather"))),
+        ..Default::default()
+    };
+    let (pre, _bg) = mgr
+        .invoke_named::<CmfHook>("cmf.tool_pre_invoke", cmf_payload("hi"), ext.clone(), None)
+        .await;
+    assert!(
+        pre.continue_processing,
+        "the pre half runs the pre steps; violation = {:?}",
+        pre.violation
+    );
+
+    let (post, _bg) = mgr
+        .invoke_named::<CmfHook>("cmf.tool_post_invoke", cmf_payload("hi"), ext, None)
+        .await;
+    assert!(
+        !post.continue_processing,
+        "the post step's plugin must run on the post half and deny",
+    );
+    assert_eq!(
+        post.violation.expect("deny expected").reason,
+        "deny-gate fired",
     );
 }

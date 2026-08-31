@@ -12,7 +12,7 @@
 //   praxis-policy-session-valkey  ──uses──▶  redis-rs + deadpool-redis (rustls)
 //
 // The host registers `ValkeySessionStoreFactory` via
-// `AplOptions.session_store_factories`; a `global.apl.session_store:
+// `AplOptions.session_store_factories`; a `global.session_store:
 // { kind: valkey, ... }` block then selects it during config load. When
 // no such block is present, praxis-policy-apl-runtime keeps its default in-process
 // `MemorySessionStore`, so this crate is entirely opt-in.

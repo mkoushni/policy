@@ -61,6 +61,11 @@ pub mod http;
 /// Which IP addresses an outbound policy call must not reach. The shared
 /// range table; a transport enforces it where it dials.
 pub mod http_addr;
+/// The generic-HTTP hook family: its two names, its payload, and its hook type.
+pub mod http_hook;
+/// The path a route matches on, normalized the way the gateway's own
+/// router normalizes it and never percent-decoded.
+pub mod http_path;
 /// Retry policy for outbound HTTP, keyed to whether a repeat is safe.
 pub mod http_retry;
 /// A scripted `HttpTransport` for tests, including the failure paths a

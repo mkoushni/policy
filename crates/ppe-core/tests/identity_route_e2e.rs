@@ -252,32 +252,36 @@ fn manager_with_observing_factory() -> (
 async fn route_identity_block_dispatches_in_declared_order() {
     let (mgr, ledger, _) = manager_with_recording_factory();
 
-    // Three identity plugins, all registered under `identity.resolve`.
-    // Route declares them in REVERSE priority order to prove that
-    // routing follows the `authentication:` declaration, not chain priority.
+    // Three identity plugins, all registered under `identity.resolve`. The route
+    // declares them in an order no other signal could produce, so the ledger
+    // reading back in that order is the binding working.
+    //
+    // This used to set priority 10/20/30 and declare them reversed, so the
+    // ledger order proved declaration beat priority. `priority:` is a
+    // policy-mode load error now, and the route block this test needs is itself
+    // a hook-mode load error, so the contrast cannot be set up either way. It
+    // is also no longer a contrast worth drawing: in policy mode there is no
+    // priority for declaration order to beat.
     let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: jwt-a
     kind: recording
     hooks: [identity.resolve]
-    priority: 10
   - name: jwt-b
     kind: recording
     hooks: [identity.resolve]
-    priority: 20
   - name: jwt-c
     kind: recording
     hooks: [identity.resolve]
-    priority: 30
 
 routes:
   - tool: get_weather
     authentication:
-      - jwt-c       # priority 30 — would naturally run LAST in chain order
-      - jwt-a       # priority 10 — would naturally run FIRST
-      - jwt-b       # priority 20
+      - jwt-c
+      - jwt-a
+      - jwt-b
 "#;
     let parsed = config::parse_config(yaml).expect("parse");
     mgr.load_config(parsed).expect("load");
@@ -303,23 +307,14 @@ routes:
     assert_eq!(firings, vec!["jwt-c", "jwt-a", "jwt-b"]);
 }
 
-/// `authentication:` is hook-specific. Plugins in the route's `plugins:`
-/// block (which means "per-route overrides" in APL-driven routes
-/// and "per-route binding" otherwise) must NOT fire for the
-/// identity.resolve hook. This is the load-bearing test for
-/// Option 1 — the design decision that `authentication:` is its own
-/// dispatch list, independent of `plugins:`.
-#[tokio::test]
-async fn route_plugins_block_does_not_bind_identity_resolve() {
-    let (mgr, ledger, _) = manager_with_recording_factory();
-
-    // The route declares `authentication:` with corp-jwt, and `plugins:`
-    // with rogue-jwt. rogue-jwt also registers under identity.resolve
-    // — but should NOT fire for the identity.resolve hook on this
-    // route because it's listed in `plugins:`, not `authentication:`.
+/// `authentication:` is the only dispatch list a route declares. The `plugins:`
+/// activation list that used to sit beside it — and mean something different on
+/// the same route — is a load error, so the two can no longer be confused.
+#[test]
+fn a_route_cannot_declare_a_plugins_list_beside_authentication() {
     let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: corp-jwt
     kind: recording
@@ -335,36 +330,24 @@ routes:
     plugins:
       - rogue-jwt
 "#;
-    let parsed = config::parse_config(yaml).expect("parse");
-    mgr.load_config(parsed).expect("load");
-    mgr.initialize().await.unwrap();
-
-    let (result, _bg) = mgr
-        .invoke_named::<IdentityHook>(
-            HOOK_IDENTITY_RESOLVE,
-            build_payload("eyJ.fake.jwt"),
-            ext_for_tool("get_weather"),
-            None,
-        )
-        .await;
-    assert!(result.continue_processing);
-
-    // Only corp-jwt fired — rogue-jwt was in `plugins:`, not
-    // `authentication:`, so it's NOT bound for this hook on this route.
-    assert_eq!(ledger.lock().unwrap().clone(), vec!["corp-jwt"]);
+    let message = config::parse_config(yaml)
+        .expect_err("the activation list beside `authentication:` must fail")
+        .to_string();
+    assert!(message.contains("routes[0]"), "{message}");
+    assert!(message.contains("run(name)"), "{message}");
 }
 
 /// A route with no `authentication:` block produces zero identity
 /// dispatches even when the `entity_type` / `entity_name` match. The
-/// plugins ARE registered under identity.resolve, but no route
-/// binds them, so the route-filter returns an empty entry list.
+/// plugin IS registered under identity.resolve, but no route
+/// binds it, so the route-filter returns an empty entry list.
 #[tokio::test]
 async fn route_without_identity_block_dispatches_no_resolvers() {
     let (mgr, ledger, _) = manager_with_recording_factory();
 
     let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: corp-jwt
     kind: recording
@@ -372,9 +355,7 @@ plugins:
 
 routes:
   - tool: get_weather
-    # No identity: block.
-    plugins:
-      - corp-jwt
+    # No authentication: block.
 "#;
     let parsed = config::parse_config(yaml).expect("parse");
     mgr.load_config(parsed).expect("load");
@@ -391,8 +372,7 @@ routes:
     assert!(result.continue_processing);
 
     // No identity plugins fired — `authentication:` was absent, so the
-    // route binds nothing for the identity.resolve hook even though
-    // corp-jwt is in `plugins:`.
+    // route binds nothing for the identity.resolve hook.
     assert!(ledger.lock().unwrap().is_empty());
 }
 
@@ -404,8 +384,8 @@ async fn identity_route_filter_respects_entity_match() {
     let (mgr, ledger, _) = manager_with_recording_factory();
 
     let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: corp-jwt
     kind: recording
@@ -447,8 +427,8 @@ async fn per_step_config_override_produces_fresh_instance() {
     let (mgr, _ledger, factory_calls) = manager_with_recording_factory();
 
     let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: corp-jwt
     kind: recording
@@ -497,8 +477,8 @@ async fn global_identity_inherited_when_route_has_no_block() {
     let (mgr, ledger, _) = manager_with_recording_factory();
 
     let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: corp-jwt
     kind: recording
@@ -539,8 +519,8 @@ async fn global_tag_route_identity_stack_dispatches_in_order() {
     let (mgr, ledger, _) = manager_with_recording_factory();
 
     let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: corp-jwt
     kind: recording
@@ -555,10 +535,10 @@ plugins:
 global:
   authentication:
     - corp-jwt
-  policies:
-    finance:
-      authentication:
-        - workday-saml
+groups:
+  finance:
+    authentication:
+      - workday-saml
 
 routes:
   - tool: get_compensation
@@ -596,8 +576,8 @@ async fn replace_inherited_drops_inherited_layers_end_to_end() {
     let (mgr, ledger, _) = manager_with_recording_factory();
 
     let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: corp-jwt
     kind: recording
@@ -612,10 +592,10 @@ plugins:
 global:
   authentication:
     - corp-jwt
-  policies:
-    finance:
-      authentication:
-        - workday-saml
+groups:
+  finance:
+    authentication:
+      - workday-saml
 
 routes:
   - tool: legacy_endpoint
@@ -653,8 +633,8 @@ async fn replace_inherited_with_empty_steps_yields_anonymous_route() {
     let (mgr, ledger, _) = manager_with_recording_factory();
 
     let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: corp-jwt
     kind: recording
@@ -698,8 +678,8 @@ async fn route_with_empty_identity_steps_dispatches_nothing() {
     let (mgr, ledger, _) = manager_with_recording_factory();
 
     let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: corp-jwt
     kind: recording
@@ -725,6 +705,150 @@ routes:
         .await;
     assert!(result.continue_processing);
     assert!(ledger.lock().unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------
+// `replace_inherited:` at bundle scope.
+//
+// A bundle's flag drops everything accumulated before it, the global
+// layer and any earlier bundle, while the bundles after it and the
+// route itself still append. Bundle order is `meta.tags` in declaration
+// order then `groups:` in declaration order, so which bundle replaces is
+// readable from the document.
+// ---------------------------------------------------------------------
+
+/// Two bundles where the second replaces. Written once and reused by the
+/// order test, which only swaps the tag list.
+const TWO_BUNDLES_SECOND_REPLACES: &str = r#"
+engine_settings:
+  dispatch: policy
+plugins:
+  - name: corp-jwt
+    kind: recording
+    hooks: [identity.resolve]
+  - name: workday-saml
+    kind: recording
+    hooks: [identity.resolve]
+  - name: legacy-basic-auth
+    kind: recording
+    hooks: [identity.resolve]
+  - name: agent-context
+    kind: recording
+    hooks: [identity.resolve]
+
+global:
+  authentication:
+    - corp-jwt
+groups:
+  finance:
+    authentication:
+      - workday-saml
+  legacy:
+    authentication:
+      replace_inherited: true
+      steps:
+        - legacy-basic-auth
+
+routes:
+  - tool: get_compensation
+    meta:
+      tags: [finance, legacy]
+    authentication:
+      - agent-context
+"#;
+
+/// Dispatch the identity hook for `get_compensation` under `yaml` and
+/// return what actually fired, in order.
+async fn identity_dispatch_order(yaml: &str) -> Vec<String> {
+    let (mgr, ledger, _) = manager_with_recording_factory();
+    let parsed = praxis_policy_core::config::parse_config(yaml).expect("parse");
+    mgr.load_config(parsed).expect("load");
+    mgr.initialize().await.unwrap();
+
+    let (result, _bg) = mgr
+        .invoke_named::<IdentityHook>(
+            HOOK_IDENTITY_RESOLVE,
+            build_payload("eyJ.fake.jwt"),
+            ext_for_tool("get_compensation"),
+            None,
+        )
+        .await;
+    assert!(
+        result.continue_processing,
+        "identity resolution should not halt the pipeline"
+    );
+    ledger.lock().unwrap().clone()
+}
+
+/// The second bundle sets the flag: the global layer and the first
+/// bundle's step are gone, the replacing bundle's step and the route's
+/// own remain.
+#[tokio::test]
+async fn bundle_replace_inherited_drops_the_layers_before_it_end_to_end() {
+    assert_eq!(
+        identity_dispatch_order(TWO_BUNDLES_SECOND_REPLACES).await,
+        vec!["legacy-basic-auth", "agent-context"],
+    );
+}
+
+/// The same two bundles in the other order resolve differently, and the
+/// difference matches declaration order: `legacy` replaces the global
+/// layer only, so `finance` survives behind it.
+#[tokio::test]
+async fn bundle_order_decides_what_replace_inherited_drops_end_to_end() {
+    let reordered =
+        TWO_BUNDLES_SECOND_REPLACES.replace("tags: [finance, legacy]", "tags: [legacy, finance]");
+    assert_eq!(
+        identity_dispatch_order(&reordered).await,
+        vec!["legacy-basic-auth", "workday-saml", "agent-context"],
+    );
+}
+
+/// A bundle with `replace_inherited: true` and `steps: []` is the
+/// anonymous-route knob at bundle scope: it drops the inherited layers
+/// and contributes nothing, so nothing authenticates the route.
+#[tokio::test]
+async fn bundle_replace_inherited_with_empty_steps_yields_anonymous_route() {
+    let (mgr, ledger, _) = manager_with_recording_factory();
+
+    let yaml = r#"
+engine_settings:
+  dispatch: policy
+plugins:
+  - name: corp-jwt
+    kind: recording
+    hooks: [identity.resolve]
+
+global:
+  authentication:
+    - corp-jwt
+groups:
+  public:
+    authentication:
+      replace_inherited: true
+      steps: []
+
+routes:
+  - tool: healthcheck
+    groups: public
+"#;
+    let parsed = praxis_policy_core::config::parse_config(yaml).expect("parse");
+    mgr.load_config(parsed).expect("load");
+    mgr.initialize().await.unwrap();
+
+    let (result, _bg) = mgr
+        .invoke_named::<IdentityHook>(
+            HOOK_IDENTITY_RESOLVE,
+            build_payload("eyJ.fake.jwt"),
+            ext_for_tool("healthcheck"),
+            None,
+        )
+        .await;
+    assert!(result.continue_processing);
+    assert!(
+        ledger.lock().unwrap().is_empty(),
+        "an empty replacing bundle should leave the route with no resolvers",
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -775,8 +899,8 @@ async fn identity_plugin_with_read_subject_sees_subject_but_not_labels() {
     let (mgr, _ledger, sink) = manager_with_observing_factory();
 
     let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: scoped-jwt
     kind: recording
@@ -830,8 +954,8 @@ async fn identity_plugin_without_caps_sees_stripped_extensions() {
     let (mgr, _ledger, sink) = manager_with_observing_factory();
 
     let yaml = r#"
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 plugins:
   - name: capless-jwt
     kind: recording
@@ -871,5 +995,122 @@ routes:
     assert!(
         obs.saw_labels.is_empty(),
         "without read_labels, labels must be hidden",
+    );
+}
+
+// ---------------------------------------------------------------------
+// The load-time report for a bundle-scope drop.
+//
+// A route's own `replace_inherited:` is visible to whoever reads the
+// route. A bundle's is not: the flag lives in a shared block somewhere
+// else, and the route ends up authenticating less than its own
+// declaration says. So the config load names every route that happens
+// to, the way the delegation-without-identity alarm does.
+// ---------------------------------------------------------------------
+
+const REPLACED_ALARM: &str = "authentication_replaced_above_the_route";
+
+/// Every event carrying an `alarm` field, flattened to `name=value`
+/// pairs so one assertion can check the alarm, the route, and the section
+/// it names.
+///
+/// Hand-rolled on `tracing` rather than pulled from
+/// `tracing-subscriber`, matching
+/// `praxis-policy-apl-runtime/tests/delegation_identity_warning.rs`: a
+/// handful of fields off one event is not worth a new dependency tree.
+struct AlarmCollector {
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+impl tracing::Subscriber for AlarmCollector {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut fields = FieldSink(Vec::new());
+        event.record(&mut fields);
+        let flattened = fields.0.join(" ");
+        if flattened.contains("alarm=") {
+            self.events.lock().unwrap().push(flattened);
+        }
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+struct FieldSink(Vec<String>);
+
+impl tracing::field::Visit for FieldSink {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.push(format!("{}={}", field.name(), value));
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push(format!("{}={:?}", field.name(), value));
+    }
+}
+
+/// Load `yaml` and return every alarm event the load itself raised.
+fn alarms_raised_by_loading(yaml: &str) -> Vec<String> {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let collector = AlarmCollector {
+        events: Arc::clone(&events),
+    };
+    let (mgr, _ledger, _) = manager_with_recording_factory();
+    let parsed = praxis_policy_core::config::parse_config(yaml).expect("parse");
+    tracing::subscriber::with_default(collector, || {
+        mgr.load_config(parsed).expect("load");
+    });
+    events.lock().unwrap().clone()
+}
+
+/// One report per affected route, naming the route, the section that set
+/// the flag, and the steps the route no longer runs.
+#[test]
+fn a_bundle_dropping_inherited_authentication_is_reported_at_load() {
+    // Two routes join the replacing bundle; a third does not.
+    let yaml = TWO_BUNDLES_SECOND_REPLACES.replace(
+        "  - tool: get_compensation",
+        "  - tool: get_headcount\n    groups: [finance]\n  - tool: get_compensation",
+    );
+    let reports: Vec<String> = alarms_raised_by_loading(&yaml)
+        .into_iter()
+        .filter(|e| e.contains(REPLACED_ALARM))
+        .collect();
+
+    assert_eq!(
+        reports.len(),
+        1,
+        "one report per affected route: {reports:?}"
+    );
+    let report = &reports[0];
+    assert!(report.contains("route=tool:get_compensation"), "{report}");
+    assert!(report.contains("declared_in=groups.legacy"), "{report}");
+    assert!(
+        report.contains("corp-jwt") && report.contains("workday-saml"),
+        "the report should name the steps the route lost: {report}",
+    );
+}
+
+/// A route joining only the non-replacing bundle keeps its inherited
+/// steps, so reporting it would be a false alarm.
+#[test]
+fn a_route_that_keeps_its_inherited_authentication_is_not_reported() {
+    let yaml = TWO_BUNDLES_SECOND_REPLACES.replace("tags: [finance, legacy]", "tags: [finance]");
+    assert!(
+        !alarms_raised_by_loading(&yaml)
+            .iter()
+            .any(|e| e.contains(REPLACED_ALARM)),
     );
 }

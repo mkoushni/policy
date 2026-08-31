@@ -139,6 +139,16 @@ praxis-policy-session-valkey           = { path = "builtins/session/valkey",    
 # `panic = "abort"` is deliberately not set. This is a library: aborting would
 # take the host process down on a recoverable policy panic and would break any
 # consumer that relies on unwinding across the engine boundary.
+
+# Line tables instead of full debug info. Panic locations and llvm-cov line
+# coverage both need only line tables, so full DWARF buys nothing here and
+# costs link time and disk on every debug and test build.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
 [profile.release]
 lto = true
 codegen-units = 1

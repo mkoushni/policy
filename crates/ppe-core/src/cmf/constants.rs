@@ -3,6 +3,8 @@
 
 // CMF constants — schema version, serialization field names, and defaults.
 
+use super::CmfHook;
+
 /// Current CMF message schema version.
 pub const SCHEMA_VERSION: &str = "2.0";
 
@@ -117,46 +119,39 @@ pub const ENTITY_NAME_GLOBAL: &str = "*";
 // CMF hook names — the canonical names plugins register under and hosts
 // pass to `PolicyEngine::invoke_named::<CmfHook>(...)`. Two per entity
 // type — pre-invocation (called from APL's policy / args phase) and
-// post-invocation (called from APL's post_policy / result phase).
+// post-invocation (called from APL's post_invocation / result phase).
 //
 // Declared with `define_hooks!` so each name arrives with the routing
-// metadata `hooks::metadata` needs. Plugin declarations name these
-// strings in `hooks:`, and the config loader validates against the
-// table these rows seed.
+// metadata `hooks::metadata` needs, the family among it: each row records
+// `CmfHook`, so the name and the type a handler is written against cannot
+// disagree. Plugin declarations name these strings in `hooks:`, and the
+// config loader validates against the table these rows seed.
 crate::define_hooks! {
     /// The CMF family's rows in the built-in hook metadata table.
     CMF_HOOK_METADATA;
 
     /// Hook name `cmf.tool_pre_invoke`.
-    HOOK_CMF_TOOL_PRE_INVOKE: "cmf.tool_pre_invoke" => entity: Some(ENTITY_TOOL), phase: Pre;
+    HOOK_CMF_TOOL_PRE_INVOKE: "cmf.tool_pre_invoke" =>
+        family: CmfHook, entity: Some(ENTITY_TOOL), phase: Pre;
     /// Hook name `cmf.tool_post_invoke`.
-    HOOK_CMF_TOOL_POST_INVOKE: "cmf.tool_post_invoke" => entity: Some(ENTITY_TOOL), phase: Post;
+    HOOK_CMF_TOOL_POST_INVOKE: "cmf.tool_post_invoke" =>
+        family: CmfHook, entity: Some(ENTITY_TOOL), phase: Post;
     /// Hook name `cmf.llm_input`.
-    HOOK_CMF_LLM_INPUT: "cmf.llm_input" => entity: Some(ENTITY_LLM), phase: Pre;
+    HOOK_CMF_LLM_INPUT: "cmf.llm_input" =>
+        family: CmfHook, entity: Some(ENTITY_LLM), phase: Pre;
     /// Hook name `cmf.llm_output`.
-    HOOK_CMF_LLM_OUTPUT: "cmf.llm_output" => entity: Some(ENTITY_LLM), phase: Post;
+    HOOK_CMF_LLM_OUTPUT: "cmf.llm_output" =>
+        family: CmfHook, entity: Some(ENTITY_LLM), phase: Post;
     /// Hook name `cmf.prompt_pre_invoke`.
-    HOOK_CMF_PROMPT_PRE_INVOKE: "cmf.prompt_pre_invoke" => entity: Some(ENTITY_PROMPT), phase: Pre;
+    HOOK_CMF_PROMPT_PRE_INVOKE: "cmf.prompt_pre_invoke" =>
+        family: CmfHook, entity: Some(ENTITY_PROMPT), phase: Pre;
     /// Hook name `cmf.prompt_post_invoke`.
-    HOOK_CMF_PROMPT_POST_INVOKE: "cmf.prompt_post_invoke" => entity: Some(ENTITY_PROMPT), phase: Post;
+    HOOK_CMF_PROMPT_POST_INVOKE: "cmf.prompt_post_invoke" =>
+        family: CmfHook, entity: Some(ENTITY_PROMPT), phase: Post;
     /// Hook name `cmf.resource_pre_fetch`.
-    HOOK_CMF_RESOURCE_PRE_FETCH: "cmf.resource_pre_fetch" => entity: Some(ENTITY_RESOURCE), phase: Pre;
+    HOOK_CMF_RESOURCE_PRE_FETCH: "cmf.resource_pre_fetch" =>
+        family: CmfHook, entity: Some(ENTITY_RESOURCE), phase: Pre;
     /// Hook name `cmf.resource_post_fetch`.
-    HOOK_CMF_RESOURCE_POST_FETCH: "cmf.resource_post_fetch" => entity: Some(ENTITY_RESOURCE), phase: Post;
-
-    /// Generic HTTP request hook, fired for non-MCP/A2A HTTP requests on
-    /// the way in. The catch-all `global` policy (if any) is annotated
-    /// under it via [`ENTITY_HTTP`] / [`ENTITY_NAME_GLOBAL`]. This half
-    /// carries authorization, which is an admission check and so belongs
-    /// entirely before the request is forwarded.
-    HOOK_CMF_HTTP_REQUEST: "cmf.http_request" => entity: Some(ENTITY_HTTP), phase: Pre;
-    /// Generic HTTP response hook, the return half of
-    /// [`HOOK_CMF_HTTP_REQUEST`]. Authorization cannot live here, but
-    /// response filtering can: a handler reads the response headers and
-    /// the extensions, which covers stripping a header, enforcing a
-    /// content type, and attaching labels. Not body redaction, since
-    /// [`HttpExtension`][crate::extensions::http::HttpExtension] carries
-    /// no body and the payload on this path is unused. A host that only
-    /// authorizes never fires it, and nothing changes for it.
-    HOOK_CMF_HTTP_RESPONSE: "cmf.http_response" => entity: Some(ENTITY_HTTP), phase: Post;
+    HOOK_CMF_RESOURCE_POST_FETCH: "cmf.resource_post_fetch" =>
+        family: CmfHook, entity: Some(ENTITY_RESOURCE), phase: Post;
 }

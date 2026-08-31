@@ -188,6 +188,8 @@ fn extensions_with_label(label: &str) -> Extensions {
 #[tokio::test]
 async fn plugin_with_read_labels_sees_labels_through_apl_handler() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: label-reader
     kind: label-reader
@@ -195,9 +197,9 @@ plugins:
     capabilities: [read_labels]
 routes:
   - tool: get_weather
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(label-reader)"
+        - "run(label-reader)"
 "#;
 
     let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -250,15 +252,17 @@ routes:
 #[tokio::test]
 async fn plugin_without_read_labels_sees_stripped_view() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: label-reader
     kind: label-reader
     hooks: [cmf.tool_pre_invoke]
 routes:
   - tool: get_weather
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(label-reader)"
+        - "run(label-reader)"
 "#;
 
     let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -308,6 +312,8 @@ routes:
 #[tokio::test]
 async fn write_capabilities_propagate_through_apl_handler() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: label-writer
     kind: label-writer
@@ -315,9 +321,9 @@ plugins:
     capabilities: [append_labels, read_labels]
 routes:
   - tool: get_weather
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(label-writer)"
+        - "run(label-writer)"
 "#;
 
     let mgr = Arc::new(PolicyEngine::default());
@@ -367,10 +373,12 @@ routes:
 #[tokio::test]
 async fn predicate_only_route_uses_baseline_capabilities() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - tool: get_weather
-    apl:
+    authorization:
       pre_invocation:
         - "require(authenticated)"
 "#;
@@ -409,10 +417,12 @@ routes:
 #[tokio::test]
 async fn empty_baseline_strips_predicate_view() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins: []
 routes:
   - tool: get_weather
-    apl:
+    authorization:
       pre_invocation:
         - "require(authenticated)"
 "#;

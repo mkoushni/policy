@@ -1,24 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-// APL parser — DSL string → IR, and YAML config → HashMap<route_key, CompiledRoute>.
+// APL parser: policy text to IR.
 //
-// Runs once at config load. The IR it produces is what the evaluator walks
-// at request time; the parser is never on the hot path.
+// The grammar this accepts is written down in docs/apl-grammar.md, and that
+// document is normative. This file used to carry the description instead, in a
+// comment block that had gone wrong on four counts: it claimed steps, pipe chains,
+// `in` / `not in` / `exists()` and `sequential:` / `parallel:` were all rejected,
+// long after each was implemented. A grammar kept in a comment beside its parser
+// is a grammar nobody can hold the parser to, which is why it moved out.
 //
-// Grammar: predicates, rules, EBNF. YAML shape: `routes:` as a map
-// keyed by route_key.
+// crates/ppe-apl-core/tests/conformance/ is what holds the two in agreement.
 //
-// Scope:
-//   ✓ Predicate grammar: identifiers, literals, comparisons, contains,
-//     & | ! parens, require(...)
-//   ✓ Actions: deny / allow / (default deny on missing)
-//   ✓ YAML top-level routes: keyed map, authorization.pre_invocation /
-//     post_invocation blocks (flat pre_invocation:/post_invocation: too)
-//   ✗ Steps (cedar:(), opa(), plugin(), taint()) — rejected with clear errors
-//   ✗ Pipe chains in args:/result: — fields parsed, values stashed as opaque
-//   ✗ `in` / `not in` / `exists()` — need IR variants first; rejected
-//   ✗ Multi-effect do: lists, sequential:/parallel: blocks — rejected
+// What lives here:
+//
+//   * `Lexer` — tokens. Quoted literals go through `crate::lexical`, which is the
+//     one reader for one, shared with every splitter below.
+//   * `PredParser` — the predicate grammar, by precedence climbing.
+//   * `parse_rule` — a predicate and an action.
+//   * `parse_step` / `parse_step_map` — the step forms, string and map.
+//   * `parse_pipeline` / `parse_stage` — field chains.
+//   * `compile_policy_block_value` — a section's policy block to a CompiledRoute.
+//     This is the entry point an orchestrator uses.
+//
+// Runs once at config load. The IR it produces is what the evaluator walks at
+// request time; the parser is never on the hot path, so clarity wins over speed
+// throughout.
 
 use std::collections::HashMap;
 
@@ -26,7 +33,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::pipeline::{FieldRule, Pipeline, ScanKind, Stage, TaintScope, TypeCheck};
-use crate::plugin_decl::{PluginDeclaration, PluginOverride, PluginRegistry};
+use crate::plugin_decl::PluginOverride;
 use crate::rules::{CompareOp, CompiledRoute, Condition, Effect, Expression, Literal, Rule};
 use crate::step::{DelegateStep, ElicitKind, ElicitStep, PdpCall, PdpDialect, Step};
 
@@ -64,30 +71,17 @@ pub enum ParseError {
         msg: String,
     },
 
-    /// The document uses a field name that has since been renamed. Rejected
-    /// rather than ignored, because an unknown field is dropped silently and its
-    /// steps would never run.
-    #[error("in `{location}`: config field `{old}` was renamed to `{new}` — update your config")]
-    RenamedField {
-        /// Where in the document the stale field appears.
-        location: String,
-        /// The old field name.
-        old: String,
-        /// The name to use instead.
-        new: String,
-    },
-
-    /// The same phase is declared both nested and flat, which would run its
-    /// effects twice.
+    /// An `authorization:` block contributes no step, so it authorizes
+    /// nothing. Either it names neither phase, or every phase it names is an
+    /// empty list.
     #[error(
-        "in `{location}`: `{phase}` is declared both nested under `authorization:` and flat on \
-         the section — use one form, not both (declaring both runs the effects twice)"
+        "in `{location}`: `authorization:` contributes no step; it declares neither \
+         `pre_invocation:` nor `post_invocation:`, or declares them empty. Name at least one \
+         step, or remove the block"
     )]
-    ConflictingAuthorizationForms {
-        /// Where in the document the conflict appears.
+    EmptyAuthorization {
+        /// Where in the document the empty block appears.
         location: String,
-        /// The phase declared twice.
-        phase: String,
     },
 }
 
@@ -104,9 +98,12 @@ enum Tok {
     GtEq,  // >=
     Lt,    // <
     LtEq,  // <=
-    And,   // &  (must have surrounding spaces — caller enforces)
+    And,   // & — spacing around it is not significant
     Or,    // |
     Not,   // !
+    /// The word `not`, legal only in the `not in` phrase. Reserved so that
+    /// `not authenticated` names `!` rather than reading as an attribute.
+    NotWord,
     LParen,
     RParen,
     Comma,
@@ -115,6 +112,23 @@ enum Tok {
     Exists,   // keyword
     In,       // keyword — set membership operator
 }
+
+/// What replaced `run(name)`, named wherever the old spelling is refused.
+const PLUGIN_IS_RUN: &str = "`plugin(name)` is not a step; `run(name)` is the one form that \
+                             invokes a plugin, in a step list and in a pipe chain alike";
+
+/// What an empty path segment breaks, named wherever one is found.
+const EMPTY_SEGMENT: &str = "empty segment in an attribute path; a path is dot-separated names, \
+                             so `a..b`, `a.` and `.a` name nothing";
+
+/// What the word `not` is for, named wherever it is refused.
+const NOT_IS_RESERVED: &str = "`not` is reserved for the `not in` phrase; APL spells predicate \
+                               negation `!`, as in `!authenticated`";
+
+/// What a number may look like, named by every rejection of one.
+const NUMBER_SHAPE: &str = "a number is an optional `-`, then digits, then optionally `.` and \
+                            more digits; there is no exponent form, and digits are required on \
+                            both sides of the dot";
 
 struct Lexer<'a> {
     src: &'a str,
@@ -174,10 +188,22 @@ impl<'a> Lexer<'a> {
                 },
                 b'&' => {
                     self.pos += 1;
+                    if self.peek() == Some(b'&') {
+                        return Err(self.err_at(
+                            self.pos - 1,
+                            "`&&` is not an operator; APL spells conjunction `&`",
+                        ));
+                    }
                     Tok::And
                 },
                 b'|' => {
                     self.pos += 1;
+                    if self.peek() == Some(b'|') {
+                        return Err(self.err_at(
+                            self.pos - 1,
+                            "`||` is not an operator; APL spells disjunction `|`",
+                        ));
+                    }
                     Tok::Or
                 },
                 b'=' => {
@@ -216,60 +242,67 @@ impl<'a> Lexer<'a> {
                         Tok::Lt
                     }
                 },
-                b'"' | b'\'' => self.lex_string(b)?,
+                b if crate::lexical::is_quote(b) => self.lex_string()?,
                 b'-' | b'0'..=b'9' => self.lex_number()?,
+                b'.' if self.bytes.get(self.pos + 1).is_some_and(u8::is_ascii_digit) => {
+                    return Err(self.err(NUMBER_SHAPE));
+                },
+                b'.' => return Err(self.err(EMPTY_SEGMENT)),
                 b if is_ident_start(b) => self.lex_ident_or_keyword()?,
-                _ => return Err(self.err(&format!("unexpected char `{}`", b as char))),
+                _ => {
+                    let ch = self
+                        .src
+                        .get(self.pos..)
+                        .and_then(|rest| rest.chars().next())
+                        .unwrap_or(char::REPLACEMENT_CHARACTER);
+                    return Err(self.err(&format!("unexpected character `{ch}`")));
+                },
             };
             out.push(tok);
         }
     }
 
-    fn lex_string(&mut self, quote: u8) -> Result<Tok, ParseError> {
-        self.bump(); // opening quote
-        let start = self.pos;
-        while let Some(b) = self.peek() {
-            if b == quote {
-                break;
-            }
-            self.pos += 1;
-        }
-        if self.peek() != Some(quote) {
-            return Err(self.err("unterminated string literal"));
-        }
-        let s = self
-            .bytes
-            .get(start..self.pos)
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .ok_or_else(|| self.err("non-utf8 in string literal"))?
-            .to_owned();
-        self.bump(); // closing quote
-        Ok(Tok::StringLit(s))
+    fn lex_string(&mut self) -> Result<Tok, ParseError> {
+        let lit = crate::lexical::read_literal(self.src, self.pos).map_err(|e| self.at(&e))?;
+        self.pos = lit.end;
+        Ok(Tok::StringLit(lit.value))
     }
 
+    /// A number is an optional `-`, then one or more digits, then optionally a
+    /// `.` and one or more digits. No exponent, no separators, no radix prefix.
+    ///
+    /// Digits are required on both sides of the dot, which `1.`, `.5` and `-.5`
+    /// each broke. `.5` was already refused, by falling off the end of the
+    /// dispatch table with a message about an unexpected character, while `-.5`
+    /// parsed as a float: one rule now, and it names the number either way.
+    ///
+    /// A leading zero is accepted and does not change the value: `007` is the
+    /// integer 7. Reading it as octal would alter a value silently, which is the
+    /// failure mode this work exists to remove.
     fn lex_number(&mut self) -> Result<Tok, ParseError> {
         let start = self.pos;
         if self.peek() == Some(b'-') {
             self.pos += 1;
         }
-        while let Some(b) = self.peek() {
-            if b.is_ascii_digit() {
-                self.pos += 1;
-            } else {
-                break;
-            }
+        let int_start = self.pos;
+        self.eat_digits();
+        if self.pos == int_start {
+            return Err(self.err_at(start, NUMBER_SHAPE));
         }
         let mut is_float = false;
         if self.peek() == Some(b'.') {
             is_float = true;
             self.pos += 1;
-            while let Some(b) = self.peek() {
-                if b.is_ascii_digit() {
-                    self.pos += 1;
-                } else {
-                    break;
-                }
+            let frac_start = self.pos;
+            self.eat_digits();
+            if self.pos == frac_start {
+                return Err(self.err_at(start, NUMBER_SHAPE));
             }
+        }
+        // An exponent is not part of the grammar, and letting it fall through
+        // produced a trailing-token error that never mentioned the number.
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            return Err(self.err_at(start, NUMBER_SHAPE));
         }
         let text = self
             .src
@@ -286,48 +319,55 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    fn eat_digits(&mut self) {
+        while let Some(b) = self.peek() {
+            if b.is_ascii_digit() {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
     fn lex_ident_or_keyword(&mut self) -> Result<Tok, ParseError> {
         let start = self.pos;
-        // An attribute path is ident-cont runs interleaved with `[...]`
-        // interpolation groups: `data.tenants[subject.tenant].data_region`.
-        // The bracket content is a nested attribute key the evaluator
-        // resolves at eval time — the lexer only delimits it.
+        // An attribute path is a production, not a run of permitted characters.
+        // It is dot-separated segments, each non-empty, optionally each followed
+        // by one `[...]` interpolation group holding a nested path.
+        //
+        // Every rejection below used to lex clean and then resolve to an absent
+        // attribute, which made a predicate silently false and a `require`
+        // silently deny: a policy that never matched and never said why.
         let mut has_bracket = false;
         loop {
+            let seg_start = self.pos;
             while let Some(b) = self.peek() {
-                if is_ident_cont(b) {
+                if is_segment_char(b) {
                     self.pos += 1;
                 } else {
                     break;
                 }
             }
+            if self.pos == seg_start {
+                return Err(self.err_at(seg_start, EMPTY_SEGMENT));
+            }
             if self.peek() == Some(b'[') {
                 has_bracket = true;
-                self.pos += 1; // consume `[`
-                let mut closed = false;
-                while let Some(b) = self.peek() {
-                    self.pos += 1;
-                    match b {
-                        b']' => {
-                            closed = true;
-                            break;
-                        },
-                        b'[' => return Err(self.err("nested `[` in attribute path")),
-                        _ => {},
-                    }
-                }
-                if !closed {
-                    return Err(self.err("unterminated `[` in attribute path"));
-                }
-                // Continue: more ident-cont chars or another `[...]` may follow.
-            } else {
-                break;
+                self.lex_subscript()?;
             }
+            if self.peek() == Some(b'.') {
+                self.pos += 1;
+                continue;
+            }
+            break;
         }
         let s = self
             .src
             .get(start..self.pos)
             .ok_or_else(|| self.err("bad identifier bounds"))?;
+        if s.starts_with("not.") {
+            return Err(self.err_at(start, NOT_IS_RESERVED));
+        }
         // A path with an interpolation group is never a keyword.
         if has_bracket {
             return Ok(Tok::Ident(s.to_owned()));
@@ -339,17 +379,91 @@ impl<'a> Lexer<'a> {
             "require" => Tok::Require,
             "exists" => Tok::Exists,
             "in" => Tok::In,
-            // "not" is NOT a keyword — it only appears in the `not in`
-            // phrase. The parser handles that as an Ident("not") + Tok::In
-            // sequence in parse_identifier_predicate.
+            // Reserved. It reaches the parser rather than failing here, because
+            // `not in` is the one phrase it is legal in and only the parser sees
+            // whether `in` follows. Everywhere else the parser names `!`.
+            "not" => Tok::NotWord,
             _ => Tok::Ident(s.to_owned()),
         })
     }
 
+    /// Consume one `[...]` interpolation group, whose content is a nested
+    /// attribute path the evaluator resolves per request.
+    ///
+    /// The content is a path, not raw text. It used to be raw, so an empty
+    /// subscript, a colon, and a quoted key all lexed clean and then looked up a
+    /// key nothing had. A quoted key was the quiet one: `data.t["a"]` looked up
+    /// the four characters `"a"`, quotes included, so it never matched.
+    fn lex_subscript(&mut self) -> Result<(), ParseError> {
+        let open = self.pos;
+        self.pos += 1; // `[`
+        let inner_start = self.pos;
+        loop {
+            match self.peek() {
+                Some(b']') => break,
+                Some(b'[') => {
+                    return Err(self.err("nested `[` in an attribute path subscript"));
+                },
+                Some(b) if is_segment_char(b) || b == b'.' => self.pos += 1,
+                Some(b) => {
+                    let ch = char::from(b);
+                    return Err(self.err(&format!(
+                        "`{ch}` in an attribute path subscript; a subscript holds a nested path, \
+                         so it takes names and dots and nothing else"
+                    )));
+                },
+                None => {
+                    return Err(self.err_at(open, "unterminated `[` in an attribute path"));
+                },
+            }
+        }
+        if self.pos == inner_start {
+            return Err(self.err_at(
+                open,
+                "empty subscript in an attribute path; a subscript holds the nested path whose \
+                 value is the key to look up",
+            ));
+        }
+        // Reject `a..b` and a trailing dot inside the group for the same reason
+        // as outside it.
+        let inner = self
+            .src
+            .get(inner_start..self.pos)
+            .ok_or_else(|| self.err("bad subscript bounds"))?;
+        if inner.starts_with('.') || inner.ends_with('.') || inner.contains("..") {
+            return Err(self.err_at(
+                inner_start,
+                "empty segment in an attribute path subscript; a subscript holds dot-separated \
+                 names",
+            ));
+        }
+        self.pos += 1; // `]`
+        Ok(())
+    }
+
     fn err(&self, msg: &str) -> ParseError {
+        self.err_at(self.pos, msg)
+    }
+
+    /// The same, for a fault whose position is not where the cursor stopped.
+    fn err_at(&self, at: usize, msg: &str) -> ParseError {
         ParseError::Predicate {
             predicate: self.src.to_owned(),
-            msg: format!("at byte {}: {}", self.pos, msg),
+            msg: format!(
+                "at character {}: {}",
+                crate::lexical::char_offset(self.src, at),
+                msg
+            ),
+        }
+    }
+
+    /// Carry a literal reader's fault out, keeping its position. The reader
+    /// reports a character offset already, so this must not run it through
+    /// `char_offset` a second time.
+    fn at(&self, e: &crate::lexical::LiteralError) -> ParseError {
+        ParseError::Predicate {
+            predicate: self.src.to_owned(),
+            msg: format!("at character {}: {}", e.at, e.msg),
         }
     }
 }
@@ -358,8 +472,8 @@ fn is_ident_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_'
 }
 
-fn is_ident_cont(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'.'
+fn is_segment_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 struct PredParser<'a> {
@@ -448,17 +562,70 @@ impl<'a> PredParser<'a> {
                     _ => Err(self.err("expected `)`")),
                 }
             },
-            // `require(...)` is a rule-level shorthand per the DSL grammar
-            // (`rule = require_call | predicate ...`), not a sub-predicate.
-            // Trying to nest it inside `&` / `|` is a grammar error.
-            Some(Tok::Require) => Err(self.err(
-                "`require(...)` is a rule-level shorthand, not a sub-predicate \
-                 — use `&` / `|` / `!` over bare identifiers instead",
-            )),
+            Some(Tok::Require) => self.parse_require(),
             Some(Tok::Exists) => self.parse_exists(),
             Some(Tok::Ident(_)) => self.parse_identifier_predicate(),
+            // `not authenticated` used to read as an attribute called `not`
+            // followed by a stray token, so the error named neither `not` nor the
+            // operator the author wanted.
+            Some(Tok::NotWord) => Err(self.err(NOT_IS_RESERVED)),
+            // A comparison is written attribute-first. Rejected rather than
+            // rewritten: reading `'x' == a` as `a == 'x'` would accept text whose
+            // meaning the author only guessed at.
+            Some(Tok::StringLit(_) | Tok::IntLit(_) | Tok::FloatLit(_) | Tok::BoolLit(_)) => {
+                Err(self.err(
+                    "a comparison names the attribute first, as in `subject.tenant == 'acme'`; a \
+                 literal cannot open one",
+                ))
+            },
             other => Err(self.err(&format!("expected atom, got {other:?}"))),
         }
+    }
+
+    /// `require(P)`, which means `!P`.
+    ///
+    /// A rule stores the condition under which it denies, so requiring `P` is
+    /// denying on `!P`. Inside the parens the comma is conjunction and binds
+    /// lower than `&` and `|`, so `require(a, b | c)` is `!(a & (b | c))`.
+    ///
+    /// This replaces a hand-written parser that accepted only a comma-or-pipe
+    /// list of bare identifiers, refused to mix the two, and could not be nested.
+    /// A comparison, a negation and a parenthesized group were all unwritable
+    /// here, not because any is ambiguous but because there was no code path.
+    ///
+    /// [`normalize_not`] is what makes this a refactor rather than a
+    /// reinterpretation: it folds the negation down to the same tree the old
+    /// desugaring produced for each of the three forms that were legal.
+    fn parse_require(&mut self) -> Result<Expression, ParseError> {
+        self.bump(); // `require`
+        if !matches!(self.peek(), Some(Tok::LParen)) {
+            return Err(self.err("expected `(` after `require`"));
+        }
+        self.bump();
+        let mut parts = Vec::new();
+        loop {
+            parts.push(self.parse_or()?);
+            match self.peek() {
+                Some(Tok::Comma) => {
+                    self.bump();
+                },
+                Some(Tok::RParen) => {
+                    self.bump();
+                    break;
+                },
+                other => {
+                    return Err(self.err(&format!(
+                        "expected `,` or `)` in `require(...)`, got {other:?}"
+                    )));
+                },
+            }
+        }
+        let inner = if parts.len() == 1 {
+            parts.pop().unwrap_or(Expression::Always)
+        } else {
+            Expression::And(parts)
+        };
+        Ok(normalize_not(inner))
     }
 
     /// `exists(<identifier>)`. Returns true if the key is present
@@ -506,21 +673,15 @@ impl<'a> PredParser<'a> {
             self.bump();
             return self.finish_in_set(key, false);
         }
-        // `not in` shows up as Ident("not") + Tok::In. Treat that as a
-        // grammar phrase here; bare `not` outside this context is not a
-        // DSL keyword (use `!` for predicate negation).
-        if let Some(Tok::Ident(maybe_not)) = self.peek()
-            && maybe_not == "not"
-        {
-            let saved_pos = self.pos;
-            self.bump(); // consume "not"
+        // `not in` is the one place the word `not` is legal. Anywhere else it
+        // names `!`, which is what `parse_atom` reports.
+        if matches!(self.peek(), Some(Tok::NotWord)) {
+            self.bump();
             if matches!(self.peek(), Some(Tok::In)) {
                 self.bump();
                 return self.finish_in_set(key, true);
             }
-            // Not "not in" — rewind so the downstream error reports
-            // the trailing-ident properly.
-            self.pos = saved_pos;
+            return Err(self.err(NOT_IS_RESERVED));
         }
 
         let op = match self.peek() {
@@ -599,7 +760,7 @@ pub fn parse_predicate(src: &str) -> Result<Expression, ParseError> {
 /// 3. `"<predicate>"` becomes `Rule { condition, action: Deny }`
 /// 4. `"<action>"` alone is form 3 with an always-true predicate
 ///
-/// **Step kinds** (`plugin(...)`, `taint(...)`, `cedar:`, `opa(...)` etc.)
+/// **Step kinds** (`run(...)`, `taint(...)`, `cedar:`, `opa(...)` etc.)
 /// are handled by `parse_step`, not here. This function specifically parses
 /// predicate-and-action rules; callers that don't know which they have
 /// should use `parse_step` instead.
@@ -610,19 +771,14 @@ pub fn parse_predicate(src: &str) -> Result<Expression, ParseError> {
 pub fn parse_rule(line: &str, source: &str) -> Result<Rule, ParseError> {
     let trimmed = line.trim();
 
-    // require(...) shorthand — special-cased because it desugars to a
-    // negated predicate + Deny action, and the spec grammar puts it
-    // as a top-level rule alternative, not a sub-predicate.
-    if is_require_call(trimmed) {
-        let condition = parse_require_rule(trimmed)?;
-        return Ok(Rule::single(
-            condition,
-            Effect::Deny {
-                reason: None,
-                code: None,
-            },
-            source,
-        ));
+    // The removed invoke spelling, named before anything else reads the line. It
+    // is not a step kind any more, so without this it reaches the predicate
+    // parser, which lexes a hyphenated plugin name as a number and reports that.
+    if trimmed.trim_start().starts_with("plugin(") {
+        return Err(ParseError::Rule {
+            rule: trimmed.to_owned(),
+            msg: PLUGIN_IS_RUN.to_owned(),
+        });
     }
 
     // Step kinds shouldn't end up here. If they do, the caller used the
@@ -668,6 +824,31 @@ pub fn parse_rule(line: &str, source: &str) -> Result<Rule, ParseError> {
         )
     };
 
+    // A field operation is not a rule. `result.x | redact` used to compile as a
+    // disjunction of two truthy attributes and take the default deny, so a
+    // pipeline written one position too high enforced something its author never
+    // asked for. Reported before the predicate parse, so the message names the
+    // position rather than a predicate that happened to lex.
+    if let Some(field) = field_operation_in_rule_position(predicate_str) {
+        return Err(ParseError::Rule {
+            rule: trimmed.to_owned(),
+            msg: format!(
+                "`{field}` is a field operation, and this is effect position: a rule here is a \
+                 predicate with an optional `allow`/`deny`. Move the chain under `args:` or \
+                 `result:`, keyed by the field it names"
+            ),
+        });
+    }
+
+    if is_require_form(predicate_str) && effects.iter().any(|e| matches!(e, Effect::Allow)) {
+        return Err(ParseError::Rule {
+            rule: trimmed.to_owned(),
+            msg: "`require(...)` states what must hold and denies when it does not, so its \
+                  action can only be `deny`; write the predicate without `require` to allow on it"
+                .to_owned(),
+        });
+    }
+
     let condition = parse_predicate(predicate_str).map_err(|e| ParseError::Rule {
         rule: trimmed.to_owned(),
         msg: format!("{e}"),
@@ -680,99 +861,88 @@ pub fn parse_rule(line: &str, source: &str) -> Result<Rule, ParseError> {
     })
 }
 
-fn is_require_call(s: &str) -> bool {
-    s.trim_start().starts_with("require(")
+/// The negation of `e`, pushed down to the leaves.
+///
+/// Folding rather than wrapping is what makes `require(P)` a refactor of the old
+/// hand-written desugaring instead of a new interpretation of it:
+///
+/// * `require(a)` gives `IsFalse(a)`, as it did.
+/// * `require(a, b)` gives `Or([IsFalse(a), IsFalse(b)])`, as it did.
+/// * `require(a | b)` gives `And([IsFalse(a), IsFalse(b)])`, as it did.
+///
+/// Those three were the whole of what the old parser accepted, so no deployed
+/// policy changes shape. A comparison has no negated condition variant, so it
+/// keeps an explicit `Not` around it.
+fn normalize_not(e: Expression) -> Expression {
+    match e {
+        Expression::Condition(Condition::IsTrue { key }) => {
+            Expression::Condition(Condition::IsFalse { key })
+        },
+        Expression::Condition(Condition::IsFalse { key }) => {
+            Expression::Condition(Condition::IsTrue { key })
+        },
+        // De Morgan, so the negation reaches the leaves rather than sitting on a
+        // group the evaluator would have to invert at request time.
+        Expression::And(parts) => Expression::Or(parts.into_iter().map(normalize_not).collect()),
+        Expression::Or(parts) => Expression::And(parts.into_iter().map(normalize_not).collect()),
+        // A double negation folds, which is what lets `require(!delegated)` mean
+        // `delegated` rather than nesting two inversions.
+        Expression::Not(inner) => *inner,
+        other => Expression::Not(Box::new(other)),
+    }
 }
 
-/// Parse `require(a)` / `require(a, b, ...)` / `require(a | b | ...)` and
-/// return the desugared "when" expression:
+/// Whether a rule's predicate half *is* a `require(...)` call, as opposed to
+/// containing one.
 ///
-///   require(X)             →  IsFalse(X)
-///   require(X, Y, ...)     →  Or([IsFalse(X), IsFalse(Y), ...])   (deny if any falsy)
-///   require(X | Y | ...)   →  And([IsFalse(X), IsFalse(Y), ...])  (deny if all falsy)
+/// Textual because the rule grammar is textual at this level: a rule is a
+/// predicate, a colon and an action, and this asks which of the two shapes the
+/// predicate is so the action can be checked against it. The predicate itself is
+/// parsed by `parse_predicate` like any other.
 ///
-/// Caller wraps with `Effect::Deny`.
-fn parse_require_rule(line: &str) -> Result<Expression, ParseError> {
-    let toks = Lexer::new(line).tokenize_all()?;
-    let mut iter = toks.into_iter().peekable();
-
-    let bad = |msg: &str| ParseError::Rule {
-        rule: line.to_owned(),
-        msg: msg.to_owned(),
+/// The call has to consume the whole predicate. A prefix test made the guard
+/// asymmetric: `require(a) & b: allow` was refused while `a & require(b): allow`
+/// was accepted, though the grammar documents both as legal composition and
+/// restricts only a rule whose *whole* predicate is the call. Do not simplify
+/// this back to `starts_with`.
+fn is_require_form(s: &str) -> bool {
+    let Some(rest) = s.trim().strip_prefix("require") else {
+        return false;
     };
-
-    match iter.next() {
-        Some(Tok::Require) => {},
-        _ => return Err(bad("expected `require`")),
-    }
-    match iter.next() {
-        Some(Tok::LParen) => {},
-        _ => return Err(bad("expected `(` after `require`")),
-    }
-
-    let mut keys = Vec::new();
-    let mut sep: Option<Tok> = None;
-
-    match iter.next() {
-        Some(Tok::Ident(s)) => keys.push(s),
-        _ => return Err(bad("expected identifier inside `require(...)`")),
-    }
-
-    loop {
-        match iter.next() {
-            Some(Tok::RParen) => break,
-            Some(t @ (Tok::Comma | Tok::Or)) => {
-                match &sep {
-                    None => sep = Some(t),
-                    Some(prev) if std::mem::discriminant(prev) == std::mem::discriminant(&t) => {},
-                    _ => {
-                        return Err(bad(
-                            "require(...) cannot mix `,` (AND) and `|` (OR) — use one or the other",
-                        ));
-                    },
-                }
-                match iter.next() {
-                    Some(Tok::Ident(s)) => keys.push(s),
-                    _ => return Err(bad("expected identifier after `,` or `|` in require(...)")),
-                }
-            },
-            Some(other) => {
-                return Err(bad(&format!(
-                    "expected `,`, `|`, or `)` in require(...), got {other:?}",
-                )));
-            },
-            None => return Err(bad("unexpected end of require(...) — missing `)`")),
-        }
-    }
-
-    if iter.peek().is_some() {
-        return Err(bad(
-            "trailing tokens after `require(...)` — require is a complete rule",
-        ));
-    }
-
-    let mut falses: Vec<Expression> = keys
-        .into_iter()
-        .map(|k| Expression::Condition(Condition::IsFalse { key: k }))
-        .collect();
-    // Single key: yield the condition itself rather than a one-element group.
-    if falses.len() == 1
-        && let Some(only) = falses.pop()
-    {
-        return Ok(only);
-    }
-    Ok(match sep {
-        Some(Tok::Or) => Expression::And(falses), // require(X | Y) → !X & !Y
-        _ => Expression::Or(falses),              // require(X, Y)  → !X | !Y
-    })
+    // The predicate lexer skips whitespace between the name and its `(`, so
+    // `require (a)` is the same shape and has to be caught with it.
+    let normalized = format!("require{}", rest.trim_start());
+    // `extract_call_args` reads the outermost matching parens and already refuses
+    // anything after the `)` it closed on, so asking it is the exact-form test.
+    extract_call_args(&normalized, "require").is_some()
 }
 
-/// Detect `taint(...)` / `plugin(...)` / `run(...)` / `cedar:` / `opa(` / `authzen(` / `nemo(` / `cel:`.
+/// The field path a rule line names, when the line is really a field operation.
+///
+/// Deliberately narrow. `result.x | result.y: deny` is a **legal** disjunction of
+/// two truthy attributes and has to keep compiling, so an `args.`/`result.` head
+/// is not enough on its own. What separates the two is whether any later segment
+/// is a stage rather than another attribute path, which [`parse_stage`] is the
+/// authority on: widen this by hand and the two answers drift.
+fn field_operation_in_rule_position(predicate: &str) -> Option<&str> {
+    let segments = split_top_level(predicate.trim(), b'|');
+    let (head, rest) = segments.split_first()?;
+    let head = head.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    if !(head.starts_with("args.") || head.starts_with("result.")) {
+        return None;
+    }
+    rest.iter()
+        .any(|seg| parse_stage(seg.trim()).is_ok())
+        .then_some(head)
+}
+
 fn detect_step_kind(s: &str) -> Option<&'static str> {
     let s = s.trim_start();
     for prefix in [
         "taint(",
-        "plugin(",
         "run(",
         "cedar:",
         "opa(",
@@ -795,19 +965,35 @@ fn detect_step_kind(s: &str) -> Option<&'static str> {
 /// arbitrary text.
 fn split_predicate_action(s: &str) -> Option<(&str, &str)> {
     let bytes = s.as_bytes();
-    let mut depth: i32 = 0;
-    let mut in_quote: Option<u8> = None;
+    let mut parens: i32 = 0;
+    let mut brackets: i32 = 0;
     let mut last_colon: Option<usize> = None;
-    for (i, &b) in bytes.iter().enumerate() {
-        match (in_quote, b) {
-            (Some(q), c) if c == q => in_quote = None,
-            (Some(_), _) => {},
-            (None, b'"' | b'\'') => in_quote = Some(b),
-            (None, b'(') => depth += 1,
-            (None, b')') => depth -= 1,
-            (None, b':') if depth == 0 => last_colon = Some(i),
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        if crate::lexical::is_quote(b) {
+            // One reader for a literal, so a colon inside quoted text is skipped
+            // by the same rule the lexer reads it with. An unterminated literal
+            // stops the scan rather than swallowing the rest of the line: the
+            // caller finds no action and the lexer then names the literal, which
+            // is the fault the author can act on.
+            match crate::lexical::skip_literal(s, i) {
+                Ok(end) => i = end,
+                Err(_) => break,
+            }
+            continue;
+        }
+        match b {
+            b'(' => parens += 1,
+            b')' => parens = parens.saturating_sub(1),
+            // Brackets count too. They did not, while both sibling splitters
+            // counted them, so a colon inside a subscript on a bare-predicate
+            // line split the rule into a predicate and a nonsense action.
+            b'[' => brackets += 1,
+            b']' => brackets = brackets.saturating_sub(1),
+            b':' if parens == 0 && brackets == 0 => last_colon = Some(i),
             _ => {},
         }
+        i += 1;
     }
     last_colon.and_then(|i| Some((s.get(..i)?.trim(), s.get(i + 1..)?.trim())))
 }
@@ -891,13 +1077,16 @@ fn try_parse_deny_call(s: &str, rule: &str) -> Result<Option<Effect>, ParseError
 /// double quotes too so YAML escaping is forgiving.
 fn strip_string_literal(s: &str, rule: &str) -> Result<String, ParseError> {
     let s = s.trim();
-    if let Some(inner) = unwrap_quotes(s) {
-        Ok(inner.to_owned())
-    } else {
-        Err(ParseError::Rule {
+    match literal_or_bare(s) {
+        Ok(Some(inner)) => Ok(inner),
+        Ok(None) => Err(ParseError::Rule {
             rule: rule.to_owned(),
             msg: format!("expected a quoted string, got `{s}`"),
-        })
+        }),
+        Err(e) => Err(ParseError::Rule {
+            rule: rule.to_owned(),
+            msg: e.msg,
+        }),
     }
 }
 
@@ -907,7 +1096,7 @@ fn strip_string_literal(s: &str, rule: &str) -> Result<String, ParseError> {
 /// - **String entry** — a rule line, taint effect, or plugin call.
 ///   - `"require(authenticated)"` → `Step::Rule`
 ///   - `"delegation.depth > 2: deny"` → `Step::Rule`
-///   - `"plugin(rate_limiter)"` → `Step::Plugin` (`"run(rate_limiter)"` is an alias)
+///   - `"run(rate_limiter)"` → `Step::Plugin`
 ///   - `"taint(PII, session)"` → `Step::Taint`
 /// - **Map entry** (single-key map) — PDP call with optional reactions.
 ///   - `cedar: { action: read, resource: e, on_deny: [...] }` → `Step::Pdp`
@@ -949,16 +1138,16 @@ fn parse_step_string(line: &str, source: &str) -> Result<Step, ParseError> {
         });
     }
 
-    // plugin(name) / run(name) — invoke a named plugin. `run` is an
-    // alias for `plugin`; both emit Step::Plugin.
-    let plugin_verb = if trimmed.starts_with("plugin(") {
-        Some("plugin")
-    } else if trimmed.starts_with("run(") {
-        Some("run")
-    } else {
-        None
-    };
-    if let Some(verb) = plugin_verb {
+    // `run(name)` invokes a named plugin. `plugin(name)` was a second spelling
+    // for the same thing; it is refused below, naming this one.
+    if trimmed.starts_with("plugin(") {
+        return Err(ParseError::Rule {
+            rule: trimmed.to_owned(),
+            msg: PLUGIN_IS_RUN.to_owned(),
+        });
+    }
+    if trimmed.starts_with("run(") {
+        let verb = "run";
         let inside = extract_call_args(trimmed, verb).ok_or_else(|| ParseError::Rule {
             rule: trimmed.to_owned(),
             msg: format!("malformed `{verb}(...)`"),
@@ -1072,8 +1261,11 @@ fn parse_delegate_call_args(inside: &str, source: &str) -> Result<ParsedDelegate
                  positional argument"
             ),
         })?;
-    // Strip wrapping quotes if the operator wrote `delegate("workday-oauth", ...)`.
-    let plugin_name = strip_wrapping_quotes(&plugin_name).to_owned();
+    // Read the name whether it was written bare or as a literal.
+    let plugin_name = literal_value(&plugin_name).map_err(|msg| ParseError::Rule {
+        rule: format!("delegate({inside})"),
+        msg: format!("{source}: {msg}"),
+    })?;
     if plugin_name.is_empty() {
         return Err(ParseError::Rule {
             rule: format!("delegate({inside})"),
@@ -1201,7 +1393,7 @@ fn parse_elicit_call_args(
     // First positional argument: the plugin name (same as delegate()).
     let plugin_name = parts_iter
         .next()
-        .map(|s| strip_wrapping_quotes(s.trim()).to_owned())
+        .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| ParseError::Rule {
             rule: format!("{verb}({inside})"),
@@ -1210,6 +1402,12 @@ fn parse_elicit_call_args(
                  as the first positional argument"
             ),
         })?;
+    // Read the name whether it was written bare or as a literal, the same way
+    // `delegate(...)` reads its own.
+    let plugin_name = literal_value(&plugin_name).map_err(|msg| ParseError::Rule {
+        rule: format!("{verb}({inside})"),
+        msg: format!("{source}: {msg}"),
+    })?;
 
     let mut from: Option<String> = None;
     let mut channel: Option<String> = None;
@@ -1311,29 +1509,28 @@ fn split_top_level_commas(input: &str) -> Result<Vec<String>, String> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut bracket_depth: usize = 0;
-    let mut quote: Option<char> = None;
-    let mut escape = false;
+    let bytes = input.as_bytes();
+    let mut i = 0;
 
-    for ch in input.chars() {
-        if escape {
-            current.push(ch);
-            escape = false;
+    while let Some(&b) = bytes.get(i) {
+        if crate::lexical::is_quote(b) {
+            // Step over the literal with the shared reader, keeping its text
+            // verbatim: each part is handed on to `literal_value`, which is what
+            // resolves the escapes, so resolving them here too would do it twice.
+            // What changes is that the escape rule is the lexer's now, where this
+            // site used to carry one of its own.
+            let end = crate::lexical::skip_literal(input, i).map_err(|e| e.msg)?;
+            current.push_str(input.get(i..end).unwrap_or_default());
+            i = end;
             continue;
         }
-        if let Some(q) = quote {
-            current.push(ch);
-            if ch == '\\' {
-                escape = true;
-            } else if ch == q {
-                quote = None;
-            }
-            continue;
-        }
+        // Take one whole character, so a multi-byte one outside a literal survives
+        // rather than being rebuilt from a single byte.
+        let ch = input
+            .get(i..)
+            .and_then(|rest| rest.chars().next())
+            .ok_or_else(|| "delegate(...) args are cut mid-character".to_owned())?;
         match ch {
-            '"' | '\'' => {
-                quote = Some(ch);
-                current.push(ch);
-            },
             '[' | '(' | '{' => {
                 bracket_depth += 1;
                 current.push(ch);
@@ -1349,9 +1546,7 @@ fn split_top_level_commas(input: &str) -> Result<Vec<String>, String> {
             },
             _ => current.push(ch),
         }
-    }
-    if quote.is_some() {
-        return Err("unterminated quoted string in delegate(...) args".to_owned());
+        i += ch.len_utf8();
     }
     if bracket_depth != 0 {
         return Err("unbalanced brackets in delegate(...) args".to_owned());
@@ -1381,9 +1576,9 @@ fn parse_delegate_value(s: &str) -> Result<serde_yaml::Value, String> {
         }
         return Ok(serde_yaml::Value::Sequence(out));
     }
-    // Quoted string — strip the surrounding quotes.
-    if let Some(inner) = unwrap_quotes(trimmed) {
-        return Ok(serde_yaml::Value::String(inner.to_owned()));
+    // A quoted literal, read by the same rule the lexer reads one with.
+    if let Some(inner) = literal_or_bare(trimmed).map_err(|e| e.msg)? {
+        return Ok(serde_yaml::Value::String(inner));
     }
     // Bool literals.
     if trimmed == "true" {
@@ -1413,17 +1608,36 @@ fn parse_delegate_value(s: &str) -> Result<serde_yaml::Value, String> {
 /// the length guard that made that safe, and `regex(")` or `enum(")` in a policy
 /// aborted the parser. Expressing the check as a strip pair cannot have that
 /// shape: a lone quote leaves nothing for the suffix strip to remove.
-fn unwrap_quotes(s: &str) -> Option<&str> {
-    ['"', '\'']
-        .into_iter()
-        .find_map(|q| s.strip_prefix(q).and_then(|rest| rest.strip_suffix(q)))
+/// Read `s` as one quoted literal, or as a bare word.
+///
+/// `Ok(Some(v))` for a literal with its escapes resolved, `Ok(None)` for text
+/// that opens no literal. A literal that is unterminated, carries an unrecognized
+/// escape, or is followed by anything is an error.
+///
+/// This replaces a `strip_prefix` / `strip_suffix` pair that stripped the
+/// outermost matching quotes without reading a literal, so `"a" == "b"` came back
+/// as `a" == "b`: two literals spliced through their inner quotes. It is also
+/// what makes `regex(")` an unterminated literal instead of a pattern matching
+/// one quote character.
+fn literal_or_bare(s: &str) -> Result<Option<String>, crate::lexical::LiteralError> {
+    crate::lexical::read_whole_literal(s)
 }
 
 /// Strip a single pair of wrapping `"`/`'` if present. No-op on
 /// unquoted input. Used for the positional plugin name where the
 /// operator may have quoted to escape a hyphen or similar (`delegate("workday-oauth")`).
-fn strip_wrapping_quotes(s: &str) -> &str {
-    unwrap_quotes(s).unwrap_or(s)
+/// The value of `s`, whether it was written as a literal or bare.
+///
+/// # Errors
+///
+/// Returns the message of a malformed literal, for a caller whose own error is a
+/// `String`.
+fn literal_value(s: &str) -> Result<String, String> {
+    match literal_or_bare(s) {
+        Ok(Some(v)) => Ok(v),
+        Ok(None) => Ok(s.trim().to_owned()),
+        Err(e) => Err(e.msg),
+    }
 }
 
 fn parse_step_map(m: &serde_yaml::Mapping, source: &str) -> Result<Step, ParseError> {
@@ -1511,27 +1725,13 @@ fn parse_step_map(m: &serde_yaml::Mapping, source: &str) -> Result<Step, ParseEr
         _ => {},
     }
 
-    // Split the key into "dialect" + optional "(args)" portion.
-    let (dialect_str, paren_args) = if let Some(open) = key.find('(') {
-        let close = key.rfind(')').ok_or_else(|| ParseError::Rule {
-            rule: key.to_owned(),
-            msg: "missing `)` in PDP call signature".into(),
-        })?;
-        let inside = key
-            .get(open + 1..close)
-            .ok_or_else(|| ParseError::Rule {
-                rule: key.to_owned(),
-                msg: "malformed `()` in PDP call signature".into(),
-            })?
-            .trim()
-            .to_owned();
-        let dialect = key.get(..open).unwrap_or(key).trim();
-        (dialect, Some(inside))
-    } else {
-        (key.trim(), None)
-    };
-
-    let dialect = PdpDialect::from_key(dialect_str);
+    // Everything left is a PDP call, and the key set is closed. This used to
+    // split at `(` and hand the prefix to `PdpDialect::from_key`, which made
+    // every unhandled key a custom dialect: `whens:` compiled to a PDP lookup
+    // instead of failing, and `pdp(workload):` resolved `pdp` rather than
+    // `workload`, so the resolver registered for `workload` could never be
+    // reached.
+    let (dialect, paren_args) = parse_pdp_key(key)?;
 
     // Extract args + on_deny/on_allow.
     // Cedar: body map carries args fields directly + on_deny/on_allow.
@@ -1561,12 +1761,106 @@ fn has_key(m: &serde_yaml::Mapping, key: &str) -> bool {
 /// reaction list as a predicate-with-effects map.
 fn is_known_pdp_dialect(key: &str) -> bool {
     let base = key.find('(').and_then(|i| key.get(..i)).unwrap_or(key);
-    matches!(base.trim(), "cedar" | "opa" | "authzen" | "nemo" | "cel")
+    let base = base.trim();
+    // `pdp` counts. A sequence body is not a valid PDP shape either way, but
+    // routing `pdp(x): [deny]` through the PDP path reports "body must be a map"
+    // rather than trying to read `pdp(x)` as a predicate.
+    base == PDP_CUSTOM_KEY || PdpDialect::from_builtin_key(base).is_some()
+}
+
+/// The key that names a custom dialect: `pdp(name):`.
+const PDP_CUSTOM_KEY: &str = "pdp";
+
+/// What a step map may be keyed on, for the error that names the closed set.
+const STEP_MAP_KEYS: &str = "`when:` with `do:`, `sequential:`, `parallel:`, \
+                            `delegate:`, `restrict:`, a built-in PDP dialect \
+                            (`cedar:`, `cel:`, `opa:`, `authzen:`, `nemo:`), or \
+                            `pdp(name):` for a custom dialect";
+
+/// The dialect a step-map key names, and the call signature it carries.
+///
+/// Three productions, and nothing else: `pdp(name)` names a custom dialect, a
+/// built-in dialect names itself either bare or with a call signature, and any
+/// other key is a misspelling.
+///
+/// `pdp(name)` carries no call signature, because the parens hold the dialect
+/// name. A custom resolver reads its arguments from the body map, the way
+/// `cedar:` does.
+fn parse_pdp_key(key: &str) -> Result<(PdpDialect, Option<String>), ParseError> {
+    let trimmed = key.trim();
+    // A key quoted in YAML keeps the separator the parse already consumed
+    // (`- 'opa("p/q"):':`), so one trailing colon is redundant rather than
+    // content. Tolerated here so the check below is about dropped text.
+    let trimmed = trimmed.strip_suffix(':').map_or(trimmed, str::trim_end);
+    let Some((name, inside)) = split_call_key(trimmed)? else {
+        return PdpDialect::from_builtin_key(trimmed)
+            .map(|d| (d, None))
+            .ok_or_else(|| unknown_step_map_key(trimmed));
+    };
+    if name == PDP_CUSTOM_KEY {
+        if inside.is_empty() {
+            return Err(ParseError::Rule {
+                rule: trimmed.to_owned(),
+                msg: "`pdp(name):` names the custom dialect to route to, so the name must not \
+                      be empty"
+                    .to_owned(),
+            });
+        }
+        return Ok((PdpDialect::Custom(inside), None));
+    }
+    PdpDialect::from_builtin_key(name)
+        .map(|d| (d, Some(inside)))
+        .ok_or_else(|| unknown_step_map_key(trimmed))
+}
+
+/// Split `name(literal)` into its two halves, or `None` when the key carries no
+/// call signature.
+///
+/// The closing paren has to terminate the key. Without that, trailing text after
+/// the `)` was read as part of neither half and silently dropped.
+fn split_call_key(key: &str) -> Result<Option<(&str, String)>, ParseError> {
+    let Some(open) = key.find('(') else {
+        return Ok(None);
+    };
+    let close = key.rfind(')').ok_or_else(|| ParseError::Rule {
+        rule: key.to_owned(),
+        msg: "missing `)` in PDP call signature".into(),
+    })?;
+    let after = key.get(close + 1..).unwrap_or("");
+    if close < open || !after.trim().is_empty() {
+        return Err(ParseError::Rule {
+            rule: key.to_owned(),
+            msg: "the `)` must end a PDP call signature, with nothing after it".into(),
+        });
+    }
+    // The argument is read as a literal, so a resolver receives the path the
+    // author wrote. This site stripped nothing, so `opa("hr/deny")` handed the
+    // resolver `"hr/deny"` with the quotes still on it.
+    let raw = key.get(open + 1..close).ok_or_else(|| ParseError::Rule {
+        rule: key.to_owned(),
+        msg: "malformed `()` in PDP call signature".into(),
+    })?;
+    let inside = literal_value(raw).map_err(|msg| ParseError::Rule {
+        rule: key.to_owned(),
+        msg,
+    })?;
+    Ok(Some((key.get(..open).unwrap_or(key).trim(), inside)))
+}
+
+/// A step-map key outside the closed set, named beside what is accepted.
+fn unknown_step_map_key(key: &str) -> ParseError {
+    ParseError::Rule {
+        rule: key.to_owned(),
+        msg: format!(
+            "`{key}:` is not a step-map key. Accepted: {STEP_MAP_KEYS}. A custom PDP dialect is \
+             written `pdp({key}):`, not `{key}:`"
+        ),
+    }
 }
 
 /// Parse the canonical `- when: X` `do: Y` rule form. `Y`
 /// may be a single effect string (`do: deny`) or a list of effect
-/// entries (`do: [plugin(audit), taint(X), deny('msg')]`). Map-form
+/// entries (`do: [run(audit), taint(X), deny('msg')]`). Map-form
 /// effects (like a nested `delegate:` block) are allowed inside `do:`
 /// via the same dispatch as top-level steps.
 fn parse_when_do_rule(m: &serde_yaml::Mapping, source: &str) -> Result<Step, ParseError> {
@@ -1956,7 +2250,7 @@ fn scalar_to_string(v: &serde_yaml::Value) -> Option<String> {
 }
 
 /// Parse one effect string. Reuses [`parse_step_string`] for forms
-/// shared with top-level steps (`plugin(...)`, `taint(...)`,
+/// shared with top-level steps (`run(...)`, `taint(...)`,
 /// `delegate(...)`, predicate-action rules), then collapses the
 /// resulting Step into an Effect.
 fn parse_effect_string(s: &str, source: &str) -> Result<Effect, ParseError> {
@@ -2030,27 +2324,25 @@ fn try_parse_field_op(s: &str, rule: &str) -> Result<Option<Effect>, ParseError>
 fn find_top_level_pipe(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut depth: i32 = 0;
-    let mut quote: Option<u8> = None;
     let mut i = 0;
     while let Some(&b) = bytes.get(i) {
-        if let Some(q) = quote {
-            if b == b'\\' {
-                i += 2;
-                continue;
+        if crate::lexical::is_quote(b) {
+            // This site skipped two bytes after a backslash, which is one of the
+            // three escape rules that used to coexist and the only one that could
+            // land mid-character on multi-byte content. The shared reader cannot.
+            match crate::lexical::skip_literal(s, i) {
+                Ok(end) => i = end,
+                Err(_) => return None,
             }
-            if b == q {
-                quote = None;
-            }
-            i += 1;
             continue;
         }
         match b {
-            b'\'' | b'"' => quote = Some(b),
             b'(' | b'[' => depth += 1,
-            b')' | b']' => depth -= 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
             b'|' if depth == 0 => {
-                // Skip `||` — never appears in effect strings today
-                // but defend against it anyway.
+                // `||` is not an operator, and the lexer says so. Stepping over it
+                // here keeps this from reading the first `|` as a chain separator
+                // and reporting a stage fault for an operator mistake.
                 if bytes.get(i + 1) == Some(&b'|') {
                     i += 2;
                     continue;
@@ -2294,7 +2586,7 @@ fn parse_reaction_list(
         .collect()
 }
 
-/// Extract the args inside a call like `taint(X, Y)` or `plugin(foo)`.
+/// Extract the args inside a call like `taint(X, Y)` or `run(foo)`.
 /// Returns the substring between the outermost matching parens.
 fn extract_call_args(line: &str, name: &str) -> Option<String> {
     let line = line.trim();
@@ -2305,10 +2597,26 @@ fn extract_call_args(line: &str, name: &str) -> Option<String> {
     if !after.starts_with('(') {
         return None;
     }
-    // Find the matching close paren.
+    // Find the matching close paren, stepping over quoted text rather than
+    // counting parens inside it. Counting them is why `deny("blocked (see
+    // policy)")` was refused as malformed: the paren in the reason closed the
+    // call early, and `deny("a)b")` closed it earlier still.
     let bytes = after.as_bytes();
     let mut depth = 0;
-    for (i, &b) in bytes.iter().enumerate() {
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        if crate::lexical::is_quote(b) {
+            if let Ok(end) = crate::lexical::skip_literal(after, i) {
+                i = end;
+                continue;
+            }
+            // Unterminated: treat the quote as an ordinary character so the close
+            // paren is still found, and let whoever reads the argument name the
+            // literal. Returning None here would report the call malformed for a
+            // quoting mistake.
+            i += 1;
+            continue;
+        }
         match b {
             b'(' => depth += 1,
             b')' => {
@@ -2323,6 +2631,7 @@ fn extract_call_args(line: &str, name: &str) -> Option<String> {
             },
             _ => {},
         }
+        i += 1;
     }
     None
 }
@@ -2338,11 +2647,23 @@ fn extract_call_args(line: &str, name: &str) -> Option<String> {
 /// arguments do not parse. A `validate` stage is rejected here because it is
 /// only meaningful on a field rule.
 pub fn parse_pipeline(src: &str) -> Result<Pipeline, ParseError> {
+    let trimmed = src.trim();
     let mut pipeline = Pipeline::new();
-    for seg in split_top_level(src.trim(), b'|') {
+    if trimmed.is_empty() {
+        // An absent field value, not a malformed chain. Kept because callers hand
+        // this an optional value directly.
+        return Ok(pipeline);
+    }
+    let segments = split_top_level(trimmed, b'|');
+    for seg in segments {
         let seg = seg.trim();
         if seg.is_empty() {
-            continue;
+            return Err(ParseError::Predicate {
+                predicate: src.to_owned(),
+                msg: "empty stage in a pipe chain; a leading, trailing or doubled `|` leaves a \
+                      position with no stage in it"
+                    .to_owned(),
+            });
         }
         pipeline.push(parse_stage(seg)?);
     }
@@ -2354,16 +2675,25 @@ fn split_top_level(s: &str, delim: u8) -> Vec<&str> {
     let bytes = s.as_bytes();
     let mut out = Vec::new();
     let mut depth: i32 = 0;
-    let mut in_quote: Option<u8> = None;
     let mut start = 0;
-    for (i, &b) in bytes.iter().enumerate() {
-        match (in_quote, b) {
-            (Some(q), c) if c == q => in_quote = None,
-            (Some(_), _) => {},
-            (None, b'"' | b'\'') => in_quote = Some(b),
-            (None, b'(' | b'[') => depth += 1,
-            (None, b')' | b']') => depth -= 1,
-            (None, c) if c == delim && depth == 0 => {
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        if crate::lexical::is_quote(b) {
+            // The shared reader steps over the literal, so an escaped quote
+            // inside one does not end it. This site tracked quotes with no escape
+            // rule at all, which is one of the three rules that used to coexist.
+            match crate::lexical::skip_literal(s, i) {
+                Ok(end) => i = end,
+                // Unterminated: stop splitting and let the stage reader name the
+                // literal. Swallowing the rest silently is what it used to do.
+                Err(_) => break,
+            }
+            continue;
+        }
+        match b {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            c if c == delim && depth == 0 => {
                 if let Some(segment) = s.get(start..i) {
                     out.push(segment);
                 }
@@ -2371,6 +2701,7 @@ fn split_top_level(s: &str, delim: u8) -> Vec<&str> {
             },
             _ => {},
         }
+        i += 1;
     }
     out.push(s.get(start..).unwrap_or(""));
     out
@@ -2411,9 +2742,10 @@ fn parse_stage(src: &str) -> Result<Stage, ParseError> {
         )),
         ("len", Some(a)) => parse_stage_len(a, &bad),
         ("enum", Some(a)) => parse_stage_enum(a, &bad),
-        ("regex", Some(a)) => Ok(parse_stage_regex(a)),
+        ("regex", Some(a)) => parse_stage_regex(a, &bad),
         ("validate", Some(a)) => Err(parse_stage_validate_rejected(a, &bad)),
-        ("plugin" | "run", Some(a)) => parse_stage_plugin(head, a, &bad),
+        ("plugin", Some(_)) => Err(bad(PLUGIN_IS_RUN)),
+        ("run", Some(a)) => parse_stage_plugin(head, a, &bad),
         ("taint", Some(a)) => parse_taint(a, src),
 
         // Scan placeholders parse as bare identifiers.
@@ -2469,11 +2801,9 @@ fn parse_stage_len(a: &str, bad: &impl Fn(&str) -> ParseError) -> Result<Stage, 
 fn parse_stage_enum(a: &str, bad: &impl Fn(&str) -> ParseError) -> Result<Stage, ParseError> {
     let values = split_top_level(a, b',')
         .into_iter()
-        .map(|v| {
-            let t = v.trim();
-            // Allow either bare identifier or quoted string.
-            unwrap_quotes(t).unwrap_or(t).to_owned()
-        })
+        .map(|v| literal_value(v.trim()).map_err(|m| bad(&m)))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>();
     if values.is_empty() {
@@ -2482,11 +2812,10 @@ fn parse_stage_enum(a: &str, bad: &impl Fn(&str) -> ParseError) -> Result<Stage,
     Ok(Stage::Enum { values })
 }
 
-fn parse_stage_regex(a: &str) -> Stage {
-    let pattern = a.trim();
-    Stage::Regex {
-        pattern: unwrap_quotes(pattern).unwrap_or(pattern).to_owned(),
-    }
+fn parse_stage_regex(a: &str, bad: &impl Fn(&str) -> ParseError) -> Result<Stage, ParseError> {
+    Ok(Stage::Regex {
+        pattern: literal_value(a.trim()).map_err(|m| bad(&m))?,
+    })
 }
 
 // Named-validator dispatch (`validate(name)`) is in the spec
@@ -2496,7 +2825,7 @@ fn parse_stage_regex(a: &str) -> Stage {
 // alternatives:
 //
 //   * `regex("pattern")` — inline named-regex equivalent
-//   * `plugin(name)` — full plugin dispatch for rich validation (Luhn,
+//   * `run(name)` — full plugin dispatch for rich validation (Luhn,
 //     format-with-context, etc.)
 //
 // When the ValidatorRegistry slice lands, this rejection flips back to
@@ -2505,7 +2834,7 @@ fn parse_stage_validate_rejected(a: &str, bad: &impl Fn(&str) -> ParseError) -> 
     bad(&format!(
         "`validate({})` — named-validator dispatch is not implemented \
          in this build. Use `regex(\"pattern\")` for a named-regex \
-         equivalent, or `plugin({})` for richer validation logic.",
+         equivalent, or `run({})` for richer validation logic.",
         a.trim(),
         a.trim(),
     ))
@@ -2587,11 +2916,27 @@ fn parse_numeric_with_suffix(s: &str) -> Option<i64> {
 /// or `(head, None)` if there are no parens.
 fn split_head_args(s: &str) -> Option<(&str, Option<String>)> {
     if let Some(open) = s.find('(') {
-        // Match the corresponding closing paren at depth 0.
+        // Match the corresponding closing paren at depth 0, stepping over quoted
+        // text. Counting parens inside a literal is why `regex("(")` was refused
+        // as having no stage identifier: the paren in the pattern closed the call
+        // before the real one did.
         let bytes = s.as_bytes();
         let mut depth = 0;
         let mut close = None;
-        for (i, &b) in bytes.iter().enumerate().skip(open) {
+        let mut i = open;
+        while let Some(&b) = bytes.get(i) {
+            if crate::lexical::is_quote(b) {
+                if let Ok(end) = crate::lexical::skip_literal(s, i) {
+                    i = end;
+                    continue;
+                }
+                // Unterminated: fall through and treat the quote as an ordinary
+                // character, so the close paren is still found and the argument
+                // reader is what names the literal. Stopping here would report a
+                // missing stage identifier for a quoting mistake.
+                i += 1;
+                continue;
+            }
             match b {
                 b'(' => depth += 1,
                 b')' => {
@@ -2603,6 +2948,7 @@ fn split_head_args(s: &str) -> Option<(&str, Option<String>)> {
                 },
                 _ => {},
             }
+            i += 1;
         }
         let close = close?;
         let head = s.get(..open)?.trim();
@@ -2673,48 +3019,21 @@ fn parse_taint_scope(s: &str, src: &str) -> Result<TaintScope, ParseError> {
     }
 }
 
-/// Top-level config — only the bits the parser understands.
-///
-/// `policy_evaluator:`, `imports:`, `global:`, `defaults:`, `tags:`,
-/// `plugin_dirs:`, `plugin_settings:`, `version:` are all accepted and
-/// stored opaquely; this struct deserializes leniently.
-///
-/// `plugins:` (the root block) is parsed into [`PluginDeclaration`]s so
-/// the runtime can look up hook names + capabilities per plugin without
-/// going back to the raw YAML.
-#[derive(Debug, Default, Deserialize)]
-pub struct ConfigYaml {
-    /// The `routes:` block, keyed by route.
-    #[serde(default)]
-    pub routes: HashMap<String, RouteYaml>,
-
-    /// Root `plugins:` block — full declarations.
-    #[serde(default)]
-    pub plugins: Vec<PluginDeclaration>,
-
-    /// Anything else top-level goes here — picked up by later steps.
-    #[serde(flatten)]
-    pub other: HashMap<String, serde_yaml::Value>,
-}
-
 #[derive(Debug, Default, Deserialize)]
 /// One route's raw blocks, before compilation.
+///
+/// `deny_unknown_fields` is what keeps a policy from being dropped: the four
+/// fields below are the whole APL body, and a catch-all here would swallow a
+/// removed spelling into a route that compiles empty. Safe because the struct
+/// has no `#[serde(flatten)]`. A section's structural keys never reach this
+/// shape: the APL runtime copies only the policy terms into the block it
+/// compiles.
+#[serde(deny_unknown_fields)]
 pub struct RouteYaml {
-    /// Flat pre-invocation authorization effects (was `policy:`). Each
-    /// entry is either a string (rule / plugin / taint) or a single-key
-    /// map (PDP call with reactions). See `parse_step`. Merged with any
-    /// `authorization.pre_invocation` entries.
-    #[serde(default)]
-    pub pre_invocation: Vec<serde_yaml::Value>,
-
-    /// Flat post-invocation authorization effects (was `post_policy:`).
-    /// Merged with any `authorization.post_invocation` entries.
-    #[serde(default)]
-    pub post_invocation: Vec<serde_yaml::Value>,
-
-    /// Nested `authorization:` block — `{ pre_invocation, post_invocation }`.
-    /// Equivalent to the flat forms; entries from both are concatenated.
-    #[serde(default)]
+    /// `authorization:` block — `{ pre_invocation, post_invocation }`. The
+    /// only place the two phase lists appear. `None` means the section wrote no
+    /// block at all.
+    #[serde(default, deserialize_with = "authorization_block")]
     pub authorization: Option<AuthorizationYaml>,
 
     /// `args:` field → pipe-chain string. Compiled to per-field pipelines.
@@ -2730,211 +3049,149 @@ pub struct RouteYaml {
     /// `plugins:` declaration at dispatch time.
     #[serde(default)]
     pub plugins: HashMap<String, PluginOverride>,
-
-    /// Anything else on the route (meta, taint, when) — stashed. Also
-    /// where renamed legacy keys land; `reject_legacy_keys` fails loudly
-    /// on them so a dropped authz block never fails open.
-    #[serde(flatten)]
-    pub other: HashMap<String, serde_yaml::Value>,
 }
 
-/// Nested `authorization:` block. Both sub-lists are optional and default
-/// to empty; each is compiled the same way as the flat `pre_invocation:` /
-/// `post_invocation:` forms.
+/// Read the `authorization:` value, treating an explicit null as a block that
+/// names neither phase rather than as no block at all. Serde would map a null
+/// onto `None`, which is how `authorization:` written with nothing under it used
+/// to load clean and enforce nothing. `reject_empty_authorization` refuses the
+/// result. `serde(default)` still supplies `None` when the key is absent, since
+/// this runs only for a key that is present.
+fn authorization_block<'de, D>(de: D) -> Result<Option<AuthorizationYaml>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_yaml::Value::deserialize(de)?;
+    if value.is_null() {
+        return Ok(Some(AuthorizationYaml::default()));
+    }
+    AuthorizationYaml::deserialize(value)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
+/// The `authorization:` block, which carries at least one of the two phase
+/// lists. Each phase is `Option` so a block naming neither is a load error
+/// rather than an empty block that authorizes nothing; `compile_route` and
+/// `compile_apl_blocks` both refuse one.
 ///
-/// `deny_unknown_fields` is load-bearing: without it a legacy key nested
-/// under the wrapper (`authorization: { policy: [...] }`) would be silently
-/// dropped by serde — both lists empty, no error, no authorization enforced
-/// (a fail-open). The top-level `reject_legacy_keys` can't catch it because
-/// the key is consumed as part of the `authorization` value and never lands
-/// in `RouteYaml.other`. Denying unknown fields turns that into a load error
-/// and also catches typos like `pre_invocaton:`. Safe here because the struct
-/// has no `#[serde(flatten)]`.
+/// `deny_unknown_fields` is load-bearing: without it a removed key nested under
+/// the wrapper (`authorization: { policy: [...] }`) would be silently dropped by
+/// serde — both phases absent, no error, no authorization enforced (a
+/// fail-open). Denying unknown fields turns that into a load error and also
+/// catches typos like `pre_invocaton:`. Safe here because the struct has no
+/// `#[serde(flatten)]`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorizationYaml {
-    /// Effects run before the call.
+    /// Effects run before the call. Each entry is either a string (rule /
+    /// plugin / taint) or a single-key map (PDP call with reactions). See
+    /// `parse_step`.
     #[serde(default)]
-    pub pre_invocation: Vec<serde_yaml::Value>,
+    pub pre_invocation: Option<Vec<serde_yaml::Value>>,
 
     /// Effects run after it.
     #[serde(default)]
-    pub post_invocation: Vec<serde_yaml::Value>,
+    pub post_invocation: Option<Vec<serde_yaml::Value>>,
 }
 
-/// Output of [`compile_config`] — the routes that have APL blocks plus
-/// the registry of plugin declarations from the root `plugins:` block.
+/// Refuse an `authorization:` block that contributes no step. Such a block
+/// authorizes nothing, and the has-APL gate would drop the route as if it
+/// carried no policy at all, so it is rejected before that gate rather than
+/// read as an empty one.
 ///
-/// The two travel together because the evaluator needs both: the route
-/// gives it the steps to run, and the registry gives the dispatcher the
-/// hook name / kind for each plugin name referenced by those steps.
-#[derive(Debug, Default)]
-pub struct CompiledConfig {
-    /// The compiled routes, keyed by route.
-    pub routes: HashMap<String, CompiledRoute>,
-    /// Plugin declarations the steps refer to by name.
-    pub plugins: PluginRegistry,
-}
-
-/// Compile a YAML config into a [`CompiledConfig`] (routes + plugin
-/// registry).
-///
-/// Routes with no APL fields populated (no `authorization:` /
-/// `pre_invocation:` / `post_invocation:` / `args:` / `result:`) are
-/// **omitted from `routes`**, per apl-design
-/// "Routes without APL blocks fall back to legacy plugin-chain execution."
-/// A route-level `plugins:` override block alone is not enough — overrides
-/// only have meaning when the route actually dispatches plugins via APL
-/// steps, so an override-only route is treated as legacy.
-/// # Errors
-///
-/// Returns `ParseError::Yaml` when the document does not deserialize, or the
-/// per-rule error from any route whose policy, args, or result block fails to
-/// compile.
-pub fn compile_config(yaml: &str) -> Result<CompiledConfig, ParseError> {
-    let cfg: ConfigYaml = serde_yaml::from_str(yaml)?;
-    let mut routes = HashMap::with_capacity(cfg.routes.len());
-    for (route_key, raw) in cfg.routes {
-        if let Some(route) = compile_route(&route_key, raw)? {
-            routes.insert(route_key, route);
-        }
-    }
-    let mut plugins = PluginRegistry::with_capacity(cfg.plugins.len());
-    for decl in cfg.plugins {
-        // Duplicate plugin names: last-one-wins for v0. The spec doesn't
-        // currently prescribe an error here; flag if real configs hit it.
-        plugins.insert(decl.name.clone(), decl);
-    }
-    Ok(CompiledConfig { routes, plugins })
-}
-
-/// Legacy field names, mapped to their replacements. Because unknown keys
-/// land in `RouteYaml.other` via `#[serde(flatten)]`, a config still using
-/// an old name would otherwise be *silently dropped* — dropping a `policy:`
-/// block fails open (no authorization enforced). We reject them loudly
-/// instead. `identity` is renamed in praxis-policy-core config, not here.
-const RENAMED_FIELDS: [(&str, &str); 2] = [
-    (
-        "policy",
-        "authorization.pre_invocation (or flat pre_invocation)",
-    ),
-    (
-        "post_policy",
-        "authorization.post_invocation (or flat post_invocation)",
-    ),
-];
-
-/// Fail loudly if a stashed key is a renamed legacy field, so a dropped
-/// authz block never fails open. Run before the has-APL gate.
-fn reject_legacy_keys(
+/// A phase written as an empty list counts as absent. It reaches the same end
+/// state by a different spelling: layers append, so an empty list overrides
+/// nothing and cannot be the way a section opts out of an inherited one.
+fn reject_empty_authorization(
     location: &str,
-    other: &HashMap<String, serde_yaml::Value>,
+    authorization: Option<&AuthorizationYaml>,
 ) -> Result<(), ParseError> {
-    for (old, new) in RENAMED_FIELDS {
-        if other.contains_key(old) {
-            return Err(ParseError::RenamedField {
-                location: location.to_owned(),
-                old: old.to_owned(),
-                new: new.to_owned(),
-            });
-        }
+    let contributes_nothing = authorization.is_some_and(|a| {
+        let empty =
+            |phase: &Option<Vec<serde_yaml::Value>>| phase.as_ref().is_none_or(Vec::is_empty);
+        empty(&a.pre_invocation) && empty(&a.post_invocation)
+    });
+    if contributes_nothing {
+        return Err(ParseError::EmptyAuthorization {
+            location: location.to_owned(),
+        });
     }
     Ok(())
 }
 
-fn compile_route(route_key: &str, raw: RouteYaml) -> Result<Option<CompiledRoute>, ParseError> {
-    // Reject legacy keys *before* the gate: a legacy-only route would
-    // otherwise look empty and be silently omitted (fail open).
-    reject_legacy_keys(route_key, &raw.other)?;
-    let has_authz = raw
-        .authorization
-        .as_ref()
-        .is_some_and(|a| !a.pre_invocation.is_empty() || !a.post_invocation.is_empty());
-    let has_apl = !raw.pre_invocation.is_empty()
-        || !raw.post_invocation.is_empty()
-        || has_authz
-        || !raw.args.is_empty()
-        || !raw.result.is_empty();
-    if !has_apl {
-        return Ok(None);
-    }
-    Ok(Some(compile_apl_blocks(route_key, raw)?))
-}
-
 /// Compile the APL bodies (authorization/args/result/plugins) of a
 /// single block into a `CompiledRoute`. Doesn't gate on "has any APL
-/// fields" — callers that need the gate (`compile_config`) check first.
+/// fields": a block that declares no APL term compiles to an empty route.
 /// `source` is the path prefix baked into rule/pipeline diagnostics
 /// (e.g. `"global.policy.all"`, `"route.get_compensation"`).
 ///
-/// The nested `authorization:` block and the flat `pre_invocation:` /
-/// `post_invocation:` forms are equivalent alternatives. Declaring the same
-/// phase in both forms on one section is rejected (it would run the effects
-/// twice); only one form may carry a given phase per section.
+/// `authorization:` is the only place the two phase lists appear, and a block
+/// naming neither is refused rather than read as empty.
+/// Compile one declared `args:` / `result:` entry into its pipeline.
+///
+/// A declared entry with no stages is a load error, while the public
+/// [`parse_pipeline`] keeps answering an empty input with an empty pipeline. Two
+/// positions, two answers: that entry point takes a field value that may be
+/// absent, and absent is not malformed. Here the author named a field and then
+/// left its chain empty, which used to compile to a no-op `FieldRule`.
+fn compile_declared_pipeline(half: &str, field: &str, chain: &str) -> Result<Pipeline, ParseError> {
+    let pipeline = parse_pipeline(chain).map_err(|e| ParseError::Rule {
+        rule: format!("{half}.{field}: {chain:?}"),
+        msg: format!("{e}"),
+    })?;
+    if pipeline.stages.is_empty() {
+        return Err(ParseError::Rule {
+            rule: format!("{half}.{field}: {chain:?}"),
+            msg: format!(
+                "`{half}.{field}:` declares no stages. A field entry names an operation to run on \
+                 the field, so an empty chain is a no-op the author did not mean; remove the \
+                 entry or give it a stage"
+            ),
+        });
+    }
+    Ok(pipeline)
+}
+
 fn compile_apl_blocks(source: &str, raw: RouteYaml) -> Result<CompiledRoute, ParseError> {
-    reject_legacy_keys(source, &raw.other)?;
+    reject_empty_authorization(source, raw.authorization.as_ref())?;
     let mut route = CompiledRoute::new(source);
     let (auth_pre, auth_post) = raw
         .authorization
-        .map(|a| (a.pre_invocation, a.post_invocation))
+        .map(|a| {
+            (
+                a.pre_invocation.unwrap_or_default(),
+                a.post_invocation.unwrap_or_default(),
+            )
+        })
         .unwrap_or_default();
-    // Reject declaring the same phase both nested and flat on one section:
-    // the two forms are alternatives, not additive, so merging them would
-    // run each effect twice (a `run(...)` / `delegate(...)` double-fire).
-    // Stacking across *different* scopes (e.g. global nested + route flat)
-    // is fine — those are separate `compile_apl_blocks` calls.
-    if !auth_pre.is_empty() && !raw.pre_invocation.is_empty() {
-        return Err(ParseError::ConflictingAuthorizationForms {
-            location: source.to_owned(),
-            phase: "pre_invocation".to_owned(),
-        });
-    }
-    if !auth_post.is_empty() && !raw.post_invocation.is_empty() {
-        return Err(ParseError::ConflictingAuthorizationForms {
-            location: source.to_owned(),
-            phase: "post_invocation".to_owned(),
-        });
-    }
-    for (i, entry) in auth_pre.iter().chain(raw.pre_invocation.iter()).enumerate() {
+    for (i, entry) in auth_pre.iter().enumerate() {
         let step = parse_step(entry, &format!("{source}.pre_invocation[{i}]"))?;
-        route.policy.push(step_to_top_level_effect(step)?);
+        route.pre_invocation.push(step_to_top_level_effect(step)?);
     }
-    for (i, entry) in auth_post
-        .iter()
-        .chain(raw.post_invocation.iter())
-        .enumerate()
-    {
+    for (i, entry) in auth_post.iter().enumerate() {
         let step = parse_step(entry, &format!("{source}.post_invocation[{i}]"))?;
-        route.post_policy.push(step_to_top_level_effect(step)?);
+        route.post_invocation.push(step_to_top_level_effect(step)?);
     }
-    for (field, chain) in &raw.args {
-        let pipeline = parse_pipeline(chain).map_err(|e| ParseError::Rule {
-            rule: format!("args.{field}: {chain:?}"),
-            msg: format!("{e}"),
-        })?;
-        route.args.push(FieldRule {
-            field: field.clone(),
-            pipeline,
-            source: format!("{source}.args.{field}"),
-        });
-    }
-    for (field, chain) in &raw.result {
-        let pipeline = parse_pipeline(chain).map_err(|e| ParseError::Rule {
-            rule: format!("result.{field}: {chain:?}"),
-            msg: format!("{e}"),
-        })?;
-        route.result.push(FieldRule {
-            field: field.clone(),
-            pipeline,
-            source: format!("{source}.result.{field}"),
-        });
+    for (half, entries, out) in [
+        ("args", &raw.args, &mut route.args),
+        ("result", &raw.result, &mut route.result),
+    ] {
+        for (field, chain) in entries {
+            let pipeline = compile_declared_pipeline(half, field, chain)?;
+            out.push(FieldRule {
+                field: field.clone(),
+                pipeline,
+                source: format!("{source}.{half}.{field}"),
+            });
+        }
     }
     route.plugin_overrides = raw.plugins;
     Ok(route)
 }
 
 /// Compile a single APL policy block from a `serde_yaml::Value` whose
-/// shape is the body of a route's `apl:` block:
+/// shape is the body of a section's policy block:
 ///
 /// ```yaml
 /// args:
@@ -2988,6 +3245,7 @@ mod tests {
     use super::*;
     use crate::attributes::AttributeBag;
     use crate::evaluator::Decision;
+    use crate::test_util::{compile_test_policy, compile_test_route};
 
     /// Unwrap a parsed step as a rule, or fail naming what came back instead.
     ///
@@ -3181,12 +3439,23 @@ mod tests {
         }
     }
 
+    /// `require(...)` is a predicate now, so it nests.
+    ///
+    /// It used to be refused here as a rule-level shorthand. That was not a
+    /// grammar constraint so much as the absence of a code path: the hand-written
+    /// parser read a list of bare identifiers and had nowhere to put a
+    /// sub-expression.
     #[test]
-    fn pred_require_rejected_as_predicate() {
-        // require() is a rule-level shorthand, not a sub-predicate.
-        // Trying to use it inside a predicate expression must fail clearly.
-        let err = parse_predicate("require(authenticated)").unwrap_err();
-        assert!(format!("{err}").contains("rule-level shorthand"));
+    fn pred_require_parses_as_a_predicate() {
+        let e = parse_predicate("require(authenticated)").expect("`require` is a predicate");
+        assert_eq!(
+            e,
+            Expression::Condition(Condition::IsFalse {
+                key: "authenticated".into()
+            }),
+            "and it means the negation of what it requires"
+        );
+        parse_predicate("require(a) | require(b)").expect("so it composes");
     }
 
     #[test]
@@ -3244,10 +3513,25 @@ mod tests {
         );
     }
 
+    /// Mixing `,` and `|` inside `require(...)` means something now.
+    ///
+    /// The old parser refused it, because it tracked a single separator and had
+    /// no precedence to appeal to. The comma binds lower than `&` and `|`, so
+    /// `require(a, b | c)` is `!(a & (b | c))`, which distributes to
+    /// `!a | (!b & !c)`.
     #[test]
-    fn rule_require_mixed_rejected() {
-        let err = parse_rule("require(a, b | c)", "test").unwrap_err();
-        assert!(format!("{err}").contains("cannot mix"));
+    fn rule_require_may_mix_separators_and_the_comma_binds_lower() {
+        let r = parse_rule("require(a, b | c)", "test").expect("mixing is meaningful now");
+        assert_eq!(
+            r.condition,
+            Expression::Or(vec![
+                Expression::Condition(Condition::IsFalse { key: "a".into() }),
+                Expression::And(vec![
+                    Expression::Condition(Condition::IsFalse { key: "b".into() }),
+                    Expression::Condition(Condition::IsFalse { key: "c".into() }),
+                ]),
+            ])
+        );
     }
 
     #[test]
@@ -3420,7 +3704,7 @@ mod tests {
     #[test]
     fn rule_step_kinds_rejected_clearly() {
         for s in [
-            "plugin(rate_limiter)",
+            "run(rate_limiter)",
             "cedar:(action: read)",
             "opa(path)",
             "taint(audit)",
@@ -3543,11 +3827,11 @@ mod tests {
     #[test]
     fn when_do_multi_effect_list() {
         // The headline demo case: fan-out from one predicate.
-        // do: [plugin(audit_logger), taint(unauth), deny('refused')]
+        // do: [run(audit_logger), taint(unauth), deny('refused')]
         let yaml = r#"
 when: "!role.hr"
 do:
-  - "plugin(audit_logger)"
+  - "run(audit_logger)"
   - "taint(unauth, session)"
   - "deny('refused', 'role.hr_required')"
 "#;
@@ -3599,7 +3883,7 @@ do:
         // the map's only key, the value is a list of effects.
         let yaml = r#"
 "!role.hr":
-  - "plugin(audit_logger)"
+  - "run(audit_logger)"
   - "deny('unauthorized')"
 "#;
         let step = parse_step_yaml(yaml).unwrap();
@@ -3622,7 +3906,7 @@ do:
       plugin: workday-oauth
       config:
         audience: workday-api
-  - "plugin(audit_logger)"
+  - "run(audit_logger)"
 "#;
         let step = parse_step_yaml(yaml).unwrap();
         let rule = expect_rule(step);
@@ -3662,7 +3946,7 @@ do:
         let yaml = r#"
 when: "!perm.view_ssn"
 do:
-  - "plugin(audit_logger)"
+  - "run(audit_logger)"
   - "result.salary | redact"
 "#;
         let step = parse_step_yaml(yaml).unwrap();
@@ -3716,9 +4000,10 @@ do: "args.card_number | str | mask(4)"
     }
 
     #[test]
-    fn field_stage_run_aliases_plugin() {
-        // In a field pipeline, `run(name)` is the same plugin-transform
-        // stage as `plugin(name)` — symmetry with the policy-step alias.
+    fn field_stage_run_dispatches_a_plugin() {
+        // `run(name)` is a plugin-transform stage in a field pipeline, the same
+        // verb a step list uses. `plugin(name)` was a second spelling for it and
+        // is refused; the test below pins that.
         let yaml = r#"
 when: role.support
 do: "args.card_number | run(luhn)"
@@ -3738,17 +4023,20 @@ do: "args.card_number | run(luhn)"
     }
 
     #[test]
-    fn field_stage_plugin_empty_name_is_rejected() {
-        // `plugin()` / `run()` with no name in a field pipeline must be
-        // rejected, mirroring the policy-step path (`parse_step_string`).
-        for verb in ["plugin", "run"] {
-            let err = parse_stage(&format!("{verb}()")).expect_err("empty name must error");
-            let msg = format!("{err}");
-            assert!(
-                msg.contains(verb) && msg.contains("must not be empty"),
-                "{verb}(): expected verb-named empty-name error, got: {msg}"
-            );
-        }
+    fn field_stage_run_empty_name_is_rejected() {
+        // `run()` with no name in a field pipeline must be rejected, mirroring the
+        // policy-step path (`parse_step_string`).
+        let err = parse_stage("run()").expect_err("empty name must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("run") && msg.contains("must not be empty"),
+            "expected a verb-named empty-name error, got: {msg}"
+        );
+
+        // The removed spelling names its replacement rather than reporting an
+        // empty name, since the verb is the fault.
+        let removed = parse_stage("plugin()").expect_err("the old spelling is refused");
+        assert!(format!("{removed}").contains("run(name)"), "{removed}");
     }
 
     /// A pipeline whose path is neither `args.` nor `result.` must not be taken
@@ -3803,7 +4091,7 @@ do: "args.card_number | run(luhn)"
         // Shorthand `predicate: [list]` with a content effect.
         let yaml = r#"
 "!perm.view_ssn":
-  - "plugin(audit_logger)"
+  - "run(audit_logger)"
   - "result.ssn | redact"
 "#;
         let step = parse_step_yaml(yaml).unwrap();
@@ -3828,8 +4116,8 @@ do: "args.card_number | run(luhn)"
         // `- sequential: [list]` as a top-level policy step.
         let yaml = r#"
 sequential:
-  - "plugin(rate_limiter)"
-  - "plugin(audit_logger)"
+  - "run(rate_limiter)"
+  - "run(audit_logger)"
 "#;
         let step = parse_step_yaml(yaml).unwrap();
         let rule = expect_rule(step);
@@ -3848,8 +4136,8 @@ sequential:
     fn top_level_parallel() {
         let yaml = r#"
 parallel:
-  - "plugin(pii_scanner)"
-  - "plugin(nemo_guardrails)"
+  - "run(pii_scanner)"
+  - "run(nemo_guardrails)"
 "#;
         let step = parse_step_yaml(yaml).unwrap();
         let rule = expect_rule(step);
@@ -3869,8 +4157,8 @@ parallel:
 when: args.include_ssn == true
 do:
   parallel:
-    - "plugin(pii_scanner)"
-    - "plugin(nemo_guardrails)"
+    - "run(pii_scanner)"
+    - "run(nemo_guardrails)"
 "#;
         let step = parse_step_yaml(yaml).unwrap();
         let rule = expect_rule(step);
@@ -3885,7 +4173,7 @@ do:
         // FieldOp inside Parallel should fail at parse, not at runtime.
         let yaml = r#"
 parallel:
-  - "plugin(audit)"
+  - "run(audit)"
   - "args.ssn | redact"
 "#;
         let err = parse_step_yaml(yaml).unwrap_err();
@@ -3896,7 +4184,7 @@ parallel:
     fn parallel_rejects_delegate_at_parse_time() {
         let yaml = r#"
 parallel:
-  - "plugin(audit)"
+  - "run(audit)"
   - "delegate(workday)"
 "#;
         let err = parse_step_yaml(yaml).unwrap_err();
@@ -3909,7 +4197,7 @@ parallel:
         let yaml = r#"
 sequential:
   - "args.ssn | redact"
-  - "plugin(audit)"
+  - "run(audit)"
 "#;
         let step = parse_step_yaml(yaml).unwrap();
         let rule = expect_rule(step);
@@ -4119,7 +4407,7 @@ restrict:
         // this guards that we didn't accidentally class it as a mutation.
         let yaml = r#"
 parallel:
-  - "plugin(audit)"
+  - "run(audit)"
   - restrict: { allow_regions: [eu] }
 "#;
         let step = parse_step_yaml(yaml).unwrap();
@@ -4139,10 +4427,10 @@ parallel:
         // parser handles arbitrary nesting through parse_effect_value.
         let yaml = r#"
 sequential:
-  - "plugin(rate_limiter)"
+  - "run(rate_limiter)"
   - parallel:
-      - "plugin(pii_scanner)"
-      - "plugin(nemo)"
+      - "run(pii_scanner)"
+      - "run(nemo)"
 "#;
         let step = parse_step_yaml(yaml).unwrap();
         let rule = expect_rule(step);
@@ -4172,73 +4460,74 @@ sequential:
     #[test]
     fn compile_simple_route() {
         let yaml = r#"
-routes:
-  get_compensation:
+route:
+  authorization:
     pre_invocation:
       - "require(authenticated)"
       - "require(role.hr | role.finance)"
       - "delegation.depth > 2 & include_ssn: deny"
 "#;
-        let routes = compile_config(yaml).unwrap().routes;
-        let route = routes.get("get_compensation").expect("route missing");
-        assert_eq!(route.policy.len(), 3);
+        let route = compile_test_route("get_compensation", yaml).unwrap();
+        assert_eq!(route.pre_invocation.len(), 3);
         assert!(
             route
                 .declared_phases()
-                .contains(crate::rules::Phase::Policy)
+                .contains(crate::rules::Phase::PreInvocation)
         );
     }
 
     #[test]
-    fn authorization_nested_and_flat_forms_are_equivalent() {
-        // The nested `authorization:` block and the flat
-        // `pre_invocation:` / `post_invocation:` forms must compile to
-        // the same route.
-        let nested = r#"
-routes:
-  r:
-    authorization:
-      pre_invocation:
-        - "require(authenticated)"
-      post_invocation:
-        - "taint(audit, session)"
-"#;
-        let flat = r#"
-routes:
-  r:
+    fn authorization_carries_both_phases() {
+        // `authorization:` is the only place the two phase lists appear, and
+        // one block may name both.
+        let yaml = r#"
+route:
+  authorization:
     pre_invocation:
       - "require(authenticated)"
     post_invocation:
       - "taint(audit, session)"
 "#;
-        let a = compile_config(nested).unwrap().routes;
-        let b = compile_config(flat).unwrap().routes;
-        let ra = a.get("r").expect("nested route");
-        let rb = b.get("r").expect("flat route");
-        assert_eq!(ra.policy.len(), rb.policy.len());
-        assert_eq!(ra.post_policy.len(), rb.post_policy.len());
-        assert_eq!(ra.policy.len(), 1);
-        assert_eq!(ra.post_policy.len(), 1);
+        let route = compile_test_route("r", yaml).unwrap();
+        assert_eq!(route.pre_invocation.len(), 1);
+        assert_eq!(route.post_invocation.len(), 1);
     }
 
     #[test]
-    fn legacy_key_nested_under_authorization_is_rejected() {
-        // Fail-closed: a legacy key nested inside the new `authorization:`
-        // wrapper must error, not be silently dropped (which would load a
-        // route with no authorization enforced). Guarded by
-        // `deny_unknown_fields` on `AuthorizationYaml`.
+    fn authorization_naming_only_the_post_phase_loads() {
+        // One phase is enough: a block that authorizes only after the call
+        // is a complete declaration.
         let yaml = r#"
-routes:
-  r:
-    authorization:
-      policy:
-        - "require(authenticated)"
+route:
+  authorization:
+    post_invocation:
+      - "taint(audit, session)"
 "#;
-        let err = compile_config(yaml).expect_err("nested legacy `policy:` must be rejected");
+        let route = compile_test_route("r", yaml).unwrap();
+        assert!(
+            route.pre_invocation.is_empty(),
+            "no pre-invocation steps declared"
+        );
+        assert_eq!(route.post_invocation.len(), 1);
+    }
+
+    #[test]
+    fn removed_key_nested_under_authorization_is_rejected() {
+        // Fail-closed: a removed key nested inside the `authorization:` wrapper
+        // must error, not be silently dropped (which would load a route with no
+        // authorization enforced). Guarded by `deny_unknown_fields` on
+        // `AuthorizationYaml`.
+        let yaml = r#"
+route:
+  authorization:
+    policy:
+      - "require(authenticated)"
+"#;
+        let err = compile_test_policy("r", yaml).expect_err("nested `policy:` must be rejected");
         let msg = format!("{err}");
         assert!(
             msg.contains("policy") || msg.contains("unknown field"),
-            "error should flag the unknown/legacy nested key: {msg}"
+            "error should flag the unknown nested key: {msg}"
         );
     }
 
@@ -4247,35 +4536,135 @@ routes:
         // `deny_unknown_fields` also catches typos so they don't silently
         // no-op the phase.
         let yaml = r#"
-routes:
-  r:
-    authorization:
-      pre_invocaton:
-        - "require(authenticated)"
+route:
+  authorization:
+    pre_invocaton:
+      - "require(authenticated)"
 "#;
         assert!(
-            compile_config(yaml).is_err(),
+            compile_test_policy("r", yaml).is_err(),
             "a typo'd sub-key under `authorization:` must be rejected, not ignored"
         );
     }
 
     #[test]
-    fn same_phase_declared_nested_and_flat_is_rejected() {
-        // The two forms are alternatives, not additive: declaring a phase
-        // both nested and flat on one section would run its effects twice.
+    fn authorization_naming_neither_phase_is_rejected() {
+        // An empty block authorizes nothing, and the has-APL gate would drop
+        // the route as if it carried no policy, so it fails the load instead.
         let yaml = r#"
-routes:
-  r:
-    authorization:
-      pre_invocation:
-        - "require(authenticated)"
-    pre_invocation:
-      - "require(role.hr)"
+route:
+  authorization: {}
 "#;
-        let err = compile_config(yaml).expect_err("both-forms-same-section must be rejected");
+        let err =
+            compile_test_policy("r", yaml).expect_err("an empty `authorization:` must be rejected");
         assert!(
-            matches!(err, ParseError::ConflictingAuthorizationForms { ref phase, .. } if phase == "pre_invocation"),
-            "expected ConflictingAuthorizationForms for pre_invocation, got {err:?}"
+            matches!(err, ParseError::EmptyAuthorization { ref location } if location == "r"),
+            "expected the empty-authorization error for route `r`, got {err:?}"
+        );
+        let msg = format!("{err}");
+        for phase in ["pre_invocation", "post_invocation"] {
+            assert!(msg.contains(phase), "the error must name `{phase}`: {msg}");
+        }
+    }
+
+    #[test]
+    fn authorization_declaring_only_empty_phases_is_rejected() {
+        // An empty list reaches the same end state as an absent one by a
+        // different spelling: layers append, so an empty list overrides
+        // nothing. Refusing only the absent form left the loud check with a
+        // quiet way around it.
+        for block in [
+            "pre_invocation: []",
+            "post_invocation: []",
+            "pre_invocation: []\n    post_invocation: []",
+        ] {
+            let yaml = format!(
+                r#"
+route:
+  authorization:
+    {block}
+"#
+            );
+            let err = compile_test_policy("r", &yaml)
+                .expect_err("an `authorization:` contributing no step must be rejected");
+            assert!(
+                matches!(err, ParseError::EmptyAuthorization { ref location } if location == "r"),
+                "expected the empty-authorization error for `{block}`, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn authorization_with_one_empty_phase_beside_a_real_one_loads() {
+        // Only a block contributing nothing at all is refused. A phase written
+        // empty beside one that carries steps is a shape an author may well
+        // reach for while editing, and it authorizes exactly what it says.
+        let yaml = r#"
+route:
+  authorization:
+    pre_invocation:
+      - "require(authenticated)"
+    post_invocation: []
+"#;
+        let route = compile_test_route("r", yaml).expect("one real phase is enough");
+        assert_eq!(route.pre_invocation.len(), 1);
+        assert!(route.post_invocation.is_empty());
+    }
+
+    #[test]
+    fn a_field_stage_nested_under_authorization_is_rejected() {
+        // `args:` and `result:` are phases, not authorization steps, so they sit
+        // beside `authorization:` rather than inside it. The symmetry with
+        // `pre_invocation:` is a guess `deny_unknown_fields` refuses.
+        for field_stage in ["args", "result"] {
+            let yaml = format!(
+                r#"
+route:
+  authorization:
+    pre_invocation:
+      - "require(authenticated)"
+    {field_stage}:
+      ssn: "redact(!perm.view_ssn)"
+"#
+            );
+            let err = compile_test_policy("r", &yaml)
+                .expect_err("a field stage under `authorization:` must be rejected");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(field_stage),
+                "the error must name `{field_stage}`: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_authorization_key_with_nothing_under_it_is_rejected() {
+        // A null value is a block that names neither phase, not the absence of
+        // a block: serde maps null onto `None`, which used to load clean and
+        // enforce nothing.
+        let yaml = r#"
+route:
+  authorization:
+"#;
+        let err =
+            compile_test_policy("r", yaml).expect_err("a null `authorization:` must be rejected");
+        assert!(
+            matches!(err, ParseError::EmptyAuthorization { ref location } if location == "r"),
+            "expected the empty-authorization error for route `r`, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_policy_block_naming_neither_phase_is_rejected() {
+        // The same refusal on the block path an orchestrator's visitor takes,
+        // which has no has-APL gate of its own to hide behind.
+        let block: serde_yaml::Value =
+            serde_yaml::from_str("authorization: {}\n").expect("fixture parses");
+        let err = compile_policy_block_value("global", &block)
+            .expect_err("an empty `authorization:` must be rejected at section scope");
+        assert!(
+            matches!(err, ParseError::EmptyAuthorization { ref location } if location == "global"),
+            "expected the empty-authorization error for `global`, got {err:?}"
         );
     }
 
@@ -4284,103 +4673,96 @@ routes:
         // A malformed pipeline under `result:` names `result.<field>` in
         // the diagnostic so the operator can locate the offending field.
         let yaml = r#"
-routes:
-  r:
-    result:
-      x: "nonsense"
+route:
+  result:
+    x: "nonsense"
 "#;
-        let err = compile_config(yaml).unwrap_err();
+        let err = compile_test_policy("r", yaml).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("result.x"), "expected result.x in: {msg}");
     }
 
     #[test]
-    fn legacy_policy_field_names_are_rejected() {
-        // Breaking rename: the old authorization-phase keys must fail
-        // loudly, never be silently dropped (which would fail open).
-        for (old, hint) in [
-            ("policy", "pre_invocation"),
-            ("post_policy", "post_invocation"),
-        ] {
-            let yaml = format!("routes:\n  r:\n    {old}:\n      - \"require(authenticated)\"\n");
-            let err = compile_config(&yaml).expect_err(&format!("legacy `{old}` must be rejected"));
+    fn removed_policy_field_names_are_rejected() {
+        // The removed authorization-phase keys must fail loudly, never be
+        // silently dropped (which would fail open). `RouteYaml` has no
+        // catch-all, so serde reports them as unknown fields.
+        for removed in ["policy", "post_policy"] {
+            let yaml = format!("route:\n  {removed}:\n    - \"require(authenticated)\"\n");
+            let err = compile_test_policy("r", &yaml)
+                .expect_err(&format!("`{removed}` must be rejected"));
             let msg = format!("{err}");
             assert!(
-                msg.contains(old) && msg.contains(hint),
-                "`{old}` rejection should name the replacement `{hint}`: {msg}"
+                msg.contains(removed),
+                "`{removed}` rejection should name the key: {msg}"
             );
         }
     }
 
     #[test]
-    fn legacy_only_route_is_not_silently_omitted() {
-        // A route whose *only* APL-ish key is a legacy name would look
-        // empty to the has-APL gate and be dropped — a fail-open. It must
-        // error instead.
+    fn a_block_whose_only_key_was_removed_is_rejected_not_read_as_empty() {
+        // A block whose *only* key is a removed name must not read as one that
+        // declared no policy, which would be a fail-open. `RouteYaml` has no
+        // catch-all, so serde refuses the key rather than compiling an empty
+        // route around it.
         let yaml = r#"
-routes:
-  ghost:
-    policy:
-      - "require(authenticated)"
+route:
+  policy:
+    - "require(authenticated)"
 "#;
         assert!(
-            matches!(compile_config(yaml), Err(ParseError::RenamedField { .. })),
-            "legacy-only route must be rejected, not omitted"
+            matches!(compile_test_policy("ghost", yaml), Err(ParseError::Yaml(_))),
+            "a route whose only key was removed must be rejected, not omitted"
         );
     }
 
     #[test]
-    fn compile_omits_routes_without_apl_blocks() {
-        // A route with no APL blocks (no authorization / pre_invocation /
-        // post_invocation / args / result) is a "legacy" route per
-        // apl-design and must be
-        // omitted from the compiled output. Unknown route keys (e.g.
-        // legacy PPE `priority`) are stashed in `other`, not errored.
+    fn a_flat_phase_key_on_a_policy_block_is_rejected() {
+        // `RouteYaml` has no catch-all, so the standalone entry point refuses a
+        // flat phase list the same way the config loader's key table does. It
+        // used to land in the catch-all and compile the route empty.
         let yaml = r#"
-routes:
-  legacy:
-    priority: 50
-  apl_route:
-    pre_invocation:
-      - "require(authenticated)"
+route:
+  pre_invocation:
+    - "require(authenticated)"
 "#;
-        let routes = compile_config(yaml).unwrap().routes;
-        assert!(routes.contains_key("apl_route"));
+        let err = compile_test_policy("r", yaml).expect_err("a flat phase key must be rejected");
+        let msg = format!("{err}");
         assert!(
-            !routes.contains_key("legacy"),
-            "legacy route should be omitted, not compiled"
+            msg.contains("pre_invocation"),
+            "the rejection should name the key: {msg}"
         );
     }
 
     #[test]
-    fn compile_unknown_top_level_keys_ignored() {
+    fn a_block_with_only_plugin_overrides_declares_no_phase() {
+        // An override block alone is not a policy: an override only means
+        // something where a step dispatches the plugin. The compiled route is
+        // empty rather than absent, which is the one shape a caller has to read
+        // now that nothing drops a route from a map.
         let yaml = r#"
-version: "0.1"
-policy_evaluator:
-  kind: apl
-plugins:
-  - name: rate_limiter
-    kind: native
-imports:
-  - "./shared.yaml"
-routes:
-  ping:
-    pre_invocation:
-      - "require(authenticated)"
+route:
+  plugins:
+    audit-log:
+      on_error: fail_open
 "#;
-        let routes = compile_config(yaml).unwrap().routes;
-        assert!(routes.contains_key("ping"));
+        let route = compile_test_route("legacy", yaml).unwrap();
+        assert!(
+            route.declared_phases().is_empty(),
+            "an override-only block declares no phase"
+        );
+        assert!(route.plugin_overrides.contains_key("audit-log"));
     }
 
     #[test]
     fn compile_propagates_rule_errors_with_source() {
         let yaml = r#"
-routes:
-  bad:
+route:
+  authorization:
     pre_invocation:
       - "subject.id == garbage_ident"
 "#;
-        let err = compile_config(yaml).unwrap_err();
+        let err = compile_test_policy("bad", yaml).unwrap_err();
         // RHS-as-identifier is rejected; the error mentions the offending input.
         let msg = format!("{err}");
         assert!(
@@ -4392,34 +4774,32 @@ routes:
     #[test]
     fn compile_plugin_step_string_form() {
         let yaml = r#"
-routes:
-  rate_limited:
+route:
+  authorization:
     pre_invocation:
-      - "plugin(rate_limiter)"
+      - "run(rate_limiter)"
 "#;
-        let routes = compile_config(yaml).unwrap().routes;
-        let route = routes.get("rate_limited").unwrap();
-        assert_eq!(route.policy.len(), 1);
-        match &route.policy[0] {
+        let route = compile_test_route("rate_limited", yaml).unwrap();
+        assert_eq!(route.pre_invocation.len(), 1);
+        match &route.pre_invocation[0] {
             Effect::Plugin { name } => assert_eq!(name, "rate_limiter"),
             other => panic!("expected Effect::Plugin, got {other:?}"),
         }
     }
 
     #[test]
-    fn compile_run_step_string_form_aliases_plugin() {
-        // `run(name)` is an alias for `plugin(name)`: both invoke a named
-        // plugin and compile to Effect::Plugin.
+    fn compile_run_step_string_form_invokes_a_plugin() {
+        // `run(name)` compiles to Effect::Plugin. It was one of two spellings for
+        // that; `plugin(name)` is refused now, pinned below.
         let yaml = r#"
-routes:
-  rate_limited:
+route:
+  authorization:
     pre_invocation:
       - "run(rate_limiter)"
 "#;
-        let routes = compile_config(yaml).unwrap().routes;
-        let route = routes.get("rate_limited").unwrap();
-        assert_eq!(route.policy.len(), 1);
-        match &route.policy[0] {
+        let route = compile_test_route("rate_limited", yaml).unwrap();
+        assert_eq!(route.pre_invocation.len(), 1);
+        match &route.pre_invocation[0] {
             Effect::Plugin { name } => assert_eq!(name, "rate_limiter"),
             other => panic!("expected Effect::Plugin, got {other:?}"),
         }
@@ -4427,7 +4807,7 @@ routes:
 
     #[test]
     fn parse_step_run_is_plugin_alias() {
-        for s in ["run(audit-log)", "plugin(audit-log)"] {
+        for s in ["run(audit-log)", "run(audit-log)"] {
             let step = parse_step(&serde_yaml::Value::String(s.to_owned()), "test").unwrap();
             match step {
                 crate::step::Step::Plugin { name } => assert_eq!(name, "audit-log", "{s}"),
@@ -4445,14 +4825,13 @@ routes:
     #[test]
     fn compile_taint_step_string_form() {
         let yaml = r#"
-routes:
-  audit_marked:
+route:
+  authorization:
     pre_invocation:
       - "taint(audit, session)"
 "#;
-        let routes = compile_config(yaml).unwrap().routes;
-        let route = routes.get("audit_marked").unwrap();
-        match &route.policy[0] {
+        let route = compile_test_route("audit_marked", yaml).unwrap();
+        match &route.pre_invocation[0] {
             Effect::Taint { label, scopes } => {
                 assert_eq!(label, "audit");
                 assert_eq!(scopes, &vec![TaintScope::Session]);
@@ -4465,8 +4844,8 @@ routes:
     fn compile_pdp_call_cedar_map_form() {
         // Cedar uses the `cedar:` key with args inline + on_deny/on_allow.
         let yaml = r#"
-routes:
-  authz_check:
+route:
+  authorization:
     pre_invocation:
       - cedar:
           action: read
@@ -4474,11 +4853,10 @@ routes:
           on_deny:
             - deny
           on_allow:
-            - "plugin(audit_logger)"
+            - "run(audit_logger)"
 "#;
-        let routes = compile_config(yaml).unwrap().routes;
-        let route = routes.get("authz_check").unwrap();
-        match &route.policy[0] {
+        let route = compile_test_route("authz_check", yaml).unwrap();
+        match &route.pre_invocation[0] {
             Effect::Pdp {
                 call,
                 on_deny,
@@ -4503,17 +4881,16 @@ routes:
         // `cel:` carries an `expr:` string + optional on_deny/on_allow
         // reactions. Routes to the CEL-backed resolver via PdpDialect::Cel.
         let yaml = r#"
-routes:
-  authz_check:
+route:
+  authorization:
     pre_invocation:
       - cel:
           expr: "subject.id == 'alice' && delegation.depth <= 2"
           on_deny:
             - deny
 "#;
-        let routes = compile_config(yaml).unwrap().routes;
-        let route = routes.get("authz_check").unwrap();
-        match &route.policy[0] {
+        let route = compile_test_route("authz_check", yaml).unwrap();
+        match &route.pre_invocation[0] {
             Effect::Pdp {
                 call,
                 on_deny,
@@ -4535,16 +4912,15 @@ routes:
     fn compile_pdp_call_opa_paren_form() {
         // OPA uses `opa("path"):` with the path inside parens + body is reactions.
         let yaml = r#"
-routes:
-  opa_check:
+route:
+  authorization:
     pre_invocation:
       - 'opa("hr/compensation/deny"):':
           on_deny:
             - deny
 "#;
-        let routes = compile_config(yaml).unwrap().routes;
-        let route = routes.get("opa_check").unwrap();
-        match &route.policy[0] {
+        let route = compile_test_route("opa_check", yaml).unwrap();
+        match &route.pre_invocation[0] {
             Effect::Pdp { call, on_deny, .. } => {
                 assert_eq!(call.dialect, PdpDialect::Opa);
                 // OPA args are a string (the path).
@@ -4555,36 +4931,52 @@ routes:
         }
     }
 
+    /// A custom dialect is `pdp(name):`, and a bare unknown key is a misspelling.
+    ///
+    /// This asserted the opposite: a bare `my_engine:` became
+    /// `Custom("my_engine")`, which made every typo a PDP lookup and left
+    /// `pdp(my_engine):` resolving a dialect called `pdp`.
     #[test]
-    fn compile_pdp_unknown_dialect_becomes_custom() {
+    fn compile_pdp_custom_dialect_is_named_in_the_parens() {
         let yaml = r#"
-routes:
-  custom_pdp:
+route:
+  authorization:
     pre_invocation:
-      - my_engine:
+      - pdp(my_engine):
           on_deny: [deny]
 "#;
-        let routes = compile_config(yaml).unwrap().routes;
-        match &routes.get("custom_pdp").unwrap().policy[0] {
+        let route = compile_test_route("custom_pdp", yaml).unwrap();
+        match &route.pre_invocation[0] {
             Effect::Pdp { call, .. } => {
                 assert_eq!(call.dialect, PdpDialect::Custom("my_engine".into()));
             },
             other => panic!("expected Pdp, got {other:?}"),
         }
+
+        let bare = r#"
+route:
+  authorization:
+    pre_invocation:
+      - my_engine:
+          on_deny: [deny]
+"#;
+        let err = compile_test_route("custom_pdp", bare)
+            .expect_err("a bare unknown key is not a custom dialect")
+            .to_string();
+        assert!(err.contains("pdp(my_engine)"), "{err}");
     }
 
     #[tokio::test]
     async fn end_to_end_hr_compensation() {
         let yaml = r#"
-routes:
-  get_compensation:
+route:
+  authorization:
     pre_invocation:
       - "require(authenticated)"
       - "require(role.hr | role.finance)"
       - "delegation.depth > 2: deny"
 "#;
-        let routes = compile_config(yaml).unwrap().routes;
-        let route = routes.get("get_compensation").unwrap();
+        let route = compile_test_route("get_compensation", yaml).unwrap();
 
         let pdp: std::sync::Arc<dyn crate::PdpResolver> = std::sync::Arc::new(NullPdpResolver);
         let plugins: std::sync::Arc<dyn crate::PluginInvoker> =
@@ -4601,7 +4993,7 @@ routes:
         bag.set("delegation.depth", 1_i64);
         assert_eq!(
             crate::evaluate_effects(
-                &route.policy,
+                &route.pre_invocation,
                 &mut bag,
                 &pdp,
                 &plugins,
@@ -4618,7 +5010,7 @@ routes:
         // Same Alice but depth=3 → deny (third rule fires).
         bag.set("delegation.depth", 3_i64);
         match crate::evaluate_effects(
-            &route.policy,
+            &route.pre_invocation,
             &mut bag,
             &pdp,
             &plugins,
@@ -4644,7 +5036,7 @@ routes:
         bag.set("authenticated", true);
         bag.set("delegation.depth", 1_i64);
         match crate::evaluate_effects(
-            &route.policy,
+            &route.pre_invocation,
             &mut bag,
             &pdp,
             &plugins,
@@ -4876,18 +5268,16 @@ routes:
     #[test]
     fn compile_route_with_args_and_result() {
         let yaml = r#"
-routes:
-  get_compensation:
-    args:
-      employee_id: "uuid"
-      amount: "int | 0..1M"
-    result:
-      ssn: "str | redact(!perm.view_ssn)"
-      employee_id: "str | mask(4)"
-      internal_notes: "omit"
+route:
+  args:
+    employee_id: "uuid"
+    amount: "int | 0..1M"
+  result:
+    ssn: "str | redact(!perm.view_ssn)"
+    employee_id: "str | mask(4)"
+    internal_notes: "omit"
 "#;
-        let routes = compile_config(yaml).unwrap().routes;
-        let route = routes.get("get_compensation").expect("missing route");
+        let route = compile_test_route("get_compensation", yaml).unwrap();
         assert_eq!(route.args.len(), 2);
         assert_eq!(route.result.len(), 3);
 
@@ -4914,24 +5304,25 @@ routes:
         // A route with no authorization block but with `args:`
         // validators is still an APL route (declared_phases non-empty).
         let yaml = r#"
-routes:
-  validate_only:
-    args:
-      employee_id: "uuid"
+route:
+  args:
+    employee_id: "uuid"
 "#;
-        let routes = compile_config(yaml).unwrap().routes;
-        assert!(routes.contains_key("validate_only"));
+        let route = compile_test_route("validate_only", yaml).unwrap();
+        assert!(
+            !route.declared_phases().is_empty(),
+            "`args:` alone is a policy"
+        );
     }
 
     #[test]
     fn compile_propagates_pipeline_parse_errors() {
         let yaml = r#"
-routes:
-  bad:
-    result:
-      x: "nonsense"
+route:
+  result:
+    x: "nonsense"
 "#;
-        let err = compile_config(yaml).unwrap_err();
+        let err = compile_test_policy("bad", yaml).unwrap_err();
         assert!(format!("{err}").contains("unknown stage"));
     }
 
@@ -4948,19 +5339,19 @@ plugins:
   - name: audit
     kind: native
     hooks: [cmf.tool_post_invoke]
-routes:
-  get_compensation:
+route:
+  authorization:
     pre_invocation:
-      - "plugin(rate_limiter)"
+      - "run(rate_limiter)"
 "#;
-        let cfg = compile_config(yaml).unwrap();
+        let cfg = compile_test_policy("get_compensation", yaml).unwrap();
         assert_eq!(cfg.plugins.len(), 2);
         let rl = cfg.plugins.get("rate_limiter").unwrap();
         assert_eq!(rl.kind, "native");
         assert_eq!(rl.hooks, vec!["cmf.tool_pre_invoke".to_owned()]);
         assert_eq!(rl.capabilities, vec!["read_subject".to_owned()]);
-        // The route should still compile (uses plugin(rate_limiter)).
-        assert!(cfg.routes.contains_key("get_compensation"));
+        // The route still compiles (it names run(rate_limiter)).
+        assert!(!cfg.route.declared_phases().is_empty());
     }
 
     #[test]
@@ -4972,18 +5363,18 @@ plugins:
     hooks: [cmf.tool_pre_invoke]
     config:
       max_requests: 100
-routes:
-  hot_path:
+route:
+  authorization:
     pre_invocation:
-      - "plugin(rate_limiter)"
-    plugins:
-      rate_limiter:
-        config:
-          max_requests: 10
-        on_error: ignore
+      - "run(rate_limiter)"
+  plugins:
+    rate_limiter:
+      config:
+        max_requests: 10
+      on_error: ignore
 "#;
-        let cfg = compile_config(yaml).unwrap();
-        let route = cfg.routes.get("hot_path").unwrap();
+        let cfg = compile_test_policy("hot_path", yaml).unwrap();
+        let route = &cfg.route;
         let ovr = route.plugin_overrides.get("rate_limiter").unwrap();
         assert_eq!(ovr.on_error.as_deref(), Some("ignore"));
         let cfg_yaml = ovr.config.as_ref().unwrap();
@@ -5007,8 +5398,9 @@ routes:
     #[test]
     fn compile_policy_block_value_parses_apl_body() {
         let yaml = r#"
-pre_invocation:
-  - "require(authenticated)"
+authorization:
+  pre_invocation:
+    - "require(authenticated)"
 result:
   ssn: "redact(!perm.view_ssn)"
 "#;
@@ -5016,7 +5408,7 @@ result:
         let compiled =
             compile_policy_block_value("global.policy.all", &value).expect("compile block");
         assert_eq!(compiled.route_key, "global.policy.all");
-        assert_eq!(compiled.policy.len(), 1);
+        assert_eq!(compiled.pre_invocation.len(), 1);
         assert_eq!(compiled.result.len(), 1);
         assert_eq!(compiled.result[0].field, "ssn");
     }
@@ -5033,14 +5425,15 @@ result:
     #[test]
     fn compile_policy_block_value_threads_source_into_rule_paths() {
         let yaml = r#"
-pre_invocation:
-  - "require(authenticated)"
+authorization:
+  pre_invocation:
+    - "require(authenticated)"
 "#;
         let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
-        let compiled = compile_policy_block_value("global.policies.hr", &value).expect("compile");
-        match &compiled.policy[0] {
+        let compiled = compile_policy_block_value("groups.hr", &value).expect("compile");
+        match &compiled.pre_invocation[0] {
             crate::rules::Effect::When { source, .. } => {
-                assert_eq!(source, "global.policies.hr.pre_invocation[0]");
+                assert_eq!(source, "groups.hr.pre_invocation[0]");
             },
             other => panic!("expected When, got {other:?}"),
         }
@@ -5285,8 +5678,8 @@ pre_invocation:
         // Both forms coexist in the same policy block — string form
         // for the compact case, map form for richer config.
         let yaml = r#"
-routes:
-  get_compensation:
+route:
+  authorization:
     pre_invocation:
       - "require(role.hr)"
       - "delegate(workday-oauth, target: workday-api, permissions: [read_compensation])"
@@ -5296,19 +5689,19 @@ routes:
           config:
             mode: trace
 "#;
-        let cfg = compile_config(yaml).expect("compile");
-        let route = cfg.routes.get("get_compensation").expect("route");
-        assert_eq!(route.policy.len(), 3);
+        let cfg = compile_test_policy("get_compensation", yaml).expect("compile");
+        let route = &cfg.route;
+        assert_eq!(route.pre_invocation.len(), 3);
 
         // Step [1] is the string-form delegate.
-        let crate::rules::Effect::Delegate(s1) = &route.policy[1] else {
+        let crate::rules::Effect::Delegate(s1) = &route.pre_invocation[1] else {
             panic!("expected Delegate at policy[1]");
         };
         assert_eq!(s1.plugin_name, "workday-oauth");
         assert!(s1.on_error.is_none());
 
         // Step [2] is the map-form delegate.
-        let crate::rules::Effect::Delegate(s2) = &route.policy[2] else {
+        let crate::rules::Effect::Delegate(s2) = &route.pre_invocation[2] else {
             panic!("expected Delegate at policy[2]");
         };
         assert_eq!(s2.plugin_name, "audit-receipt");
@@ -5316,13 +5709,13 @@ routes:
     }
 
     #[test]
-    fn compile_route_with_delegate_in_policy_and_post_policy() {
+    fn compile_route_with_delegate_in_both_step_lists() {
         // End-to-end: delegate() lands in the right phase with the
         // right source path for diagnostics. Mixed with normal rules
         // to prove it doesn't perturb existing step parsing.
         let yaml = r#"
-routes:
-  get_compensation:
+route:
+  authorization:
     pre_invocation:
       - "require(role.hr)"
       - delegate:
@@ -5336,20 +5729,23 @@ routes:
           plugin: audit-biscuit
           on_error: continue
 "#;
-        let cfg = compile_config(yaml).expect("compile");
-        let route = cfg.routes.get("get_compensation").expect("route present");
-        assert_eq!(route.policy.len(), 3);
+        let cfg = compile_test_policy("get_compensation", yaml).expect("compile");
+        let route = &cfg.route;
+        assert_eq!(route.pre_invocation.len(), 3);
 
         // Policy step [1] is the delegate.
-        let crate::rules::Effect::Delegate(ds) = &route.policy[1] else {
-            panic!("expected Delegate at policy[1], got {:?}", route.policy[1]);
+        let crate::rules::Effect::Delegate(ds) = &route.pre_invocation[1] else {
+            panic!(
+                "expected Delegate at policy[1], got {:?}",
+                route.pre_invocation[1]
+            );
         };
         assert_eq!(ds.plugin_name, "workday-oauth");
         assert_eq!(ds.source, "get_compensation.pre_invocation[1]");
 
-        // post_policy[0] is the audit-biscuit delegate.
-        let crate::rules::Effect::Delegate(post_ds) = &route.post_policy[0] else {
-            panic!("expected Delegate at post_policy[0]");
+        // post_invocation[0] is the audit-biscuit delegate.
+        let crate::rules::Effect::Delegate(post_ds) = &route.post_invocation[0] else {
+            panic!("expected Delegate at post_invocation[0]");
         };
         assert_eq!(post_ds.plugin_name, "audit-biscuit");
         assert_eq!(post_ds.on_error.as_deref(), Some("continue"));
@@ -5487,25 +5883,28 @@ routes:
 
     #[test]
     fn compile_route_with_require_approval_in_policy() {
-        // End-to-end: the sugar verb survives compile_config and lands as
+        // End-to-end: the sugar verb survives compilation and lands as
         // an Effect::Elicit at the right phase/source. The `when`-gated
         // form mirrors the manager-approval design doc.
         let yaml = r#"
-routes:
-  payroll_adjust:
+route:
+  authorization:
     pre_invocation:
       - "require(authenticated)"
       - when: "args.amount > 10000"
         do:
           - "require_approval(manager-approver, from: user.manager, channel: \"ciba\", scope: \"args.amount <= 25000\", purpose: \"Approve salary change\", timeout: 24h)"
 "#;
-        let cfg = compile_config(yaml).expect("compile");
-        let route = cfg.routes.get("payroll_adjust").expect("route present");
-        assert_eq!(route.policy.len(), 2);
+        let cfg = compile_test_policy("payroll_adjust", yaml).expect("compile");
+        let route = &cfg.route;
+        assert_eq!(route.pre_invocation.len(), 2);
 
         // policy[1] is the `when` wrapper; its body[0] is the elicitation.
-        let crate::rules::Effect::When { body, .. } = &route.policy[1] else {
-            panic!("expected When at policy[1], got {:?}", route.policy[1]);
+        let crate::rules::Effect::When { body, .. } = &route.pre_invocation[1] else {
+            panic!(
+                "expected When at policy[1], got {:?}",
+                route.pre_invocation[1]
+            );
         };
         let crate::rules::Effect::Elicit(e) = &body[0] else {
             panic!("expected Elicit in when-body, got {:?}", body[0]);
@@ -5531,8 +5930,8 @@ routes:
             "diagnostic should explain that validate is unimplemented: {msg}",
         );
         assert!(
-            msg.contains("regex") && msg.contains("plugin"),
-            "diagnostic should suggest regex(...) and plugin(...): {msg}",
+            msg.contains("regex") && msg.contains("run"),
+            "diagnostic should suggest regex(...) and run(...): {msg}",
         );
         assert!(
             msg.contains("ssn_format"),
@@ -5540,24 +5939,34 @@ routes:
         );
     }
 
-    /// A lone quote character in a stage argument used to abort the parser:
-    /// `"` satisfies both `starts_with('"')` and `ends_with('"')`, and the
-    /// follow-up slice ran from 1 to 0. `parse_pipeline` is public and policy
-    /// text is operator input, so this was a reachable panic rather than a
-    /// theoretical one. Both stages must now parse, treating the quote as a
-    /// literal value.
+    /// A lone quote in a stage argument is an unterminated literal.
+    ///
+    /// It used to be content, so `regex(")` compiled to a pattern matching one
+    /// double-quote character and `enum(")` to a set holding one. That was the
+    /// visible half of a wider problem: quoted text was read in ten places with
+    /// three different escape rules, and this site had none, so a quote was a
+    /// delimiter only when it happened to appear at both ends.
+    ///
+    /// One reader serves every site now. What a stage argument keeps is the right
+    /// to carry no quotes at all, which the sibling test below pins: requiring
+    /// them would rewrite working field stages for no gain in meaning. What it
+    /// loses is the right to open a literal and not close it.
+    ///
+    /// The reason this test was first written still holds and is still checked: a
+    /// lone quote satisfied both `starts_with` and `ends_with`, and the follow-up
+    /// slice ran from 1 to 0, so `parse_pipeline` panicked on operator input. It
+    /// returns an error here, not a panic.
     #[test]
-    fn lone_quote_in_stage_argument_does_not_abort() {
-        let regex = parse_pipeline("str | regex(\")").expect("regex stage must parse");
-        assert_eq!(regex.stages.len(), 2);
+    fn lone_quote_in_stage_argument_is_an_unterminated_literal() {
+        for src in ["str | regex(\")", "str | enum(\")", "str | regex(')"] {
+            let msg = parse_pipeline(src)
+                .expect_err("a lone quote does not read as content")
+                .to_string();
+            assert!(msg.contains("unterminated"), "{src}: {msg}");
+        }
 
-        let enumerated = parse_pipeline("str | enum(\")").expect("enum stage must parse");
-        assert_eq!(enumerated.stages.len(), 2);
-
-        // Single-quote form, and the two-quote empty-string form, which the
-        // length-guarded siblings already accepted.
-        parse_pipeline("str | regex(')").expect("single-quote regex must parse");
-        parse_pipeline("str | regex(\"\")").expect("empty quoted pattern must parse");
+        // Two quotes are a closed literal, so an empty pattern still parses.
+        parse_pipeline("str | regex(\"\")").expect("an empty quoted pattern is a closed literal");
     }
 
     #[test]

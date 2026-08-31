@@ -32,7 +32,7 @@ Add one dependency to get the engine and all bundled extensions:
 praxis-policy = { version = "0.1", features = ["builtins"] }
 ```
 
-Without `builtins`, you get the engine alone and no extensions compiled in. Declare invidual features instead: `jwt`, `oauth`, `elicitation-ciba`, `cedar`, `cel`, `opa`, `valkey`.
+Without `builtins`, you get the engine alone and no extensions compiled in. Declare individual features instead: `jwt`, `oauth`, `elicitation-ciba`, `cedar`, `cel`, `opa`, `valkey`.
 
 The crates are versioned together and released together, so a single `0.1` requirement covers the set. Requires Rust 1.96 or newer.
 

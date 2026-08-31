@@ -188,6 +188,8 @@ async fn build_manager(yaml: &str) -> (Arc<PolicyEngine>, Arc<std::sync::atomic:
 #[tokio::test]
 async fn config_override_replaces_base_config_for_route() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: gate
     kind: allowlist-gate
@@ -196,17 +198,17 @@ plugins:
       allowlist: ["closed"]
 routes:
   - tool: tool_a
-    apl:
+    authorization:
       pre_invocation:
-        - "plugin(gate)"
+        - "run(gate)"
   - tool: tool_b
-    apl:
-      plugins:
-        gate:
-          config:
-            allowlist: ["open"]
+    plugins:
+      gate:
+        config:
+          allowlist: ["open"]
+    authorization:
       pre_invocation:
-        - "plugin(gate)"
+        - "run(gate)"
 "#;
     let (mgr, instance_count) = build_manager(YAML).await;
 
@@ -261,6 +263,8 @@ routes:
 #[tokio::test]
 async fn dispatch_cache_memoizes_override_instances() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: gate
     kind: allowlist-gate
@@ -269,13 +273,13 @@ plugins:
       allowlist: ["closed"]
 routes:
   - tool: tool_b
-    apl:
-      plugins:
-        gate:
-          config:
-            allowlist: ["open"]
+    plugins:
+      gate:
+        config:
+          allowlist: ["open"]
+    authorization:
       pre_invocation:
-        - "plugin(gate)"
+        - "run(gate)"
 "#;
     let (mgr, instance_count) = build_manager(YAML).await;
 
@@ -310,6 +314,8 @@ routes:
 #[tokio::test]
 async fn caps_only_override_does_not_reinstantiate() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: gate
     kind: allowlist-gate
@@ -318,12 +324,12 @@ plugins:
       allowlist: ["open"]
 routes:
   - tool: tool_c
-    apl:
-      plugins:
-        gate:
-          on_error: ignore
+    plugins:
+      gate:
+        on_error: ignore
+    authorization:
       pre_invocation:
-        - "plugin(gate)"
+        - "run(gate)"
 "#;
     let (mgr, instance_count) = build_manager(YAML).await;
 
@@ -361,6 +367,8 @@ routes:
 #[tokio::test]
 async fn two_routes_with_distinct_overrides_produce_distinct_instances() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 plugins:
   - name: gate
     kind: allowlist-gate
@@ -369,21 +377,21 @@ plugins:
       allowlist: ["closed"]
 routes:
   - tool: tool_a
-    apl:
-      plugins:
-        gate:
-          config:
-            allowlist: ["alpha"]
+    plugins:
+      gate:
+        config:
+          allowlist: ["alpha"]
+    authorization:
       pre_invocation:
-        - "plugin(gate)"
+        - "run(gate)"
   - tool: tool_b
-    apl:
-      plugins:
-        gate:
-          config:
-            allowlist: ["open"]
+    plugins:
+      gate:
+        config:
+          allowlist: ["open"]
+    authorization:
       pre_invocation:
-        - "plugin(gate)"
+        - "run(gate)"
 "#;
     let (mgr, instance_count) = build_manager(YAML).await;
 
@@ -454,6 +462,8 @@ async fn on_error_override_plumbs_through_to_trusted_config() {
     // we'll build the routes manually below to focus on what the
     // dispatch plan does with overrides.
     const YAML: &str = r#"
+engine_settings:
+  dispatch: hooks
 plugins:
   - name: gate
     kind: allowlist-gate
@@ -463,10 +473,9 @@ plugins:
 "#;
     let (mgr, _) = build_manager(YAML).await;
 
-    // Construct the APL plugin registry by hand to match what
-    // `compile_config` would have produced for the YAML's `plugins:`
-    // block. `RouteDispatchPlan::build` consults this to know which
-    // plugins to resolve through praxis-policy-core.
+    // Construct the APL plugin registry by hand, the way a document's root
+    // `plugins:` block would supply it. `RouteDispatchPlan::build` consults this
+    // to know which plugins to resolve through praxis-policy-core.
     let mut registry = PluginRegistry::new();
     registry.insert(
         "gate".to_owned(),
@@ -486,7 +495,7 @@ plugins:
     // Override route — sets `on_error: ignore` only.
     let mut route_override = CompiledRoute::default();
     route_override.route_key = "override-route".into();
-    route_override.policy.push(Effect::Plugin {
+    route_override.pre_invocation.push(Effect::Plugin {
         name: "gate".into(),
     });
     let mut override_block = PluginOverride::default();
@@ -513,7 +522,7 @@ plugins:
     // Base-config route — no overrides; should carry default Fail.
     let mut route_base = CompiledRoute::default();
     route_base.route_key = "base-route".into();
-    route_base.policy.push(Effect::Plugin {
+    route_base.pre_invocation.push(Effect::Plugin {
         name: "gate".into(),
     });
     let plan_base = cache.get_or_build(&route_base, &registry, &mgr).await;

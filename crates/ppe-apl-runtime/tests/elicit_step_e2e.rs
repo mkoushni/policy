@@ -40,7 +40,7 @@ use praxis_policy_core::plugin::{OnError, Plugin, PluginConfig, PluginMode};
 
 use praxis_policy_apl_core::{
     ElicitKind, ElicitStep, ElicitationInvoker as _, ElicitationOutcome, ElicitationStatus,
-    compile_config,
+    test_util::compile_test_policy,
 };
 use praxis_policy_apl_runtime::{ElicitationPluginInvoker, RouteDispatchPlan};
 
@@ -158,13 +158,13 @@ plugins:
   - name: manager-approver
     kind: test
     hooks: [elicit]
-routes:
-  payroll_adjust:
+route:
+  authorization:
     pre_invocation:
       - "require_approval(manager-approver, from: claim.manager, channel: \"ciba\", scope: \"args.amount <= 25000\", purpose: \"Approve raise\")"
 "#;
-    let cfg = compile_config(yaml).expect("compile route YAML");
-    let route = cfg.routes.get("payroll_adjust").expect("route present");
+    let cfg = compile_test_policy("payroll_adjust", yaml).expect("compile route YAML");
+    let route = &cfg.route;
     let plan = RouteDispatchPlan::build(route, &cfg.plugins, &mgr).await;
     (mgr, Arc::new(plan))
 }

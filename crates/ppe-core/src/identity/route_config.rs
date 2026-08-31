@@ -2,12 +2,12 @@
 // Copyright (c) 2026 Praxis Contributors
 
 // Route-level identity configuration — the parsed shape of a
-// route's `identity:` block in unified-config YAML.
+// route's `authentication:` block in unified-config YAML.
 //
 // # Semantic note
 //
-// Identity binding is **hook-specific**: the `identity:` block
-// binds plugins ONLY for the `identity.resolve` hook on this
+// Identity binding is **hook-specific**: the `authentication:`
+// block binds plugins ONLY for the `identity.resolve` hook on this
 // route, independent of whatever the route's `plugins:` block does.
 // This matters because in APL-driven routes, the `plugins:` block
 // has different meaning (it's a per-route config-override list,
@@ -22,34 +22,31 @@
 //
 // ```yaml
 // # List form — implicit additive, common case
-// identity:
+// authentication:
 //   - corp-jwt
 //   - spiffe-attestor
 //
 // # Object form — when the override flag is needed
-// identity:
+// authentication:
 //   replace_inherited: true
 //   steps:
 //     - legacy-basic-auth
 // ```
 //
 // Each step is either a bare plugin name (string) or a map with
-// `name:` + optional `on_error:` / `config:`:
+// `name:` + optional `config:`:
 //
 // ```yaml
-// identity:
+// authentication:
 //   - corp-jwt                       # bare name
 //   - name: spiffe-attestor          # map form
-//     on_error: deny
 //     config:
 //       verify_attestation: strict
 // ```
 
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 
-/// A route's parsed `identity:` block. Drives dispatch of the
+/// A route's parsed `authentication:` block. Drives dispatch of the
 /// `identity.resolve` hook for the route.
 ///
 /// `None` on a `RouteEntry` means "no identity declared for this
@@ -57,54 +54,51 @@ use serde::{Deserialize, Serialize};
 /// entry list when filtered for this route, and the host's
 /// `IdentityPayload` flows through unchanged (no resolvers fire).
 ///
-/// Inheritance (deferred) walks `global → tags → route`
-/// and merges each layer's `RouteIdentityConfig` based on
-/// `replace_inherited`: when `false` (the default), the new layer's
-/// steps append after the inherited ones; when `true`, the new
-/// layer's steps replace the inherited list wholesale.
+/// Inheritance walks `global → entity default → tags → route`,
+/// appending each layer's steps to the running list. A layer setting
+/// `replace_inherited` drops everything accumulated before it
+/// first. See `crate::config::resolve_identity_plugins_for_route`,
+/// which is where the merge lives.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteIdentityConfig {
     /// Ordered list of identity steps to run. Empty list is valid:
-    /// `identity: { replace_inherited: true, steps: [] }` is the
-    /// "explicitly opt out of inherited identity" knob.
+    /// `authentication: { replace_inherited: true, steps: [] }` is
+    /// the "explicitly opt out of inherited identity" knob.
     pub steps: Vec<RouteIdentityStep>,
 
     /// When true, this block replaces any inherited identity steps
     /// instead of appending to them. Set via the object-form YAML
-    /// (`identity: { replace_inherited: true, steps: [...] }`).
+    /// (`authentication: { replace_inherited: true, steps: [...] }`).
     /// The list-form YAML always produces `false`.
     ///
-    /// Honored by the inheritance merge once that lands. Today the
-    /// flag is stored without exercising its merge semantics (no
-    /// inheritance to override yet at route level).
+    /// `crate::config::resolve_identity_plugins_for_route` honors the
+    /// flag at every scope it can be written at. On a route it drops
+    /// every inherited layer. On an entity default or a tag bundle it
+    /// drops what stacked before it, while the layers after it and the
+    /// route still append, so declaration order decides what survives.
+    /// A drop written above the route is reported at config load, since
+    /// the route it strips is not where the flag is written.
     #[serde(default, skip_serializing_if = "is_false")]
     pub replace_inherited: bool,
 }
 
 /// One step in the identity-phase pipeline. Points at a plugin
-/// registered under the `identity.resolve` hook, optionally with
-/// a per-call config override and an `on_error` policy that
-/// controls what happens when the step fails.
+/// registered under the `identity.resolve` hook, optionally with a
+/// per-call config override.
 ///
 /// # Cumulative stacking
 ///
-/// At runtime, every step in the block runs (subject to its own
-/// `on_error`). Each step's resolved `IdentityPayload` accumulates
-/// — handlers contribute orthogonal slots (JWT → `subject`;
-/// SPIFFE → `caller_workload`; agent resolver → `agent`) so they
-/// compose without collision in the common case.
+/// At runtime, every step in the block runs. Each step's resolved
+/// `IdentityPayload` accumulates — handlers contribute orthogonal
+/// slots (JWT → `subject`; SPIFFE → `caller_workload`; agent
+/// resolver → `agent`) so they compose without collision in the
+/// common case.
 ///
-/// # On-error semantics
+/// # Failure handling
 ///
-/// - `None` or `Some("continue")` — soft failure: the step's
-///   contribution is dropped, the next step runs, and any missing
-///   extensions get caught later by `require(authenticated)` /
-///   `require(workload.*)` in downstream policy.
-/// - `Some("deny")` — hard requirement: a failure halts the
-///   request with the plugin's violation code.
-///
-/// Unknown strings parse as best-effort; future slices may
-/// introduce typed enums.
+/// A step's failure handling is the `on_error:` of the plugin's own
+/// `plugins:` declaration. A step carried its own for a while and
+/// nothing read it, so the key is gone rather than duplicated.
 ///
 /// # Per-step config override
 ///
@@ -124,16 +118,6 @@ pub struct RouteIdentityStep {
     /// match the existing `create_override_instance` interface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_override: Option<serde_json::Value>,
-
-    /// Per-step failure handling. See type-level docs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_error: Option<String>,
-
-    /// Catch-all for any other fields a future schema version
-    /// adds (timeout, priority, condition, …) — preserved so the
-    /// parser doesn't reject configs targeting newer runtimes.
-    #[serde(default, flatten, skip_serializing_if = "HashMap::is_empty")]
-    pub extra: HashMap<String, serde_json::Value>,
 }
 
 impl RouteIdentityStep {
@@ -171,8 +155,6 @@ mod tests {
         let s = RouteIdentityStep::bare("corp-jwt");
         assert_eq!(s.name, "corp-jwt");
         assert!(s.config_override.is_none());
-        assert!(s.on_error.is_none());
-        assert!(s.extra.is_empty());
     }
 
     #[test]

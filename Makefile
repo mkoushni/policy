@@ -75,9 +75,17 @@ build:
 build-release:
 	@$(CARGO) build --release --workspace
 
+# The inner loop. Covers test and example code as well as the libraries, and
+# both feature sets, because most compile errors while editing live in tests.
+#
+# Prefer this over `make test` while iterating. `cargo check` never links an
+# executable, and on macOS with an Endpoint Security agent installed, linking and
+# first-running a test binary is what costs the wall clock, not compiling it. See
+# AGENTS.md, Conventions -> Tests.
 .PHONY: check
 check:
-	@$(CARGO) check --workspace
+	@$(CARGO) check --workspace --all-targets
+	@$(CARGO) check --workspace --all-targets --all-features
 
 .PHONY: clean
 clean:
@@ -175,6 +183,9 @@ audit:
 # this is the only copy of the number.
 COVERAGE_FLOOR ?= 95
 
+# `--all-features` reaches the test targets behind `test-util`, without which the
+# compiler's test scaffolding and everything it covers fall outside the floor.
+#
 # `--include-ignored` reaches the Valkey integration tests, much of which needs no
 # Valkey at all. `VALKEY_TESTS_OPTIONAL=1` lets them skip instead of fail, because
 # this target measures and `make test` is what asserts. Set `VALKEY_TEST_URL` to
@@ -182,7 +193,7 @@ COVERAGE_FLOOR ?= 95
 .PHONY: coverage
 coverage:
 	@command -v cargo-llvm-cov >/dev/null 2>&1 || $(CARGO) install cargo-llvm-cov --locked
-	@VALKEY_TESTS_OPTIONAL=1 cargo llvm-cov --workspace --summary-only \
+	@VALKEY_TESTS_OPTIONAL=1 cargo llvm-cov --workspace --all-features --summary-only \
 		--fail-under-lines $(COVERAGE_FLOOR) -- --include-ignored
 
 # Mutation testing. Advisory, not part of the blocking CI gate.
