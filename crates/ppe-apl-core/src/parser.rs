@@ -149,12 +149,6 @@ impl<'a> Lexer<'a> {
         self.bytes.get(self.pos).copied()
     }
 
-    fn bump(&mut self) -> Option<u8> {
-        let b = self.peek()?;
-        self.pos += 1;
-        Some(b)
-    }
-
     fn skip_ws(&mut self) {
         while let Some(b) = self.peek() {
             if b.is_ascii_whitespace() {

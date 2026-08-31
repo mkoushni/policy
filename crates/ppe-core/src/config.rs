@@ -3128,11 +3128,6 @@ fn score_route_match(route: &RouteEntry, query: RouteQuery<'_>) -> Option<(usize
 mod tests {
     use super::*;
 
-    // Helper: empty tags for tests that don't need them
-    fn no_tags() -> HashSet<String> {
-        HashSet::new()
-    }
-
     /// The name the route table resolves for a request, or `None` when nothing
     /// matched. Route matching outlived the activation lists it used to feed.
     fn matched_name(
