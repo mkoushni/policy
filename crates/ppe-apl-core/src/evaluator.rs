@@ -199,9 +199,9 @@ fn order_compare(
     })
 }
 
-/// An order operator was applied to a value that is not a finite number.
-/// There is no boolean that is safe to return: `false` skips a deny
-/// rule, `true` inverts under `!`. The phase Denies instead.
+/// An order operator was applied to a value that cannot be ordered
+/// exactly. There is no boolean that is safe to return: `false` skips
+/// a deny rule, `true` inverts under `!`. The phase Denies instead.
 #[derive(Debug)]
 struct Unorderable {
     key: String,
@@ -210,7 +210,8 @@ struct Unorderable {
 impl Unorderable {
     fn reason(&self) -> String {
         format!(
-            "order comparison on `{}` failed (fail-closed): value is not a finite number",
+            "order comparison on `{}` failed (fail-closed): value is not a finite number, \
+             or an integer that cannot be compared exactly through f64",
             self.key
         )
     }
@@ -274,6 +275,11 @@ fn numeric_compare(attr: &AttributeValue, lit: &Literal, op: OrderOp) -> Result<
     // `args.amount > 10000` plainly means a numeric comparison. A present
     // value that is not a finite number cannot be ordered: `Err` so the
     // phase Denies rather than treating the comparison as false.
+    //
+    // Integers whose magnitude exceeds 2^53 are not exact as `f64`.
+    // Coercing them for a mixed int/float compare would collapse distinct
+    // amounts and a max-amount deny could skip. Those pairs are Unorderable
+    // too, same as `NaN`.
     let a = coerce_f64_attr(attr).ok_or(())?;
     let b = coerce_f64_lit(lit).ok_or(())?;
     Ok(match op {
@@ -284,19 +290,32 @@ fn numeric_compare(attr: &AttributeValue, lit: &Literal, op: OrderOp) -> Result<
     })
 }
 
+/// Largest `|n|` for which every integer in `[-n, n]` is a distinct `f64`.
+/// Above this, mixed int/float order would collapse distinct amounts.
+const F64_EXACT_INT_BOUND: i64 = 9_007_199_254_740_992; // 2^53
+
+/// Convert `n` to `f64` only when the conversion is exact.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "the bound below is the exact-integer range of f64"
+)]
+fn i64_as_exact_f64(n: i64) -> Option<f64> {
+    (-F64_EXACT_INT_BOUND..=F64_EXACT_INT_BOUND)
+        .contains(&n)
+        .then_some(n as f64)
+}
+
 /// Coerce a bag attribute to `f64` for an order comparison: numbers pass
 /// through; a string is parsed (numeric-looking strings only); anything
 /// else is non-numeric.
 ///
 /// Only reached for operand pairs that are not both integers, since
-/// [`numeric_compare`] answers those exactly before coercing.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "f64 is the only common type for a mixed int/float comparison"
-)]
+/// [`numeric_compare`] answers those exactly before coercing. Integers
+/// outside [`F64_EXACT_INT_BOUND`] return `None` so the compare Denies
+/// rather than rounding.
 fn coerce_f64_attr(attr: &AttributeValue) -> Option<f64> {
     match attr {
-        AttributeValue::Int(a) => Some(*a as f64),
+        AttributeValue::Int(a) => i64_as_exact_f64(*a),
         AttributeValue::Float(a) => finite_f64(*a),
         AttributeValue::String(s) => s.trim().parse::<f64>().ok().and_then(finite_f64),
         _ => None,
@@ -305,13 +324,9 @@ fn coerce_f64_attr(attr: &AttributeValue) -> Option<f64> {
 
 /// Coerce a literal to `f64` for an order comparison. Same rules as
 /// [`coerce_f64_attr`] so `args.x > "10"` works symmetrically.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "f64 is the only common type for a mixed int/float comparison"
-)]
 fn coerce_f64_lit(lit: &Literal) -> Option<f64> {
     match lit {
-        Literal::Int(b) => Some(*b as f64),
+        Literal::Int(b) => i64_as_exact_f64(*b),
         Literal::Float(b) => finite_f64(*b),
         Literal::String(s) => s.trim().parse::<f64>().ok().and_then(finite_f64),
         _ => None,
@@ -1208,17 +1223,25 @@ fn dispatch_parallel<'a>(
                     // configured). Fail closed if it ever fires: a
                     // gate that did not finish cannot become Allow.
                     if first_halt.is_none() {
+                        let label = effects
+                            .get(idx)
+                            .map_or_else(|| "unknown".to_owned(), parallel_branch_label);
                         first_halt = Some(Decision::Deny {
-                            reason: Some(format!("parallel branch {idx} timed out (fail-closed)")),
+                            reason: Some(format!(
+                                "parallel branch {idx} ({label}) timed out (fail-closed)"
+                            )),
                             rule_source: fallback_source.to_owned(),
                         });
                     }
                 },
                 BranchOutcome::Panicked(msg) => {
                     if first_halt.is_none() {
+                        let label = effects
+                            .get(idx)
+                            .map_or_else(|| "unknown".to_owned(), parallel_branch_label);
                         first_halt = Some(Decision::Deny {
                             reason: Some(format!(
-                                "parallel branch {idx} panicked (fail-closed): {msg}"
+                                "parallel branch {idx} ({label}) panicked (fail-closed): {msg}"
                             )),
                             rule_source: fallback_source.to_owned(),
                         });
@@ -1232,6 +1255,24 @@ fn dispatch_parallel<'a>(
             None => EffectOutcome::Continue,
         }
     })
+}
+
+/// Short identity for a parallel branch in fail-closed deny reasons.
+fn parallel_branch_label(effect: &Effect) -> String {
+    match effect {
+        Effect::Allow => "allow".to_owned(),
+        Effect::Deny { .. } => "deny".to_owned(),
+        Effect::Plugin { name } => format!("plugin({name})"),
+        Effect::Delegate(_) => "delegate".to_owned(),
+        Effect::Elicit(_) => "elicit".to_owned(),
+        Effect::Taint { label, .. } => format!("taint({label})"),
+        Effect::Restrict { .. } => "restrict".to_owned(),
+        Effect::FieldOp { path, .. } => format!("field_op({path})"),
+        Effect::Sequential(_) => "sequential".to_owned(),
+        Effect::Parallel(_) => "parallel".to_owned(),
+        Effect::When { source, .. } => format!("when({source})"),
+        Effect::Pdp { call, .. } => format!("pdp({:?})", call.dialect),
+    }
 }
 
 /// Apply a `FieldOp` effect — resolve the path in args/result, run
@@ -1840,6 +1881,66 @@ mod tests {
                 &bag
             ),
             "2^53+1 must compare greater-or-equal to 2^53"
+        );
+    }
+
+    /// Mixed int/float order above 2^53 cannot go through `f64` without
+    /// collapsing distinct amounts. Fail closed rather than answer wrong.
+    #[test]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::float_cmp,
+        reason = "the lossy conversion is the premise under test"
+    )]
+    fn mixed_int_float_order_on_large_integers_is_fail_closed() {
+        let big = 9_007_199_254_740_993_i64; // 2^53 + 1
+        let boundary = 9_007_199_254_740_992_i64; // 2^53
+        assert_eq!(
+            big as f64, boundary as f64,
+            "premise: these are indistinguishable as doubles"
+        );
+
+        let mut bag = AttributeBag::default();
+        bag.set("args.amount", AttributeValue::Int(big));
+        let err = super::eval_comparison(
+            "args.amount",
+            CompareOp::Gt,
+            &Literal::Float(boundary as f64),
+            &bag,
+        )
+        .expect_err("mixed order past 2^53 must not become a boolean");
+        assert!(
+            err.reason().contains("fail-closed"),
+            "reason must say fail-closed: {}",
+            err.reason()
+        );
+
+        bag.set("args.amount", AttributeValue::Float(boundary as f64));
+        let err = super::eval_comparison("args.amount", CompareOp::Lt, &Literal::Int(big), &bag)
+            .expect_err("a large int literal must not coerce through f64 either");
+        assert!(
+            err.reason().contains("fail-closed"),
+            "reason must say fail-closed: {}",
+            err.reason()
+        );
+    }
+
+    #[test]
+    fn mixed_int_float_order_within_exact_range_still_compares() {
+        let mut bag = AttributeBag::default();
+        bag.set("args.amount", AttributeValue::Int(10_000));
+        assert!(
+            eval_comparison("args.amount", CompareOp::Gt, &Literal::Float(9999.5), &bag),
+            "10000 > 9999.5 must hold"
+        );
+        assert!(
+            eval_comparison(
+                "args.amount",
+                CompareOp::Lt,
+                &Literal::Float(10_000.5),
+                &bag
+            ),
+            "10000 < 10000.5 must hold"
         );
     }
 
@@ -4328,6 +4429,14 @@ mod tests {
                 assert!(
                     reason.contains("panic"),
                     "reason must name the panic: {reason}"
+                );
+                assert!(
+                    reason.contains("plugin(boom)"),
+                    "reason must name the panicking effect: {reason}"
+                );
+                assert!(
+                    reason.contains("branch 1"),
+                    "reason must name the branch index: {reason}"
                 );
             },
             d => panic!("a panicking parallel branch must deny, got {d:?}"),

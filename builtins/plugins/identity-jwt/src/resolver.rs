@@ -41,6 +41,7 @@
 //   * `auth.audience_mismatch` — `aud` didn't include any configured aud
 //   * `auth.algorithm_mismatch` — token uses unaccepted algo
 //   * `auth.mapping_failed` — claim mapper rejected the claims
+//   * `auth.config_error` — issuer config was emptied after load (`audiences`)
 //   * `auth.token_invalid` — any other validation failure
 
 use std::sync::Arc;
@@ -811,12 +812,13 @@ impl HookHandler<IdentityHook> for JwtIdentityResolver {
             },
             Err(ValidateError::NoAudiences) => {
                 return PluginResult::deny(PluginViolation::new(
-                    "auth.no_audiences",
+                    "auth.config_error",
                     format!(
                         "issuer '{iss}' lists no audiences and did not set \
                          skip_audience_validation, so a token minted for any \
                          app would be accepted; this is a configuration fault \
-                         rather than a problem with the token"
+                         discovered at request time because `audiences` is a \
+                         public field, not a problem with the token"
                     ),
                 ));
             },
@@ -1172,6 +1174,34 @@ mod tests {
             "an empty audience list must surface as NoAudiences, got {}",
             variant_of(&err)
         );
+    }
+
+    /// Config load rejects this; the runtime path is a fallback because
+    /// `audiences` is a public field. The deny code is a config fault, not
+    /// an authentication failure on the token.
+    #[tokio::test]
+    async fn emptied_audiences_after_load_deny_as_config_error() {
+        let resolver = resolver_on_header("authorization");
+        {
+            let mut issuers = resolver.trusted_issuers.write().unwrap();
+            let current = &issuers[0];
+            let replacement = TrustedIssuer {
+                issuer: current.issuer.clone(),
+                audiences: vec![],
+                skip_audience_validation: false,
+                keys: Arc::clone(&current.keys),
+                algorithms: current.algorithms.clone(),
+                leeway_seconds: current.leeway_seconds,
+                source: current.source.clone(),
+                refresh: crate::trusted_issuer::RefreshGate::default(),
+            };
+            issuers[0] = Arc::new(replacement);
+        }
+        let payload = IdentityPayload::new(
+            jwt_with_payload(r#"{"iss":"https://idp.example","sub":"alice"}"#),
+            TokenSource::Bearer,
+        );
+        assert_eq!(deny_code_for(&resolver, payload).await, "auth.config_error");
     }
 
     #[test]

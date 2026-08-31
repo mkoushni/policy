@@ -767,17 +767,17 @@ impl TrustedIssuerConfig {
                 self.issuer
             ));
         }
-        if self.skip_audience_validation && !self.audiences.is_empty() {
-            return Err(format!(
-                "trusted_issuer '{}' sets skip_audience_validation together \
-                 with audiences; pick one",
-                self.issuer
-            ));
-        }
         if !self.skip_audience_validation && self.audiences.is_empty() {
             return Err(format!(
                 "trusted_issuer '{}' must list at least one audience \
                  (or set skip_audience_validation: true)",
+                self.issuer
+            ));
+        }
+        if self.skip_audience_validation && !self.audiences.is_empty() {
+            return Err(format!(
+                "trusted_issuer '{}' sets skip_audience_validation together \
+                 with audiences; pick one",
                 self.issuer
             ));
         }
@@ -1213,5 +1213,43 @@ mod tests {
             panic!("an empty issuer must not validate")
         };
         assert!(e.contains("issuer"), "{e}");
+    }
+
+    fn issuer_for_audience_checks(audiences: Vec<String>, skip: bool) -> TrustedIssuerConfig {
+        TrustedIssuerConfig {
+            issuer: "https://idp.example".into(),
+            audiences,
+            skip_audience_validation: skip,
+            algorithms: vec![Algorithm::HS256],
+            decoding_key: DecodingKeySource::Secret { secret: "s".into() },
+            leeway_seconds: 0,
+        }
+    }
+
+    /// Omitted and explicitly empty `audiences` are the same fault when skip
+    /// is off: the issuer would accept a token minted for any app.
+    #[test]
+    fn omitted_and_empty_audiences_share_the_same_load_error() {
+        let omitted = issuer_for_audience_checks(Vec::new(), false);
+        let explicit = issuer_for_audience_checks(vec![], false);
+        let omitted_err = omitted.validate().expect_err("omitted audiences must fail");
+        let explicit_err = explicit.validate().expect_err("empty audiences must fail");
+        assert!(
+            omitted_err.contains("at least one audience"),
+            "{omitted_err}"
+        );
+        assert_eq!(
+            omitted_err, explicit_err,
+            "omitted and `audiences: []` must not produce different messages"
+        );
+    }
+
+    #[test]
+    fn skip_with_a_list_is_still_a_conflict() {
+        let err = issuer_for_audience_checks(vec!["app".into()], true)
+            .validate()
+            .expect_err("skip plus a list must fail");
+        assert!(err.contains("skip_audience_validation"), "{err}");
+        assert!(err.contains("pick one"), "{err}");
     }
 }

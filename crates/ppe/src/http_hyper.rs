@@ -296,6 +296,12 @@ fn classify(err: &hyper_util::client::legacy::Error) -> HttpTransportError {
 /// checks those separately; this is the connect-time check the table's
 /// docs require, so a name that rebinds from public to metadata is
 /// refused on the lookup that actually dials.
+///
+/// The connector dials the `SocketAddr`s this resolver returns. A later
+/// DNS update does not change the peer: we never resolve a second time
+/// between the filter and `connect`. The residual is that an address we
+/// accepted is still a public host, and this transport cannot see whether
+/// that host forwards to a private one.
 #[derive(Clone, Copy, Debug)]
 struct EgressResolver {
     allow_private: bool,

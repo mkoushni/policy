@@ -67,6 +67,12 @@ connect-time check the table's docs require (a name that rebinds from
 public to metadata is refused on the lookup that dials). IPv4-mapped
 IPv6 literals are judged by the address they reach.
 
+The connector dials the filtered `SocketAddr` list; it does not resolve
+the name a second time. A DNS rebind after this lookup therefore cannot
+change the peer we connect to. What remains is that a public address we
+accepted could still forward to a private host, which this transport
+cannot observe.
+
 `HyperTransport::with_allow_private_destinations` is the hatch for a
 local IdP or a mock on loopback. `install_default_http_transport` does
 not set it. A host that injects its own transport never sees this knob;
