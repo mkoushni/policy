@@ -27,9 +27,9 @@ crate::define_hooks! {
     /// carries authorization, which is an admission check and so belongs
     /// entirely before the request is forwarded.
     ///
-    /// A route selecting on `http:` is matched from the request line once
-    /// `engine_settings.dispatch: policy` is set, which is not the default,
-    /// so a host that also puts `method` and `path` on the HTTP extension at the
+    /// A route selecting on `http:` is matched from the request line under
+    /// `engine_settings.dispatch: policy`, which is the default, so a host
+    /// that also puts `method` and `path` on the HTTP extension at the
     /// identity invocation unlocks that route's own `authentication:` list. A
     /// host that supplies no request line there behaves exactly as it does
     /// today, with the global list governing, and the engine warns once when

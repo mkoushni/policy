@@ -366,9 +366,9 @@ pub struct RouteEntry {
     pub llm: Option<StringOrList>,
 
     /// Match generic HTTP requests by path, and optionally by method.
-    /// Requires `engine_settings.dispatch: policy`, which is not the
-    /// default, so the route stays inert until it is set, like every other
-    /// route selector. See [`HttpSelector`] for the three shapes.
+    /// Requires `engine_settings.dispatch: policy`, which is the default, so
+    /// the route is live as written, like every other route selector. See
+    /// [`HttpSelector`] for the three shapes.
     #[serde(default)]
     pub http: Option<HttpSelector>,
 
@@ -702,9 +702,10 @@ impl StringOrList {
 /// reuse [`Pattern`]: the segment-boundary reading is the host router's, and a
 /// glob dialect here would disagree with it.
 ///
-/// Nothing here resolves until `engine_settings.dispatch: policy` is set.
-/// It is not the default, and an `http:` route declared without it is reported
-/// at load rather than left to be discovered.
+/// Nothing here resolves unless `engine_settings.dispatch: policy` is in effect.
+/// It is the default, so this resolves as written; an `http:` route declared
+/// under an explicit `dispatch: hooks` is reported at load rather than left to
+/// be discovered.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum HttpSelector {

@@ -59,7 +59,7 @@
 // The global HTTP catch-all installs under the same pair, under the
 // reserved global name rather than a route's own. An `http:` route
 // resolves only under `engine_settings.dispatch: policy`, which is
-// not the default; the global catch-all installs either way.
+// the default; the global catch-all installs either way.
 //
 // The mapping lives in [`hook_pair_for_entity`]. Hosts fire
 // `mgr.invoke_named::<CmfHook>("cmf.llm_input", ...)` for LLM
@@ -1894,8 +1894,8 @@ mod tests {
     // A compiled policy body reaches a request through the annotation the
     // visitor installed, so these drive a real engine rather than inspecting
     // the visitor's own state. Every fixture sets
-    // `engine_settings.dispatch: policy`, which the `http:` selector
-    // requires and which is not the default.
+    // `engine_settings.dispatch: policy` explicitly, which the `http:`
+    // selector requires and which is also the default.
 
     /// A plugin that denies whatever reaches it, so a structural chain that
     /// runs when it should not is visible as a denial with this code.
