@@ -31,6 +31,7 @@
 // so a stray feature unification cannot silently give a host a second
 // HTTP stack it did not ask for.
 
+use std::error::Error;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::OnceLock;
@@ -276,19 +277,38 @@ impl HyperTransport {
 /// the request: a caller uses it to decide between retrying and
 /// recording an indeterminate outcome. `is_connect()` is the only signal
 /// hyper gives us that nothing was sent, so anything else is `Io`, which
-/// reads as "may have reached the peer" and is the safe direction to err
+/// reads as "may have reached the peer" and the safe direction to err
 /// in. Guessing `Connect` for an ambiguous failure would license a retry
 /// that mints a second token.
+///
+/// hyper-util's Display is `client error ({kind})` and does not include
+/// the source chain, so matching that string never sees
+/// [`EGRESS_DENIED_PREFIX`]. Walk [`Error::source`] instead; otherwise a
+/// filtered hostname reports `Connect`, maps to `idp_unreachable`, and
+/// is retried against a destination that can never be reached.
 fn classify(err: &hyper_util::client::legacy::Error) -> HttpTransportError {
-    let msg = err.to_string();
-    if let Some(reason) = msg.split(EGRESS_DENIED_PREFIX).nth(1) {
-        return HttpTransportError::Rejected(reason.trim().to_owned());
+    if let Some(reason) = denied_reason(err) {
+        return HttpTransportError::Rejected(reason);
     }
+    let msg = err.to_string();
     if err.is_connect() {
         HttpTransportError::Connect(msg)
     } else {
         HttpTransportError::Io(msg)
     }
+}
+
+/// The private-address reason [`EgressResolver`] stuffed behind
+/// [`EGRESS_DENIED_PREFIX`], if any layer of `err` carries it.
+fn denied_reason(err: &(dyn Error + 'static)) -> Option<String> {
+    let mut cur = Some(err);
+    while let Some(e) = cur {
+        if let Some((_, reason)) = e.to_string().split_once(EGRESS_DENIED_PREFIX) {
+            return Some(reason.trim().to_owned());
+        }
+        cur = e.source();
+    }
+    None
 }
 
 /// DNS resolver that drops addresses [`private_address_reason`] would
@@ -504,6 +524,7 @@ mod tests {
             .execute(HttpRequest::get("http://10.0.0.1/jwks"))
             .await
             .expect_err("RFC 1918 is not a public destination");
+        assert!(!err.may_have_reached_peer());
         match err {
             HttpTransportError::Rejected(reason) => {
                 assert!(
@@ -525,6 +546,7 @@ mod tests {
             matches!(err, HttpTransportError::Rejected(_)),
             "expected Rejected, got {err:?}"
         );
+        assert!(!err.may_have_reached_peer());
     }
 
     #[tokio::test]
@@ -556,6 +578,55 @@ mod tests {
             matches!(err, HttpTransportError::Rejected(_)),
             "expected Rejected, got {err:?}"
         );
+        assert!(!err.may_have_reached_peer());
+    }
+
+    #[tokio::test]
+    async fn a_hostname_resolving_to_loopback_is_rejected_not_connect() {
+        // IP literals take the pre-connect check and never enter
+        // `EgressResolver`. A name has to, and hyper's Display is
+        // `client error (Connect)` — matching that string used to
+        // report Connect, which retried and mapped to idp_unreachable.
+        let err = HyperTransport::new()
+            .execute(HttpRequest::get("http://localhost:1/jwks"))
+            .await
+            .expect_err("localhost resolves to loopback");
+        assert!(
+            matches!(err, HttpTransportError::Rejected(_)),
+            "expected Rejected, got {err:?}"
+        );
+        assert!(!err.may_have_reached_peer());
+    }
+
+    #[test]
+    fn classify_walks_the_source_chain_for_the_egress_marker() {
+        // hyper-util formats as `client error (Connect)` and keeps the
+        // resolver error on `source()`, the way the live client does.
+        #[derive(Debug)]
+        struct Marker(&'static str);
+        impl std::fmt::Display for Marker {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl Error for Marker {}
+
+        #[derive(Debug)]
+        struct Wrap(Marker);
+        impl std::fmt::Display for Wrap {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("client error (Connect)")
+            }
+        }
+        impl Error for Wrap {
+            fn source(&self) -> Option<&(dyn Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let err = Wrap(Marker("ppe-egress-denied:loopback"));
+        assert_eq!(denied_reason(&err).as_deref(), Some("loopback"));
+        assert!(denied_reason(&Marker("client error (Connect)")).is_none());
     }
 
     #[tokio::test]

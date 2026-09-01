@@ -73,6 +73,14 @@ change the peer we connect to. What remains is that a public address we
 accepted could still forward to a private host, which this transport
 cannot observe.
 
+A filtered hostname used to surface as `HttpTransportError::Connect`
+because hyper-util's Display is `client error (Connect)` and does not
+include the resolver error. `classify` now walks `Error::source()`, so
+the marker `EgressResolver` writes becomes `Rejected`. That is what
+maps to `delegation.egress_denied` / `elicitation.egress_denied` and
+what `http_retry` refuses to retry. IP literals never needed the walk:
+they take the pre-connect check.
+
 `HyperTransport::with_allow_private_destinations` is the hatch for a
 local IdP or a mock on loopback. `install_default_http_transport` does
 not set it. A host that injects its own transport never sees this knob;
@@ -81,11 +89,14 @@ that transport's egress policy is the one that counts.
 Regression: `a_link_local_literal_is_rejected_without_dialling`,
 `a_private_literal_is_rejected_without_dialling`,
 `loopback_is_rejected_unless_the_hatch_is_set`,
-`a_mapped_ipv6_metadata_literal_is_rejected_without_dialling`, and
-`an_ipv6_loopback_literal_is_rejected_without_dialling` in
+`a_mapped_ipv6_metadata_literal_is_rejected_without_dialling`,
+`an_ipv6_loopback_literal_is_rejected_without_dialling`, and
+`a_hostname_resolving_to_loopback_is_rejected_not_connect` in
 `crates/ppe/src/http_hyper.rs`. Each expects `HttpTransportError::Rejected`
 and `may_have_reached_peer() == false`. The connection-refused test now
 uses the hatch so it still exercises `Connect` on loopback.
+`classify_walks_the_source_chain_for_the_egress_marker` pins the walk
+without DNS.
 
 ### F3 — leg-2 IdP errors leaked bearer material
 
@@ -104,17 +115,23 @@ violation. Reverting the sanitization makes those assertions fail.
 **Closed.** `TrustedIssuerConfig::validate` requires at least one
 audience unless `skip_audience_validation: true` is set. Setting both
 is refused. At verify, an emptied `audiences` field without the skip
-flag is `NoAudiences` rather than `validate_aud = false`.
+flag is `NoAudiences` rather than `validate_aud = false`. A configured
+list also requires the token to carry an `aud` claim
+(`set_required_spec_claims`); jsonwebtoken otherwise skips audience
+checking when the claim is absent.
 
 **Breaking** for a config that listed no audiences. The operator-visible
 hatch is `skip_audience_validation: true`, which accepts a token minted
-for any app (or none).
+for any app (or none). Without the hatch, a missing `aud` is refused
+the same as a mismatch (`auth.audience_mismatch`).
 
 Regression: `each_malformed_config_is_refused_at_load_with_a_message_naming_the_fault`
 covers omitted and empty lists; `empty_audience_list_rejects_the_token`
-covers the public-field hole; `skip_audience_validation_accepts_a_token_minted_for_another_app`
-pins the hatch. Removing the load check without the skip flag makes
-those load tests build.
+covers the public-field hole; `a_token_with_no_aud_claim_is_refused`
+covers an omitted claim; `skip_audience_validation_accepts_a_token_minted_for_another_app`
+and `skip_audience_validation_accepts_a_token_with_no_aud_claim` pin the
+hatch. Removing the load check without the skip flag makes those load
+tests build.
 
 ### F5 — `!=` on a missing attribute did not deny
 
@@ -143,6 +160,10 @@ Regression: `non_numeric_amount_order_deny_fails_closed` and
 `args.amount > 10000: deny` must Deny, including under `!(...)`.
 A finite `"5000"` still Allows; a missing amount still Allows.
 Treating the comparison as false makes those assertions Allow.
+Integers whose magnitude exceeds 2^53 are Unorderable on mixed
+int/float (and on string-encoded integers), same as `NaN`:
+`mixed_int_float_order_on_large_integers_is_fail_closed` and
+`a_string_encoded_large_int_does_not_round_through_f64`.
 
 ### F7 — unreadable handler result was Allow
 

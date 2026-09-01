@@ -317,7 +317,7 @@ fn coerce_f64_attr(attr: &AttributeValue) -> Option<f64> {
     match attr {
         AttributeValue::Int(a) => i64_as_exact_f64(*a),
         AttributeValue::Float(a) => finite_f64(*a),
-        AttributeValue::String(s) => s.trim().parse::<f64>().ok().and_then(finite_f64),
+        AttributeValue::String(s) => coerce_f64_numeric_string(s),
         _ => None,
     }
 }
@@ -328,9 +328,24 @@ fn coerce_f64_lit(lit: &Literal) -> Option<f64> {
     match lit {
         Literal::Int(b) => i64_as_exact_f64(*b),
         Literal::Float(b) => finite_f64(*b),
-        Literal::String(s) => s.trim().parse::<f64>().ok().and_then(finite_f64),
+        Literal::String(s) => coerce_f64_numeric_string(s),
         _ => None,
     }
+}
+
+/// Parse a numeric-looking string for order comparison.
+///
+/// Integer spellings go through [`i64_as_exact_f64`]. `parse::<f64>()`
+/// rounds `"9007199254740993"` onto 2^53, which is the same collapse the
+/// `Int` arm refuses — LLM tool arguments arrive as strings, so that is
+/// the operand shape the bound was written for. Fractional strings still
+/// parse as `f64`.
+fn coerce_f64_numeric_string(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if let Ok(n) = s.parse::<i64>() {
+        return i64_as_exact_f64(n);
+    }
+    s.parse::<f64>().ok().and_then(finite_f64)
 }
 
 /// `f64::from_str` accepts `NaN`, `inf`, and `-inf`. IEEE order is not
@@ -1923,6 +1938,28 @@ mod tests {
             "reason must say fail-closed: {}",
             err.reason()
         );
+    }
+
+    /// LLM tool arguments arrive as strings. `parse::<f64>()` rounds
+    /// `"9007199254740993"` onto 2^53, so a max-amount deny against an
+    /// int cap would skip. Integer spellings take the same exactness
+    /// bound as `Int`.
+    #[test]
+    fn a_string_encoded_large_int_does_not_round_through_f64() {
+        let rule = crate::parser::parse_rule("args.amount > 9007199254740992: deny", "test")
+            .expect("parses");
+        let mut bag = AttributeBag::new();
+        bag.set("args.amount", "9007199254740993");
+        match evaluate_rules(std::slice::from_ref(&rule), &bag) {
+            Decision::Deny { .. } => {},
+            other => panic!("2^53 + 1 as a string is over the cap, got {other:?}"),
+        }
+
+        bag.set("args.amount", "5000");
+        match evaluate_rules(std::slice::from_ref(&rule), &bag) {
+            Decision::Allow => {},
+            other => panic!("a small string amount must still compare, got {other:?}"),
+        }
     }
 
     #[test]

@@ -1054,6 +1054,11 @@ fn validate_token(
     } else {
         let aud_refs: Vec<&str> = issuer.audiences.iter().map(String::as_str).collect();
         validation.set_audience(&aud_refs);
+        // jsonwebtoken only checks `aud` when the claim is present.
+        // `set_required_spec_claims` replaces the set (default is `exp`),
+        // so `exp` and `iss` stay required alongside `aud`. A token with
+        // no audience is then a missing-claim error, not a pass.
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
     }
     decode::<ClaimMap>(token, key, &validation).map_err(ValidateError::Jwt)
 }
@@ -1066,6 +1071,7 @@ fn classify_jwt_error(e: &jsonwebtoken::errors::Error) -> (&'static str, String)
         ErrorKind::InvalidSignature => "auth.signature_invalid",
         ErrorKind::ImmatureSignature => "auth.token_not_yet_valid",
         ErrorKind::InvalidAudience => "auth.audience_mismatch",
+        ErrorKind::MissingRequiredClaim(c) if c == "aud" => "auth.audience_mismatch",
         ErrorKind::InvalidIssuer => "auth.untrusted_issuer",
         ErrorKind::InvalidAlgorithm | ErrorKind::InvalidAlgorithmName => "auth.algorithm_mismatch",
         ErrorKind::Base64(_) | ErrorKind::Json(_) => "auth.malformed_header",
@@ -1981,6 +1987,64 @@ mod tests {
         assert!(
             result.continue_processing,
             "an explicit skip must accept any aud: {:?}",
+            result.violation
+        );
+    }
+
+    /// jsonwebtoken only checks `aud` when the claim is present. A
+    /// configured list used to pass a token that simply omitted it.
+    #[tokio::test]
+    async fn a_token_with_no_aud_claim_is_refused() {
+        let resolver = resolver_on_header("authorization");
+        let token = sign_with(
+            b"test-secret",
+            &json!({
+                "iss": "https://idp.example",
+                "sub": "alice",
+                "exp": seconds_from_now(3_600),
+            }),
+        );
+        let r = result_for(&resolver, &token).await;
+        assert!(
+            !r.continue_processing,
+            "a token with no aud must not pass a configured list: {:?}",
+            r.violation
+        );
+        assert_eq!(
+            r.violation.expect("deny carries a violation").code,
+            "auth.audience_mismatch"
+        );
+    }
+
+    /// The hatch's documented meaning is any `aud`, or none. Requiring
+    /// the claim on the default path must not leak onto this one.
+    #[tokio::test]
+    async fn skip_audience_validation_accepts_a_token_with_no_aud_claim() {
+        let resolver = JwtIdentityResolver::new(cfg_with_config(
+            "jwt",
+            json!({
+                "trusted_issuers": [{
+                    "issuer": "https://idp.example",
+                    "skip_audience_validation": true,
+                    "algorithms": ["HS256"],
+                    "decoding_key": { "kind": "secret", "secret": "test-secret" },
+                }],
+                "role": "user",
+            }),
+        ))
+        .expect("skip_audience_validation is the hatch for no aud check");
+        let token = sign_with(
+            b"test-secret",
+            &json!({
+                "iss": "https://idp.example",
+                "sub": "alice",
+                "exp": seconds_from_now(3_600),
+            }),
+        );
+        let result = result_for(&resolver, &token).await;
+        assert!(
+            result.continue_processing,
+            "the hatch accepts a token with no aud: {:?}",
             result.violation
         );
     }
