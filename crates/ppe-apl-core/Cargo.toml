@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Praxis Contributors
 
 # APL core — predicate language, compiler, evaluator.
-# Module structure follows docs/specs/apl-design.md §4.
+# The grammar this crate accepts is normative in docs/apl-grammar.md.
 
 [package]
 name = "praxis-policy-apl-core"
@@ -36,8 +36,25 @@ regex = { workspace = true }
 futures = { workspace = true }
 praxis-policy-orchestration = { workspace = true }
 
+[features]
+# Scaffolding for compiling one policy block plus its plugin registry, which is
+# what this crate's tests and those of praxis-policy-apl-cmf and
+# praxis-policy-apl-runtime need from the compiler.
+#
+# Off by default and never enabled by a normal build. Keeping it behind a feature
+# keeps a test seam out of the published API surface, where semver would bind it
+# for no consumer's benefit. The rationale is praxis-policy-core's `test-util`
+# feature's, verbatim.
+#
+# This crate's own `tests/` need it too, and cargo does not enable a crate's own
+# optional feature for `cargo test`, hence the self dev-dependency below rather
+# than a `required-features` test target: such a target is silently skipped
+# instead of run, which is the failure mode this work exists to remove.
+test-util = []
+
 [dev-dependencies]
 tokio = { workspace = true }
+praxis-policy-apl-core = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

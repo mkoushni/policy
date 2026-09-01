@@ -6,16 +6,15 @@
 //
 // ```yaml
 // global:
-//   apl:
-//     pdp:
-//       - kind: opa
-//         on_error: deny          # optional; deny | allow, default deny
-//         max_cache_entries: 1024 # optional; cap on distinct inline modules
-//         modules:                # global Rego modules (inline and/or files)
-//           - |
-//             package authz
-//             default allow := false
-//             allow if input.subject.id == "alice"
+//   pdp:
+//     - kind: opa
+//       on_error: deny          # optional; deny | allow, default deny
+//       max_cache_entries: 1024 # optional; cap on distinct inline modules
+//       modules:                # global Rego modules (inline and/or files)
+//         - |
+//           package authz
+//           default allow := false
+//           allow if input.subject.id == "alice"
 // ```
 //
 // The per-route query (and any inline module) lives in each route's

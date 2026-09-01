@@ -21,10 +21,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use praxis_policy_apl_cmf::BagBuilder;
+use praxis_policy_apl_core::test_util::compile_test_route;
 use praxis_policy_apl_core::{
     AttributeBag, Decision, DelegationInvoker, ElicitationInvoker, NoopDelegationInvoker,
     NoopElicitationInvoker, PdpCall, PdpDecision, PdpDialect, PdpError, PdpResolver, PluginError,
-    PluginInvocation, PluginInvoker, PluginOutcome, RoutePayload, compile_config, evaluate_route,
+    PluginInvocation, PluginInvoker, PluginOutcome, RoutePayload, evaluate_route,
 };
 use praxis_policy_core::extensions::{
     DelegationExtension, DelegationHop, SecurityExtension, SubjectExtension, SubjectType,
@@ -50,17 +51,17 @@ fn elicitations() -> Arc<dyn ElicitationInvoker> {
 
 // HR route.
 const HR_ROUTE_YAML: &str = r#"
-routes:
-  get_employee:
-    args:
-      employee_id: "str"
+route:
+  args:
+    employee_id: "str"
+  authorization:
     pre_invocation:
       - "require(authenticated)"
       - "delegation.depth > 2: deny"
-    result:
-      ssn: "str | redact(!perm.view_ssn)"
-      salary: "int | redact(!role.hr)"
-      employee_id: "str | mask(4)"
+  result:
+    ssn: "str | redact(!perm.view_ssn)"
+    salary: "int | redact(!role.hr)"
+    employee_id: "str | mask(4)"
 "#;
 
 // ---------- PDP / Plugin stubs ----------
@@ -168,8 +169,7 @@ async fn alice_full_route_through_cmf_bridge() {
     assert_eq!(bag.get_bool("perm.view_ssn"), Some(true));
     assert_eq!(bag.get_int("delegation.depth"), Some(1));
 
-    let routes = compile_config(HR_ROUTE_YAML).unwrap().routes;
-    let route = routes.get("get_employee").unwrap();
+    let route = compile_test_route("get_employee", HR_ROUTE_YAML).unwrap();
 
     let mut payload = RoutePayload::with_result(
         json!({ "employee_id": "123-45-6789" }),
@@ -181,7 +181,7 @@ async fn alice_full_route_through_cmf_bridge() {
     );
 
     let r = evaluate_route(
-        route,
+        &route,
         &mut bag,
         &mut payload,
         &pdp(),
@@ -205,8 +205,7 @@ async fn mallory_gets_both_fields_redacted_through_cmf_bridge() {
         .with_delegation(&shallow_delegation())
         .build();
 
-    let routes = compile_config(HR_ROUTE_YAML).unwrap().routes;
-    let route = routes.get("get_employee").unwrap();
+    let route = compile_test_route("get_employee", HR_ROUTE_YAML).unwrap();
 
     let mut payload = RoutePayload::with_result(
         json!({ "employee_id": "555-44-3333" }),
@@ -218,7 +217,7 @@ async fn mallory_gets_both_fields_redacted_through_cmf_bridge() {
     );
 
     let r = evaluate_route(
-        route,
+        &route,
         &mut bag,
         &mut payload,
         &pdp(),
@@ -244,15 +243,14 @@ async fn deep_delegation_denies_through_cmf_bridge() {
 
     assert_eq!(bag.get_int("delegation.depth"), Some(3));
 
-    let routes = compile_config(HR_ROUTE_YAML).unwrap().routes;
-    let route = routes.get("get_employee").unwrap();
+    let route = compile_test_route("get_employee", HR_ROUTE_YAML).unwrap();
 
     let mut payload = RoutePayload::with_result(
         json!({ "employee_id": "123-45-6789" }),
         json!({ "ssn": "x", "salary": 1, "employee_id": "123-45-6789" }),
     );
     let r = evaluate_route(
-        route,
+        &route,
         &mut bag,
         &mut payload,
         &pdp(),
@@ -273,13 +271,12 @@ async fn args_attributes_flow_into_bag_for_policy_use() {
     // ad-hoc route, since the canonical HR route doesn't reference
     // `args.*` in its policy block.
     let yaml = r#"
-routes:
-  guarded_route:
+route:
+  authorization:
     pre_invocation:
       - "args.include_ssn == true: deny"
 "#;
-    let routes = compile_config(yaml).unwrap().routes;
-    let route = routes.get("guarded_route").unwrap();
+    let route = compile_test_route("guarded_route", yaml).unwrap();
 
     let args = json!({ "include_ssn": true, "id": "abc" });
     let mut bag = BagBuilder::new()
@@ -290,7 +287,7 @@ routes:
 
     let mut payload = RoutePayload::new(args);
     let r = evaluate_route(
-        route,
+        &route,
         &mut bag,
         &mut payload,
         &pdp(),
@@ -319,15 +316,14 @@ async fn anonymous_user_denied_at_authenticated_check() {
         .build();
     assert!(!bag.contains("authenticated"));
 
-    let routes = compile_config(HR_ROUTE_YAML).unwrap().routes;
-    let route = routes.get("get_employee").unwrap();
+    let route = compile_test_route("get_employee", HR_ROUTE_YAML).unwrap();
 
     let mut payload = RoutePayload::with_result(
         json!({ "employee_id": "123-45-6789" }),
         json!({ "ssn": "x", "salary": 1, "employee_id": "123-45-6789" }),
     );
     let r = evaluate_route(
-        route,
+        &route,
         &mut bag,
         &mut payload,
         &pdp(),

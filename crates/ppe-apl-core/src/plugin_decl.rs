@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 /// preserves them without us modeling every variant for v0.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginDeclaration {
-    /// Plugin name — referenced from routes by `plugin(name)` and used
+    /// Plugin name — referenced from routes by `run(name)` and used
     /// as the key in [`PluginRegistry`].
     pub name: String,
 
@@ -42,7 +42,7 @@ pub struct PluginDeclaration {
     /// PPE hook names this plugin implements. Invokers pick which
     /// hook to dispatch based on this list; v0 uses the first entry,
     /// future versions will choose by invocation context (policy vs
-    /// `post_policy` vs pipe-chain).
+    /// `post_invocation` vs pipe-chain).
     ///
     /// NOT overridable per-route.
     #[serde(default)]

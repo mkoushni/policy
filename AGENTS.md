@@ -17,6 +17,7 @@ for the change.
 ## Quick Reference
 
 ```console
+make check          # type-check both feature sets (never links)
 make build          # workspace build (debug)
 make test           # all workspace tests (two passes)
 make lint           # fmt --check + clippy -D warnings
@@ -36,7 +37,7 @@ cargo test -p praxis-policy-core --lib -- test_name
 
 ## Architecture
 
-14-crate workspace implementing a policy engine for
+16-crate workspace implementing a policy engine for
 AI agent traffic. The engine decides who may call
 which tool, what data comes back, and where that
 data goes next.
@@ -53,6 +54,7 @@ crates/
   ppe-apl-cmf   canonical message format transforms
   ppe-apl-runtime  host runtime, plugin invokers,
                    route handler, session management
+  ppe-pdp-diff  differential tests across cedar/cel/opa
 
 builtins/
   plugins/      identity-jwt, delegator-oauth,
@@ -87,9 +89,9 @@ These are settled decisions, not a backlog:
 - **No `panic = "abort"`**: this is a library; abort
   would take the host process down on a recoverable
   policy panic
-- **`dead_code`, `elided_lifetimes_in_paths`,
-  `single_use_lifetimes` at `allow`**: style and
-  cleanup items that do not affect runtime behavior
+- **`elided_lifetimes_in_paths`,
+  `single_use_lifetimes` at `allow`**: style
+  items that do not affect runtime behavior
 - **`mod.rs` module style**: three module directories
   use `mod.rs`; not switching to file-adjacent style
 
@@ -111,6 +113,10 @@ No author lines, no path lines.
   `reason`
 - `[workspace.lints]` in `Cargo.toml` is the
   authority
+- `dead_code` is denied. Keep an unused public item
+  only with a reason that names the host or other
+  out-of-tree caller. Do not silence it for future
+  work; delete the item.
 
 ### Tests
 
@@ -122,6 +128,21 @@ The Valkey session store tests are `#[ignore]`-gated
 and need `VALKEY_TEST_URL` set to run against a real
 server. `make coverage` runs them with
 `VALKEY_TESTS_OPTIONAL=1` so they skip gracefully.
+
+Prefer one test binary per concern over many small
+ones. Cargo builds one binary per `tests/*.rs`, and a
+`tests/<dir>/main.rs` harness that gathers related
+cases links once instead of a dozen times.
+
+While iterating:
+
+- Use `make check` for fast compile-time feedback.
+- Run tests for affected crates:
+  `cargo nextest run -p <crate> --lib`.
+- Reserve full workspace test runs for commit boundaries.
+
+Newly linked test binaries may be delayed by endpoint
+security. The test workflow above helps mitigate this issue.
 
 ## Supply Chain
 

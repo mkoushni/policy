@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-// Parses and validates the `global.apl.session_store` block for the
+// Parses and validates the `global.session_store` block for the
 // Valkey backend. Deliberately minimal: a single endpoint, TLS,
 // auth, key prefix, optional sliding TTL, and fail-closed timeout/retry
 // knobs with committed safe defaults. Sentinel/Cluster fields are NOT
@@ -27,7 +27,7 @@ fn default_command_timeout_ms() -> u64 {
     500
 }
 
-/// Parsed `global.apl.session_store` config for `kind: valkey`.
+/// Parsed `global.session_store` config for `kind: valkey`.
 ///
 /// Unknown keys (including `kind`, consumed by the factory dispatch) are
 /// ignored so the same block can carry the discriminator.

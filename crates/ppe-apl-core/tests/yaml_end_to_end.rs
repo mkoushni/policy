@@ -3,12 +3,11 @@
 
 // End-to-end integration: YAML config → compiled IR → evaluated against a
 // realistic AttributeBag and payload. This exercises the public crate API
-// only (`compile_config` + `evaluate_route` + traits) and serves as the
+// only (`compile_test_route` + `evaluate_route` + traits) and serves as the
 // authoritative "if this passes, praxis-policy-apl-core works as a unit" check.
 //
-// The fixture is a representative HR route, adapted to
-// the map-keyed `routes:` shape that the parser actually accepts (the
-// list-with-matchers form is a deferred shape).
+// The fixture is a representative HR route, carried as the single `route:`
+// block the test-util document shape accepts.
 
 #![allow(
     missing_docs,
@@ -25,11 +24,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use praxis_policy_apl_core::test_util::compile_test_route;
 use praxis_policy_apl_core::{
     AttributeBag, Decision, DelegationInvoker, ElicitationInvoker, FieldOutcome,
     NoopDelegationInvoker, NoopElicitationInvoker, PdpCall, PdpDecision, PdpDialect, PdpError,
     PdpResolver, PluginError, PluginInvocation, PluginInvoker, PluginOutcome, RoutePayload,
-    compile_config, evaluate_route,
+    evaluate_route,
 };
 use serde_json::json;
 
@@ -52,17 +52,17 @@ fn elicitations() -> Arc<dyn ElicitationInvoker> {
 // ----- Fixtures: a baseline route used by every scenario below. -----
 
 const HR_ROUTE_YAML: &str = r#"
-routes:
-  get_employee:
-    args:
-      employee_id: "str"
+route:
+  args:
+    employee_id: "str"
+  authorization:
     pre_invocation:
       - "require(authenticated)"
       - "delegation.depth > 2: deny"
-    result:
-      ssn: "str | redact(!perm.view_ssn)"
-      salary: "int | redact(!role.hr)"
-      employee_id: "str | mask(4)"
+  result:
+    ssn: "str | redact(!perm.view_ssn)"
+    salary: "int | redact(!role.hr)"
+    employee_id: "str | mask(4)"
 "#;
 
 struct AllowPdp;
@@ -107,8 +107,7 @@ async fn alice_full_access_sees_unredacted_result_with_masked_id() {
     bag.set("perm.view_ssn", true);
     bag.set("delegation.depth", 1_i64);
 
-    let routes = compile_config(HR_ROUTE_YAML).expect("YAML compiles").routes;
-    let route = routes.get("get_employee").expect("route present");
+    let route = compile_test_route("get_employee", HR_ROUTE_YAML).expect("YAML compiles");
 
     let mut payload = RoutePayload::with_result(
         json!({ "employee_id": "123-45-6789" }),
@@ -120,7 +119,7 @@ async fn alice_full_access_sees_unredacted_result_with_masked_id() {
     );
 
     let r = evaluate_route(
-        route,
+        &route,
         &mut bag,
         &mut payload,
         &pdp(),
@@ -153,8 +152,7 @@ async fn mallory_no_perm_no_role_gets_both_fields_redacted() {
     bag.set("delegation.depth", 1_i64);
     // role.hr and perm.view_ssn are absent → IsTrue=false → !IsTrue=true → redact fires.
 
-    let routes = compile_config(HR_ROUTE_YAML).unwrap().routes;
-    let route = routes.get("get_employee").unwrap();
+    let route = compile_test_route("get_employee", HR_ROUTE_YAML).unwrap();
 
     let mut payload = RoutePayload::with_result(
         json!({ "employee_id": "555-44-3333" }),
@@ -166,7 +164,7 @@ async fn mallory_no_perm_no_role_gets_both_fields_redacted() {
     );
 
     let r = evaluate_route(
-        route,
+        &route,
         &mut bag,
         &mut payload,
         &pdp(),
@@ -192,8 +190,7 @@ async fn deep_delegation_denies_at_policy() {
     bag.set("perm.view_ssn", true);
     bag.set("delegation.depth", 3_i64);
 
-    let routes = compile_config(HR_ROUTE_YAML).unwrap().routes;
-    let route = routes.get("get_employee").unwrap();
+    let route = compile_test_route("get_employee", HR_ROUTE_YAML).unwrap();
 
     let mut payload = RoutePayload::with_result(
         json!({ "employee_id": "123-45-6789" }),
@@ -201,7 +198,7 @@ async fn deep_delegation_denies_at_policy() {
     );
 
     let r = evaluate_route(
-        route,
+        &route,
         &mut bag,
         &mut payload,
         &pdp(),
@@ -234,8 +231,7 @@ async fn unauthenticated_user_is_denied_before_args_mutate_result() {
     let mut bag = AttributeBag::new();
     bag.contains("authenticated"); // sanity: confirm we built an empty bag.
 
-    let routes = compile_config(HR_ROUTE_YAML).unwrap().routes;
-    let route = routes.get("get_employee").unwrap();
+    let route = compile_test_route("get_employee", HR_ROUTE_YAML).unwrap();
 
     let mut payload = RoutePayload::with_result(
         json!({ "employee_id": "123-45-6789" }),
@@ -243,7 +239,7 @@ async fn unauthenticated_user_is_denied_before_args_mutate_result() {
     );
 
     let r = evaluate_route(
-        route,
+        &route,
         &mut bag,
         &mut payload,
         &pdp(),
@@ -264,8 +260,7 @@ async fn args_validator_rejects_wrong_type() {
     bag.set("authenticated", true);
     bag.set("delegation.depth", 1_i64);
 
-    let routes = compile_config(HR_ROUTE_YAML).unwrap().routes;
-    let route = routes.get("get_employee").unwrap();
+    let route = compile_test_route("get_employee", HR_ROUTE_YAML).unwrap();
 
     let mut payload = RoutePayload::with_result(
         json!({ "employee_id": 42 }), // ← wrong type
@@ -273,7 +268,7 @@ async fn args_validator_rejects_wrong_type() {
     );
 
     let r = evaluate_route(
-        route,
+        &route,
         &mut bag,
         &mut payload,
         &pdp(),
@@ -298,17 +293,16 @@ async fn args_validator_rejects_wrong_type() {
 #[tokio::test]
 async fn inbound_only_evaluation_skips_result_phase() {
     // Simulates the inbound path: payload has no result yet. Args + policy
-    // run; result phase is skipped; post_policy runs (none defined here).
+    // run; result phase is skipped; post_invocation runs (none defined here).
     let mut bag = AttributeBag::new();
     bag.set("authenticated", true);
     bag.set("delegation.depth", 1_i64);
 
-    let routes = compile_config(HR_ROUTE_YAML).unwrap().routes;
-    let route = routes.get("get_employee").unwrap();
+    let route = compile_test_route("get_employee", HR_ROUTE_YAML).unwrap();
 
     let mut payload = RoutePayload::new(json!({ "employee_id": "123-45-6789" }));
     let r = evaluate_route(
-        route,
+        &route,
         &mut bag,
         &mut payload,
         &pdp(),
@@ -329,13 +323,12 @@ async fn inbound_only_evaluation_skips_result_phase() {
 #[test]
 fn compiled_route_phase_set_reflects_yaml_blocks() {
     use praxis_policy_apl_core::Phase;
-    let routes = compile_config(HR_ROUTE_YAML).unwrap().routes;
-    let route = routes.get("get_employee").unwrap();
+    let route = compile_test_route("get_employee", HR_ROUTE_YAML).unwrap();
     let phases = route.declared_phases();
     assert!(phases.contains(Phase::Args));
-    assert!(phases.contains(Phase::Policy));
+    assert!(phases.contains(Phase::PreInvocation));
     assert!(phases.contains(Phase::Result));
-    assert!(!phases.contains(Phase::PostPolicy));
+    assert!(!phases.contains(Phase::PostInvocation));
 }
 
 // Marker so the file isn't all `_` — sanity check that `FieldOutcome` is

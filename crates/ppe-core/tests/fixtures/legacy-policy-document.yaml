@@ -15,8 +15,8 @@
 # realm's JWKS URL so the resolver fetches the active public key at
 # init time (no manual PEM paste).
 
-plugin_settings:
-  routing_enabled: true
+engine_settings:
+  dispatch: policy
 
 plugins:
   # User identity. Carries the human's roles + permissions claims.
@@ -24,7 +24,6 @@ plugins:
     kind: identity/jwt
     hooks: [identity.resolve]
     mode: sequential
-    priority: 10
     on_error: fail
     capabilities:
       # Fetching a JWKS is an outbound call, and PPE performs no HTTP of
@@ -51,7 +50,6 @@ plugins:
     kind: identity/jwt
     hooks: [identity.resolve]
     mode: sequential
-    priority: 20
     on_error: fail
     capabilities:
       # Fetching a JWKS is an outbound call, and PPE performs no HTTP of
@@ -83,7 +81,6 @@ plugins:
     kind: delegator/oauth
     hooks: [token.delegate]
     mode: sequential
-    priority: 30
     on_error: fail
     capabilities:
       # Fetching from an IdP is an outbound call, and PPE performs no
@@ -118,7 +115,6 @@ plugins:
     kind: validator/pii-scan
     hooks: [cmf.tool_pre_invoke]
     mode: sequential
-    priority: 25
     on_error: fail
     config:
       detect:
@@ -140,8 +136,6 @@ plugins:
       - cmf.prompt_pre_invoke
       - cmf.resource_pre_fetch
     mode: sequential
-    priority: 90    # fires AFTER policy / delegate so the record
-                    # reflects the final decision + minted tokens
     on_error: ignore  # observation failures don't halt traffic
     capabilities:
       - read_subject
@@ -164,7 +158,6 @@ plugins:
     kind: delegator/oauth
     hooks: [token.delegate]
     mode: sequential
-    priority: 31
     on_error: fail
     capabilities:
       # Fetching from an IdP is an outbound call, and PPE performs no
@@ -198,7 +191,6 @@ plugins:
     kind: elicitation/ciba
     hooks: [elicit]
     mode: sequential
-    priority: 40
     on_error: fail
     capabilities:
       # Fetching a JWKS is an outbound call, and PPE performs no HTTP of
@@ -276,45 +268,49 @@ global:
 
 routes:
   - tool: get_compensation
-    pre_invocation:
-      - "require(role.hr)"
-      - "delegate(workday-oauth, target: workday-api, audience: workday-api, permissions: [read_compensation])"
-      - "taint(secret, session)"
-      - "run(audit-log)"
+    authorization:
+      pre_invocation:
+        - "require(role.hr)"
+        - "delegate(workday-oauth, target: workday-api, audience: workday-api, permissions: [read_compensation])"
+        - "taint(secret, session)"
+        - "run(audit-log)"
     args:
       ssn: "str | redact(!perm.view_ssn)"
     result:
       ssn: "str | redact(!perm.view_ssn)"
 
   - tool: search_repos
-    pre_invocation:
-      - "require(team.engineering | team.security)"
-      - cedar:
-          action: 'Action::"read"'
-          resource:
-            type: Repo
-            id: ${args.repo_name}
-            attributes:
-              visibility: ${args.visibility}
-      - "delegate(github-oauth, target: github-api, audience: github-api, permissions: [repo:read:internal])"
-      - "!(delegation.granted.permissions contains 'repo:read:internal'): deny"
-      - "run(audit-log)"
+    authorization:
+      pre_invocation:
+        - "require(team.engineering | team.security)"
+        - cedar:
+            action: 'Action::"read"'
+            resource:
+              type: Repo
+              id: ${args.repo_name}
+              attributes:
+                visibility: ${args.visibility}
+        - "delegate(github-oauth, target: github-api, audience: github-api, permissions: [repo:read:internal])"
+        - "!(delegation.granted.permissions contains 'repo:read:internal'): deny"
+        - "run(audit-log)"
 
   - tool: send_email
-    pre_invocation:
-      - "require(perm.email_send)"
-      - "run(audit-log)"
-      - "run(pii-scan)"
-      - "security.labels contains \"secret\": deny('external email blocked: this session accessed secret data', 'session_tainted_secret')"
+    authorization:
+      pre_invocation:
+        - "require(perm.email_send)"
+        - "run(audit-log)"
+        - "run(pii-scan)"
+        - "security.labels contains \"secret\": deny('external email blocked: this session accessed secret data', 'session_tainted_secret')"
 
   # Sensitive mutating action. Small changes go straight through; an
   # adjustment over $10K requires the requester's manager to approve
   # out-of-band (CIBA), and the approval is bound to the live amount
   # (`scope`) so it can't be replayed against a larger change.
   - tool: adjust_compensation
-    pre_invocation:
-      - "require(role.hr)"
-      - when: "args.amount > 10000"
-        do:
-          - "require_approval(manager-approver, from: claim.manager, channel: \"ciba\", scope: \"args.amount <= 25000\", purpose: \"Approve a compensation adjustment\", timeout: 24h)"
-      - "run(audit-log)"
+    authorization:
+      pre_invocation:
+        - "require(role.hr)"
+        - when: "args.amount > 10000"
+          do:
+            - "require_approval(manager-approver, from: claim.manager, channel: \"ciba\", scope: \"args.amount <= 25000\", purpose: \"Approve a compensation adjustment\", timeout: 24h)"
+        - "run(audit-log)"

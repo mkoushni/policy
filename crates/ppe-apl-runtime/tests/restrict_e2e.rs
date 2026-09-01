@@ -75,9 +75,11 @@ fn constraint(ext: &Extensions) -> Option<CandidateConstraintExtension> {
 #[tokio::test]
 async fn restrict_emits_constraint_on_side_channel() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 routes:
   - tool: infer
-    apl:
+    authorization:
       pre_invocation:
         - restrict: { allow_regions: [eu] }
 "#;
@@ -109,9 +111,11 @@ routes:
 #[tokio::test]
 async fn two_restricts_fold_into_one_blob() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 routes:
   - tool: infer
-    apl:
+    authorization:
       pre_invocation:
         - restrict: { allow_models: ["vllm/*", "anthropic/*"], deny_models: ["openai/*"] }
         - restrict: { allow_models: ["anthropic/*", "cohere/*"] }
@@ -141,9 +145,11 @@ routes:
 #[tokio::test]
 async fn gated_restrict_absent_when_gate_false() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 routes:
   - tool: infer
-    apl:
+    authorization:
       pre_invocation:
         - when: "session.labels contains 'eu_resident'"
           do:
@@ -179,9 +185,11 @@ routes:
 #[tokio::test]
 async fn conflicting_custom_labels_fail_closed() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 routes:
   - tool: infer
-    apl:
+    authorization:
       pre_invocation:
         - restrict: { custom: { gpu: h100 } }
         - restrict: { custom: { gpu: a100 } }
@@ -210,9 +218,11 @@ routes:
 #[tokio::test]
 async fn parallel_branch_restricts_accumulate() {
     const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 routes:
   - tool: infer
-    apl:
+    authorization:
       pre_invocation:
         - parallel:
             - restrict: { allow_regions: [eu, us] }

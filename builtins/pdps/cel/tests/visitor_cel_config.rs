@@ -3,7 +3,7 @@
 
 // End-to-end integration: a unified-config YAML that
 //
-//   1. declares a `cel` PDP under `global.apl.pdp[]`,
+//   1. declares a `cel` PDP under `global.pdp[]`,
 //   2. attaches a `cel:(expr: "...")` policy step to a route,
 //
 // must flow a real decision from the praxis-policy-core dispatcher through
@@ -50,13 +50,14 @@ use praxis_policy_pdp_cel::CelPdpFactory;
 // role namespace so a principal with no roles evaluates to a clean `false`
 // (Deny) rather than an undeclared-variable error.
 const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 global:
-  apl:
-    pdp:
-      - kind: cel
+  pdp:
+    - kind: cel
 routes:
   - tool: get_document
-    apl:
+    authorization:
       pre_invocation:
         - cel:
             expr: |
@@ -184,14 +185,15 @@ async fn config_declared_cel_pdp_denies_non_matching_subject() {
 #[tokio::test]
 async fn malformed_on_error_is_rejected_at_load() {
     const BAD_YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 global:
-  apl:
-    pdp:
-      - kind: cel
-        on_error: maybe
+  pdp:
+    - kind: cel
+      on_error: maybe
 routes:
   - tool: get_document
-    apl:
+    authorization:
       pre_invocation:
         - cel:
             expr: |
@@ -215,14 +217,15 @@ routes:
 #[tokio::test]
 async fn on_error_allow_yaml_flips_eval_error_to_allow_end_to_end() {
     const ALLOW_YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 global:
-  apl:
-    pdp:
-      - kind: cel
-        on_error: allow
+  pdp:
+    - kind: cel
+      on_error: allow
 routes:
   - tool: get_document
-    apl:
+    authorization:
       pre_invocation:
         - cel:
             expr: |
@@ -258,13 +261,14 @@ routes:
 #[tokio::test]
 async fn missing_expr_at_request_time_denies_without_panicking() {
     const NO_EXPR_YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 global:
-  apl:
-    pdp:
-      - kind: cel
+  pdp:
+    - kind: cel
 routes:
   - tool: get_document
-    apl:
+    authorization:
       pre_invocation:
         - cel:
             on_deny:
@@ -302,13 +306,14 @@ routes:
 #[tokio::test]
 async fn cel_reads_meta_entity_name_from_bag() {
     const META_YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 global:
-  apl:
-    pdp:
-      - kind: cel
+  pdp:
+    - kind: cel
 routes:
   - tool: get_document
-    apl:
+    authorization:
       pre_invocation:
         - cel:
             expr: |

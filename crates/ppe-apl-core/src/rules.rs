@@ -134,7 +134,7 @@ pub enum Condition {
 /// Compound predicate.
 ///
 /// `Always` is the implicit-true predicate for bare-effect rules:
-/// `- plugin(rate_limiter)` / `- taint(audit)` / unconditional
+/// `- run(rate_limiter)` / `- taint(audit)` / unconditional
 /// `- deny` / `- allow`. It's never produced by predicate-string parsing
 /// — only by rule-level forms where no `when:` is supplied.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -185,7 +185,7 @@ pub enum Effect {
         reason: Option<String>,
         /// Author-supplied stable violation code. When `Some`, it
         /// overrides the rule's auto-generated source-position code
-        /// (`routes.tool:X.apl.policy[N]`) downstream. Useful when
+        /// (`routes.tool:X.pre_invocation[N]`) downstream. Useful when
         /// MCP clients want to dispatch on category (`quota.exceeded`,
         /// `delegation.depth_exceeded`) rather than position, or when
         /// multiple routes share a deny category that should
@@ -445,11 +445,11 @@ pub enum Phase {
     /// Inbound arguments, before the call is made.
     Args,
     /// The authorization decision.
-    Policy,
+    PreInvocation,
     /// The response, before it reaches the caller.
     Result,
     /// After the response, for effects that must not gate it.
-    PostPolicy,
+    PostInvocation,
 }
 
 /// Bit-packed set of phases a route declared.
@@ -480,9 +480,9 @@ impl PhaseSet {
     fn bit(p: Phase) -> u8 {
         match p {
             Phase::Args => 0b0001,
-            Phase::Policy => 0b0010,
+            Phase::PreInvocation => 0b0010,
             Phase::Result => 0b0100,
-            Phase::PostPolicy => 0b1000,
+            Phase::PostInvocation => 0b1000,
         }
     }
 }
@@ -514,7 +514,7 @@ pub struct DenyResponse {
 /// "tag rules" or "route overrides," only "steps that fire in phase P."
 ///
 /// `args` and `result` are per-field pipelines (validators + transforms).
-/// `policy` and `post_policy` are step lists — predicate-and-action rules
+/// `pre_invocation` and `post_invocation` are step lists, predicate-and-action rules
 /// plus PDP calls, plugin invocations, and taint effects. See
 /// apl-dsl-spec.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -526,13 +526,13 @@ pub struct CompiledRoute {
     pub args: Vec<crate::pipeline::FieldRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     /// Effects deciding whether the call proceeds.
-    pub policy: Vec<Effect>,
+    pub pre_invocation: Vec<Effect>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     /// Field rules applied to the response.
     pub result: Vec<crate::pipeline::FieldRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     /// Effects run after the response, which cannot gate it.
-    pub post_policy: Vec<Effect>,
+    pub post_invocation: Vec<Effect>,
     /// Per-plugin overrides declared on this route's `plugins:` block.
     /// Keyed by plugin name; merged at dispatch time via
     /// `EffectivePlugin::resolve(name, registry, &this.plugin_overrides)`.
@@ -562,14 +562,14 @@ impl CompiledRoute {
         if !self.args.is_empty() {
             set.insert(Phase::Args);
         }
-        if !self.policy.is_empty() {
-            set.insert(Phase::Policy);
+        if !self.pre_invocation.is_empty() {
+            set.insert(Phase::PreInvocation);
         }
         if !self.result.is_empty() {
             set.insert(Phase::Result);
         }
-        if !self.post_policy.is_empty() {
-            set.insert(Phase::PostPolicy);
+        if !self.post_invocation.is_empty() {
+            set.insert(Phase::PostInvocation);
         }
         set
     }
@@ -591,7 +591,7 @@ impl CompiledRoute {
     /// later/narrower layer in the inheritance chain.
     ///
     /// Merge semantics:
-    /// - **`policy` / `post_policy`**: `more_specific`'s steps append
+    /// - **`pre_invocation` / `post_invocation`**: `more_specific`'s steps append
     ///   *after* self's. Earlier layers run first — globals deny before
     ///   route-specific rules get a chance.
     /// - **`args` / `result`**: per-field; if both layers declare the
@@ -603,10 +603,10 @@ impl CompiledRoute {
     /// `self.route_key` is preserved — `apply_layer` doesn't overwrite
     /// identity, just policy content.
     pub fn apply_layer(&mut self, more_specific: CompiledRoute) {
-        // policy / post_policy: more_specific's steps append AFTER self.
+        // pre/post-invocation: more_specific's steps append AFTER self.
         // Order of accumulated calls = order of evaluation.
-        self.policy.extend(more_specific.policy);
-        self.post_policy.extend(more_specific.post_policy);
+        self.pre_invocation.extend(more_specific.pre_invocation);
+        self.post_invocation.extend(more_specific.post_invocation);
 
         // args: more_specific wins on field collision — drop any self.args
         // entries the new layer redefines, then push the new layer's.
@@ -686,12 +686,12 @@ mod tests {
     fn phase_set_basic() {
         let mut set = PhaseSet::new();
         assert!(set.is_empty());
-        set.insert(Phase::Policy);
+        set.insert(Phase::PreInvocation);
         set.insert(Phase::Result);
-        assert!(set.contains(Phase::Policy));
+        assert!(set.contains(Phase::PreInvocation));
         assert!(set.contains(Phase::Result));
         assert!(!set.contains(Phase::Args));
-        assert!(!set.contains(Phase::PostPolicy));
+        assert!(!set.contains(Phase::PostInvocation));
         assert!(!set.is_empty());
     }
 
@@ -700,7 +700,7 @@ mod tests {
         let mut route = CompiledRoute::new("get_compensation");
         assert!(route.declared_phases().is_empty());
 
-        route.policy.push(Effect::When {
+        route.pre_invocation.push(Effect::When {
             condition: Expression::Condition(Condition::IsTrue {
                 key: "authenticated".into(),
             }),
@@ -708,7 +708,7 @@ mod tests {
             source: "policy[0]".into(),
         });
         let phases = route.declared_phases();
-        assert!(phases.contains(Phase::Policy));
+        assert!(phases.contains(Phase::PreInvocation));
         assert!(!phases.contains(Phase::Args));
     }
 
@@ -767,50 +767,50 @@ mod tests {
     }
 
     #[test]
-    fn apply_layer_appends_policy_and_post_policy_in_evaluation_order() {
+    fn apply_layer_appends_both_step_lists_in_evaluation_order() {
         // Start with global (least specific), then layer route on top.
-        // After: global.policy[0] runs first, route.policy[0] runs second.
+        // After: global.pre_invocation[0] runs first, route.pre_invocation[0] runs second.
         let mut effective = CompiledRoute::new("route.get_compensation");
         // Seed effective with global content (simulating having already
         // applied the global layer once).
-        effective.policy.push(Effect::When {
+        effective.pre_invocation.push(Effect::When {
             condition: Expression::Always,
             body: vec![Effect::Allow],
             source: "global.policy[0]".into(),
         });
-        effective.post_policy.push(Effect::When {
+        effective.post_invocation.push(Effect::When {
             condition: Expression::Always,
             body: vec![Effect::Allow],
-            source: "global.post_policy[0]".into(),
+            source: "global.post_invocation[0]".into(),
         });
 
         // Now apply the route-specific layer on top.
         let mut route_layer = CompiledRoute::new("ignored");
-        route_layer.policy.push(Effect::When {
+        route_layer.pre_invocation.push(Effect::When {
             condition: Expression::Always,
             body: vec![Effect::Allow],
             source: "route.policy[0]".into(),
         });
-        route_layer.post_policy.push(Effect::When {
+        route_layer.post_invocation.push(Effect::When {
             condition: Expression::Always,
             body: vec![Effect::Allow],
-            source: "route.post_policy[0]".into(),
+            source: "route.post_invocation[0]".into(),
         });
 
         effective.apply_layer(route_layer);
 
         // global ran first, route ran second — first-deny-wins respects
         // the hierarchy.
-        assert_eq!(effective.policy.len(), 2);
-        match &effective.policy[0] {
+        assert_eq!(effective.pre_invocation.len(), 2);
+        match &effective.pre_invocation[0] {
             Effect::When { source, .. } => assert_eq!(source, "global.policy[0]"),
             _ => panic!(),
         }
-        match &effective.policy[1] {
+        match &effective.pre_invocation[1] {
             Effect::When { source, .. } => assert_eq!(source, "route.policy[0]"),
             _ => panic!(),
         }
-        assert_eq!(effective.post_policy.len(), 2);
+        assert_eq!(effective.post_invocation.len(), 2);
 
         // route_key preserved (apply_layer doesn't touch identity).
         assert_eq!(effective.route_key, "route.get_compensation");
@@ -923,28 +923,28 @@ mod tests {
         let mut effective = CompiledRoute::new("route.get_compensation");
 
         let mut global = CompiledRoute::default();
-        global.policy.push(Effect::When {
+        global.pre_invocation.push(Effect::When {
             condition: Expression::Always,
             body: vec![Effect::Allow],
             source: "global.policy[0]".into(),
         });
 
         let mut default = CompiledRoute::default();
-        default.policy.push(Effect::When {
+        default.pre_invocation.push(Effect::When {
             condition: Expression::Always,
             body: vec![Effect::Allow],
             source: "default.policy[0]".into(),
         });
 
         let mut tag = CompiledRoute::default();
-        tag.policy.push(Effect::When {
+        tag.pre_invocation.push(Effect::When {
             condition: Expression::Always,
             body: vec![Effect::Allow],
             source: "tag.hr.policy[0]".into(),
         });
 
         let mut route = CompiledRoute::default();
-        route.policy.push(Effect::When {
+        route.pre_invocation.push(Effect::When {
             condition: Expression::Always,
             body: vec![Effect::Allow],
             source: "route.policy[0]".into(),
@@ -958,7 +958,7 @@ mod tests {
         // Order of calls = order of evaluation. global runs first,
         // route runs last (first-deny-wins lets globals deny early).
         let sources: Vec<&str> = effective
-            .policy
+            .pre_invocation
             .iter()
             .map(|s| match s {
                 Effect::When { source, .. } => source.as_str(),

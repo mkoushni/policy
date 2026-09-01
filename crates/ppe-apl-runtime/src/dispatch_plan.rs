@@ -10,7 +10,7 @@
 // praxis-policy-core's `invoke_named(hook_name, ...)` resolves the lineup on
 // every call: hook lookup → route/condition filter → group by mode →
 // dispatch. APL routes are already authoritative lineups (the YAML's
-// `routes.<r>.policy: [plugin(x), plugin(y)]` IS the plan). Re-resolving
+// `routes.<r>.pre_invocation: [run(x), run(y)]` IS the plan). Re-resolving
 // per call wastes work and lets praxis-policy-core's parallel routing model
 // (entity-based conditions) override APL's intent.
 //
@@ -48,7 +48,7 @@ use praxis_policy_core::hooks::{HookMetadata, HookPhase, lookup_hook_metadata};
 use praxis_policy_core::plugin::OnError;
 use praxis_policy_core::registry::HookEntry;
 
-use praxis_policy_apl_core::pipeline::Stage;
+use praxis_policy_apl_core::pipeline::{FieldRule, Stage};
 use praxis_policy_apl_core::plugin_decl::{EffectivePlugin, PluginRegistry};
 use praxis_policy_apl_core::rules::{CompiledRoute, Effect};
 
@@ -338,8 +338,8 @@ fn walk_effects<F: FnMut(&Effect)>(effects: &[Effect], visit: &mut F) {
 }
 
 /// Walk a `CompiledRoute` and return the unique delegate-plugin names
-/// referenced by any `Effect::Delegate` anywhere in `policy` /
-/// `post_policy` (including effects nested inside When / Sequential /
+/// referenced by any `Effect::Delegate` anywhere in `pre_invocation` /
+/// `post_invocation` (including effects nested inside When / Sequential /
 /// Parallel / Pdp reactions). Insertion-ordered for build determinism.
 /// Separate from [`collect_plugin_names`] because delegate plugins
 /// resolve under a different hook family (`token.delegate`) and the
@@ -372,7 +372,7 @@ mod identity_check_tests {
 
     fn route_with(steps: Vec<Effect>) -> CompiledRoute {
         let mut route = CompiledRoute::new("tool:get_compensation");
-        route.policy = steps;
+        route.pre_invocation = steps;
         route
     }
 
@@ -437,7 +437,7 @@ mod identity_check_tests {
 /// A route that delegates the caller's own credential depends on
 /// something having validated it first. Identity resolution is a
 /// separate hook the host invokes at request entry, and it is per-route
-/// configuration — `route.identity` is optional, and a route with no
+/// configuration: `route.authentication` is optional, and a route with no
 /// identity block resolves no identity plugins at all. Nothing then
 /// rejects a token the `IdP` never signed before the delegator exchanges
 /// it.
@@ -509,8 +509,8 @@ fn delegate_steps_exchanging_caller_credentials(route: &CompiledRoute) -> Vec<St
             out.push(ds.plugin_name.clone());
         }
     };
-    walk_effects(&route.policy, &mut visit);
-    walk_effects(&route.post_policy, &mut visit);
+    walk_effects(&route.pre_invocation, &mut visit);
+    walk_effects(&route.post_invocation, &mut visit);
     out
 }
 
@@ -524,14 +524,14 @@ pub(crate) fn collect_delegate_plugin_names(route: &CompiledRoute) -> Vec<String
             out.push(ds.plugin_name.clone());
         }
     };
-    walk_effects(&route.policy, &mut visit);
-    walk_effects(&route.post_policy, &mut visit);
+    walk_effects(&route.pre_invocation, &mut visit);
+    walk_effects(&route.post_invocation, &mut visit);
     out
 }
 
 /// Walk a `CompiledRoute` and return the unique elicitation-plugin names
-/// referenced by any `Effect::Elicit` anywhere in `policy` /
-/// `post_policy` (including nested). Insertion-ordered for build
+/// referenced by any `Effect::Elicit` anywhere in `pre_invocation` /
+/// `post_invocation` (including nested). Insertion-ordered for build
 /// determinism. Separate from [`collect_plugin_names`] because
 /// elicitation plugins resolve under the `elicit` hook family and the
 /// plan keeps them in their own map.
@@ -545,13 +545,13 @@ pub(crate) fn collect_elicit_plugin_names(route: &CompiledRoute) -> Vec<String> 
             out.push(es.plugin_name.clone());
         }
     };
-    walk_effects(&route.policy, &mut visit);
-    walk_effects(&route.post_policy, &mut visit);
+    walk_effects(&route.pre_invocation, &mut visit);
+    walk_effects(&route.post_invocation, &mut visit);
     out
 }
 
 /// Walk a `CompiledRoute` and return the unique plugin names referenced
-/// by any `Effect::Plugin` anywhere in `policy` / `post_policy` (including
+/// by any `Effect::Plugin` anywhere in `pre_invocation` / `post_invocation` (including
 /// nested) or `Stage::Plugin` (in `args` / `result` pipelines).
 /// Insertion-ordered for build determinism.
 pub(crate) fn collect_plugin_names(route: &CompiledRoute) -> Vec<String> {
@@ -564,8 +564,8 @@ pub(crate) fn collect_plugin_names(route: &CompiledRoute) -> Vec<String> {
             out.push(name.clone());
         }
     };
-    walk_effects(&route.policy, &mut visit);
-    walk_effects(&route.post_policy, &mut visit);
+    walk_effects(&route.pre_invocation, &mut visit);
+    walk_effects(&route.post_invocation, &mut visit);
     for fr in route.args.iter().chain(route.result.iter()) {
         for stage in &fr.pipeline.stages {
             if let Stage::Plugin { name } = stage
@@ -576,6 +576,65 @@ pub(crate) fn collect_plugin_names(route: &CompiledRoute) -> Vec<String> {
         }
     }
     out
+}
+
+/// The plugin names a `CompiledRoute` reaches, split by which half reaches
+/// them: `(pre, post)`.
+///
+/// [`collect_plugin_names`] unions the two halves, which is what a dispatch
+/// plan wants. The reachability report wants them apart, because a route's two
+/// halves install under different hooks and a plugin reached on one is not
+/// covered on the other. `args` pipelines run on the pre half and `result`
+/// pipelines on the post half, so each stage joins the side it runs on.
+///
+/// Delegation and elicitation names join both sides: their effects carry a
+/// plugin the route dispatches to the same way a step does.
+pub(crate) fn collect_plugin_names_by_half(route: &CompiledRoute) -> (Vec<String>, Vec<String>) {
+    fn names_in(effects: &[Effect]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut visit = |e: &Effect| {
+            let name = match e {
+                Effect::Plugin { name } => name,
+                Effect::Delegate(ds) => &ds.plugin_name,
+                Effect::Elicit(es) => &es.plugin_name,
+                _ => return,
+            };
+            if seen.insert(name.clone()) {
+                out.push(name.clone());
+            }
+        };
+        walk_effects(effects, &mut visit);
+        out
+    }
+
+    fn stage_names(fields: &[FieldRule]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for fr in fields {
+            for stage in &fr.pipeline.stages {
+                if let Stage::Plugin { name } = stage
+                    && !out.contains(name)
+                {
+                    out.push(name.clone());
+                }
+            }
+        }
+        out
+    }
+
+    fn extend_unique(into: &mut Vec<String>, names: Vec<String>) {
+        for name in names {
+            if !into.contains(&name) {
+                into.push(name);
+            }
+        }
+    }
+
+    let mut pre = names_in(&route.pre_invocation);
+    extend_unique(&mut pre, stage_names(&route.args));
+    let mut post = names_in(&route.post_invocation);
+    extend_unique(&mut post, stage_names(&route.result));
+    (pre, post)
 }
 
 /// Compute the union of capabilities declared by every plugin a
@@ -597,7 +656,7 @@ pub(crate) fn route_capability_union(
     registry: &PluginRegistry,
 ) -> std::collections::HashSet<String> {
     let mut caps: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Plugin steps (`plugin(name)` in policy / `plugin: name` in
+    // Plugin steps (`run(name)` in policy / `plugin: name` in
     // args / result pipelines).
     for name in collect_plugin_names(route) {
         if let Some(eff) = EffectivePlugin::resolve(&name, registry, &route.plugin_overrides) {

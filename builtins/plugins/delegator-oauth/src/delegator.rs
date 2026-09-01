@@ -389,11 +389,11 @@ struct TokenExchangeResponse {
 
 /// Subset of the standard OAuth error response — `error` is the
 /// machine-readable code (`invalid_grant`, `invalid_scope`, …).
+/// `error_description` is not modelled: an `IdP` may echo the submitted
+/// credential there, and serde drops unmodelled fields.
 #[derive(Debug, Deserialize)]
 struct TokenErrorResponse {
     error: String,
-    #[serde(default)]
-    error_description: Option<String>,
 }
 
 #[async_trait]

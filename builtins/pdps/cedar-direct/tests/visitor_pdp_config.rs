@@ -3,7 +3,7 @@
 
 // End-to-end integration: a unified-config YAML that
 //
-//   1. declares a `cedar-direct` PDP under `global.apl.pdp[]`,
+//   1. declares a `cedar-direct` PDP under `global.pdp[]`,
 //   2. embeds Cedar policy text inline in that declaration,
 //   3. attaches a `cedar:(...)` policy step to a route,
 //
@@ -49,17 +49,18 @@ use praxis_policy_pdp_cedar_direct::CedarDirectPdpFactory;
 // only fires for principals carrying the `reader` role; everything else
 // hits Cedar's default-deny path.
 const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
 global:
-  apl:
-    pdp:
-      - kind: cedar-direct
-        policy_text: |
-          @id("reader-permit")
-          permit(principal, action == Action::"read", resource)
-          when { principal.roles.contains("reader") };
+  pdp:
+    - kind: cedar-direct
+      policy_text: |
+        @id("reader-permit")
+        permit(principal, action == Action::"read", resource)
+        when { principal.roles.contains("reader") };
 routes:
   - tool: get_document
-    apl:
+    authorization:
       pre_invocation:
         - cedar:
             action: 'Action::"read"'

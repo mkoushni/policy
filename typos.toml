@@ -2,4 +2,28 @@
 extend-exclude = ["Cargo.lock", "target/"]
 
 [default.extend-words]
-# Add project-specific identifiers that typos flags incorrectly.
+# Deliberate misspellings. Each is a fixture for a test that a misspelled
+# configuration key is reported rather than silently dropped, so the wrong
+# spelling IS the input under test and correcting it would delete the test.
+#
+# Listed here rather than excluding the whole file, which would hide a real typo
+# in the prose around them. The cost is that a genuine slip of one of these exact
+# words elsewhere would pass; each is mangled far enough that it is not a word
+# anyone reaches for by accident.
+authorizaton = "authorizaton"
+confg = "confg"
+dispath = "dispath"
+gobal = "gobal"
+inherted = "inherted"
+invocaton = "invocaton"
+
+# Alternate spellings that are correct English. typos-cli prefers the other form;
+# this project uses these and is consistent about them.
+overrideable = "overrideable"
+unparseable = "unparseable"
+writeable = "writeable"
+
+# `mis-parsing` / `mis-connecting`: a hyphenated prefix, not a misspelling of
+# `miss`. `pendings`: the plural noun, in "multiple concurrent pendings".
+mis = "mis"
+pendings = "pendings"
