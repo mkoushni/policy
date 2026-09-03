@@ -1250,6 +1250,7 @@ fn dispatch_parallel<'a>(
                     }
                 },
                 BranchOutcome::Panicked(msg) => {
+                    // Use the panic as this branch's synthetic Halt and audit reason.
                     if first_halt.is_none() {
                         let label = effects
                             .get(idx)
@@ -1258,7 +1259,7 @@ fn dispatch_parallel<'a>(
                             reason: Some(format!(
                                 "parallel branch {idx} ({label}) panicked (fail-closed): {msg}"
                             )),
-                            rule_source: fallback_source.to_owned(),
+                            rule_source: "parallel.branch_panic".to_owned(),
                         });
                     }
                 },
@@ -1322,6 +1323,7 @@ async fn dispatch_field_op(
 
     // Pick the right side of the payload based on the path prefix.
     // Out-of-phase ops drop silently (see the doc comment).
+    #[derive(Clone, Copy)]
     enum Side {
         Args,
         Result,
@@ -1348,43 +1350,52 @@ async fn dispatch_field_op(
         });
     };
 
-    let Some(current) = get_dotted(root, subpath).cloned() else {
-        return EffectOutcome::Continue; // missing field → silent no-op
+    // Expand intermediate arrays; excessive fan-out fails closed.
+    let Some(paths) = crate::route::expand_field_paths(root, subpath) else {
+        return EffectOutcome::Halt(Decision::Deny {
+            reason: Some(format!(
+                "FieldOp path `{path}` expands to too many elements to redact safely"
+            )),
+            rule_source: fallback_source.to_owned(),
+        });
     };
 
     let pipeline = crate::pipeline::Pipeline {
         stages: stages.to_vec(),
     };
-    // `subpath`, not `path`: the field name a pipeline reports to a
-    // plugin is relative to the args / result root, matching what the
-    // `args:` / `result:` section pipelines pass. The prefixed `path`
-    // stays in use for deny messages, where the reader wants the side
-    // spelled out.
-    let eval = evaluate_pipeline(&pipeline, &current, bag, plugins, subpath, phase).await;
-    taints.extend(eval.taints);
     let mark_modified = |side: Side, args: &mut bool, result: &mut bool| match side {
         Side::Args => *args = true,
         Side::Result => *result = true,
     };
-    match eval.outcome {
-        FieldOutcome::Pass => EffectOutcome::Continue,
-        FieldOutcome::Replace(new_val) => {
-            if set_dotted(root, subpath, new_val) {
-                mark_modified(side, args_modified, result_modified);
-            }
-            EffectOutcome::Continue
-        },
-        FieldOutcome::Omit => {
-            if remove_dotted(root, subpath) {
-                mark_modified(side, args_modified, result_modified);
-            }
-            EffectOutcome::Continue
-        },
-        FieldOutcome::Deny { reason, .. } => EffectOutcome::Halt(Decision::Deny {
-            reason: Some(reason),
-            rule_source: fallback_source.to_owned(),
-        }),
+    for concrete in paths {
+        let Some(current) = get_dotted(root, &concrete).cloned() else {
+            continue; // missing field on this element → silent no-op
+        };
+        // Plugins receive a root-relative field name; deny messages use the
+        // prefixed path to identify the args or result side.
+        let eval = evaluate_pipeline(&pipeline, &current, bag, plugins, subpath, phase).await;
+        taints.extend(eval.taints);
+        match eval.outcome {
+            FieldOutcome::Pass => {},
+            FieldOutcome::Replace(new_val) => {
+                if set_dotted(root, &concrete, new_val) {
+                    mark_modified(side, args_modified, result_modified);
+                }
+            },
+            FieldOutcome::Omit => {
+                if remove_dotted(root, &concrete) {
+                    mark_modified(side, args_modified, result_modified);
+                }
+            },
+            FieldOutcome::Deny { reason, .. } => {
+                return EffectOutcome::Halt(Decision::Deny {
+                    reason: Some(reason),
+                    rule_source: fallback_source.to_owned(),
+                });
+            },
+        }
     }
+    EffectOutcome::Continue
 }
 
 /// Result of running a pipeline against one field's value.
@@ -3551,6 +3562,20 @@ mod tests {
         }
     }
 
+    /// Invoker that panics on every plugin call.
+    struct PanicPlugins;
+    #[async_trait]
+    impl PluginInvoker for PanicPlugins {
+        async fn invoke(
+            &self,
+            _name: &str,
+            _bag: &AttributeBag,
+            _invocation: PluginInvocation<'_>,
+        ) -> Result<PluginOutcome, PluginError> {
+            panic!("plugin blew up mid-branch");
+        }
+    }
+
     fn pdp_step(decision_diagnostic_label: &str) -> Effect {
         Effect::Pdp {
             call: PdpCall {
@@ -4555,6 +4580,44 @@ mod tests {
                 assert_eq!(reason.as_deref(), Some("branch 1 denied"));
             },
             other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_panicked_branch_fails_closed() {
+        let mut bag = AttributeBag::new();
+        let mut payload = crate::route::RoutePayload::new(json!({}));
+
+        let rule = Rule {
+            condition: Expression::Always,
+            effects: vec![Effect::Parallel(vec![
+                Effect::Plugin {
+                    name: "guard".into(),
+                },
+                Effect::Allow,
+            ])],
+            source: "test.policy[0]".into(),
+        };
+
+        let eval = evaluate_effects(
+            &vec![Effect::from(rule)],
+            &mut bag,
+            &(Arc::new(FakePdp {
+                decision: Decision::Allow,
+            }) as Arc<dyn PdpResolver>),
+            &(Arc::new(PanicPlugins) as Arc<dyn PluginInvoker>),
+            &noop_delegations(),
+            &noop_elicitations(),
+            crate::step::DispatchPhase::Pre,
+            &mut payload,
+        )
+        .await;
+
+        match eval.decision {
+            Decision::Deny { rule_source, .. } => {
+                assert_eq!(rule_source, "parallel.branch_panic");
+            },
+            other => panic!("panicked branch must deny, got {other:?}"),
         }
     }
 

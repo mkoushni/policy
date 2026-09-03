@@ -105,8 +105,13 @@ pub struct PipelineResult {
     /// read.
     pub payload_modified: bool,
 
-    /// The final extensions after all modifications.
-    /// `None` if no plugin modified extensions.
+    /// The final extensions the pipeline ran with.
+    ///
+    /// `Some` from both constructors whether or not a plugin changed anything:
+    /// [`Self::allowed_with`] and [`Self::denied`] each carry the extensions
+    /// they were handed, and `payload_modified` is what reports a change. So
+    /// `None` reaches a consumer only from a result a host built itself, and
+    /// means there is no engine state to read rather than that none changed.
     pub modified_extensions: Option<Extensions>,
 
     /// The violation that caused a deny, if any.
@@ -486,10 +491,15 @@ impl Executor {
             match result {
                 Ok(Ok(result_box)) => {
                     if let Some(erased) = extract_erased(result_box) {
-                        if !erased.continue_processing
-                            && can_block
-                            && let Some(mut v) = erased.violation
-                        {
+                        if !erased.continue_processing && can_block {
+                            // A blocking result always halts; synthesize a violation
+                            // when the plugin did not provide one.
+                            let mut v = erased.violation.unwrap_or_else(|| {
+                                crate::error::PluginViolation::new(
+                                    "plugin_deny",
+                                    format!("Plugin '{plugin_name}' denied"),
+                                )
+                            });
                             v.plugin_name = Some(plugin_name.to_owned());
                             return Some(v);
                         }

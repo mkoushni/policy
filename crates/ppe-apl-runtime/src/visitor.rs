@@ -1084,6 +1084,26 @@ impl ConfigVisitor for AplConfigVisitor {
                 return Err(err_msg.into());
             }
 
+            // Repeat elicitation validation after stacking to catch duplicates
+            // introduced across global, group, and route layers.
+            for (phase, effects) in [
+                ("pre_invocation", &effective.pre_invocation),
+                ("post_invocation", &effective.post_invocation),
+            ] {
+                let elicits: usize = effects
+                    .iter()
+                    .map(praxis_policy_apl_core::rules::Effect::count_elicits)
+                    .sum();
+                if elicits > 1 {
+                    let err_msg = format!(
+                        "route '{route_key}': {phase} reaches {elicits} elicitation steps; at \
+                         most one elicitation per phase is supported (they would share one retry \
+                         id and resolve against each other)"
+                    );
+                    return Err(err_msg.into());
+                }
+            }
+
             // Each half installs only when the effective route declares steps
             // for it, the way the global catch-all already decides.
             let installs_pre = declares_pre_phase(&effective);

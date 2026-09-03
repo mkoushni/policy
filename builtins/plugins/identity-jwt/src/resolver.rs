@@ -101,7 +101,6 @@ const DEFAULT_LEEWAY_SECONDS: u64 = 60;
 /// `PluginFactory::create` trait surface across the workspace) while
 /// putting the network I/O on the natural async hook the host
 /// already drives via `PolicyEngine::initialize().await`.
-#[derive(Debug)]
 pub struct JwtIdentityResolver {
     cfg: PluginConfig,
     /// Each issuer behind its own `Arc` so the verify path can clone
@@ -129,6 +128,21 @@ pub struct JwtIdentityResolver {
     /// `RawInboundToken.source_header` so forwarding plugins know
     /// where to put it (or strip it) on the upstream call.
     header: String,
+}
+
+// Implement `Debug` manually because `cfg` and `pending_jwks` may contain HMAC
+// signing secrets or inline PEM keys.
+impl std::fmt::Debug for JwtIdentityResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JwtIdentityResolver")
+            .field("name", &self.cfg.name)
+            .field("role", &self.role)
+            .field("header", &self.header)
+            .field("pending_jwks_count", &self.pending_jwks.len())
+            .field("cfg", &"<redacted>")
+            .field("pending_jwks", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl JwtIdentityResolver {
@@ -679,7 +693,7 @@ impl HookHandler<IdentityHook> for JwtIdentityResolver {
         let header_lc = self.header.to_ascii_lowercase();
         let header_value = payload.headers().get(header_lc.as_str());
         let raw_token: String = match header_value {
-            Some(v) => v.strip_prefix("Bearer ").unwrap_or(v).to_owned(),
+            Some(v) => strip_bearer_prefix(v).to_owned(),
             None if !payload.raw_token().is_empty() => payload.raw_token().to_owned(),
             None => {
                 return PluginResult::deny(PluginViolation::new(
@@ -948,6 +962,19 @@ fn peek_issuer(token: &str) -> Option<String> {
     value.get("iss")?.as_str().map(String::from)
 }
 
+/// Strip a leading `Bearer` auth-scheme from a header value, if present.
+///
+/// The scheme is case-insensitive per RFC 9110 §11.1. Bare tokens are returned
+/// unchanged for hosts that strip the scheme themselves.
+fn strip_bearer_prefix(value: &str) -> &str {
+    match value.split_once(' ') {
+        Some((scheme, after)) if scheme.eq_ignore_ascii_case("bearer") => {
+            after.trim_start_matches(' ')
+        },
+        _ => value,
+    }
+}
+
 /// Reason `validate_token` couldn't verify the JWT. Wraps the
 /// usual `jsonwebtoken::errors::Error` plus the kid-selection
 /// and JWKS-availability cases.
@@ -1208,6 +1235,17 @@ mod tests {
             TokenSource::Bearer,
         );
         assert_eq!(deny_code_for(&resolver, payload).await, "auth.config_error");
+    }
+
+    #[test]
+    fn strip_bearer_prefix_is_case_insensitive() {
+        assert_eq!(strip_bearer_prefix("Bearer abc.def.ghi"), "abc.def.ghi");
+        assert_eq!(strip_bearer_prefix("bearer abc.def.ghi"), "abc.def.ghi");
+        assert_eq!(strip_bearer_prefix("BEARER abc.def.ghi"), "abc.def.ghi");
+        assert_eq!(strip_bearer_prefix("BeArEr abc.def.ghi"), "abc.def.ghi");
+        assert_eq!(strip_bearer_prefix("bearer   abc.def.ghi"), "abc.def.ghi");
+        assert_eq!(strip_bearer_prefix("abc.def.ghi"), "abc.def.ghi");
+        assert_eq!(strip_bearer_prefix("bearerish"), "bearerish");
     }
 
     #[test]

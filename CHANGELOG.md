@@ -15,16 +15,41 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-> **Upgrading a 0.1.0 configuration?** `docs/upgrade-apl.md` lists every key and
-> form that must be rewritten, with a before and an after for each. This release
-> removes ten configuration keys, changes the default dispatch mode, and tightens
-> the policy language's lexical rules, so a 0.1.0 document does not load unchanged.
+> **Upgrading from 0.1.0?** Configurations require changes: this release removes
+> ten keys, changes the default dispatch mode, and tightens APL lexical rules.
+> `docs/upgrade-apl.md` lists the required rewrites with before-and-after examples.
 >
-> For what the language accepts now, rather than what changed,
-> `docs/apl-grammar.md` is normative. It replaces a grammar that existed only as
-> comments inside the parser.
+> `docs/apl-grammar.md` is the normative APL grammar, replacing the parser's
+> inline grammar comments.
 
 ### Added
+
+- **`assertions:` controls the headers PPE writes at trust boundaries.** Available
+  alongside `authentication:` at global, default, bundle, and route scope, its
+  `request:` contract maps engine-derived values such as `subject.id` and
+  `claim.<name>` onto upstream request headers. Target headers are removed before
+  rendering, so a missing value cannot leave a client-supplied value under a
+  trusted name. Its `response:` contract strips or replaces upstream response
+  headers; unnamed response headers pass through unchanged.
+
+  Contracts inherit by scope: more-specific `headers:` entries replace matching
+  targets, `strip:` entries accumulate, and `replace_inherited: true` resets
+  inherited operator-authored rules. Raw or delegated tokens and peer-supplied
+  headers cannot be used as sources, and a protocol floor fixed in code per
+  direction holds the headers no `strip:` entry can remove: framing and `host` on
+  the way in, and the framing, caching and CORS set a client reads on the way out.
+  `authorization` sits outside the request floor, so forwarding an upstream on a
+  delegated credential can still remove the client's own bearer. Invalid sources,
+  targets, encodings, or conflicting entries fail configuration loading with their
+  location. Assertions run after the applicable
+  policy phase, and response assertions are returned through the existing
+  `PipelineResult`, requiring no host change.
+
+  Configuration loading also reports `http:` routes whose assertions depend on
+  host-supplied request metadata and routes affected by an inherited
+  `replace_inherited: true`. Assertions are unsigned, so recipients must trust the
+  network path. `docs/assertions.md` is the reference.
+  ([#28](https://github.com/praxis-proxy/policy/issues/28))
 
 - **`docs/apl-grammar.md`, the grammar as a document.** APL's grammar lived in
   comments beside the parser, and those comments were wrong on four counts: they
@@ -808,6 +833,11 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 - **`AplRouteHandler::with_pdp_router` is gone.** Install a `PdpRouter` through `with_pdp`, which is what the visitor already does. ([#13](https://github.com/praxis-proxy/policy/issues/13))
 
 ### Fixed
+
+- **A bundle joined through both `meta.tags` and `groups:` no longer runs its
+  `authentication:` steps twice.** Bundle membership is now deduplicated before
+  authentication and assertion layers are resolved, keeping their inheritance
+  order consistent.
 
 - **A `delegate(...)` or elicitation step above route scope no longer fails the
   load.** The reachability check that makes `dispatch: policy` survivable asks
