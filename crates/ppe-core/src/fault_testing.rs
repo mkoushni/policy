@@ -15,6 +15,7 @@
 #![allow(clippy::panic, reason = "the harness panics on demand")]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -138,6 +139,41 @@ pub fn fault_entry(
     }
 }
 
+/// Handler that always allows and counts how many times it ran.
+///
+/// Used to assert a later phase still dispatched after a contained failure.
+pub struct ProbeHandler(pub Arc<AtomicUsize>);
+
+#[async_trait]
+impl AnyHookHandler for ProbeHandler {
+    async fn invoke(
+        &self,
+        _payload: &dyn PluginPayload,
+        _extensions: &Extensions,
+        _ctx: &mut PluginContext,
+    ) -> Result<Box<dyn std::any::Any + Send + Sync>, Box<PluginError>> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(erase_result(PluginResult::<FaultPayload>::allow()))
+    }
+
+    fn hook_type_name(&self) -> &'static str {
+        "probe"
+    }
+}
+
+/// An allowing plugin in `mode`, counting invocations on `calls`.
+pub fn probe_entry(name: &str, mode: PluginMode, calls: Arc<AtomicUsize>) -> HookEntry {
+    let cfg = PluginConfig {
+        name: name.into(),
+        mode,
+        ..Default::default()
+    };
+    HookEntry {
+        plugin_ref: Arc::new(PluginRef::new(Arc::new(FaultPlugin(cfg.clone())), cfg)),
+        handler: Arc::new(ProbeHandler(calls)),
+    }
+}
+
 /// Decision the catalog asserts for `mode` × `failure` under `on_error: fail`.
 ///
 /// Lives here so the match on [`PluginMode`] is exhaustive inside this crate.
@@ -160,11 +196,12 @@ pub enum ExpectedVerdict {
     AllowThenBackgroundPanic,
 }
 
-/// Every mode the executor dispatches. `Disabled` is omitted.
+/// Every [`PluginMode`] variant, including `Disabled`.
 ///
-/// The match is exhaustive so a new [`PluginMode`] variant fails to compile
-/// until this list and [`expected_plugin_verdict`] gain a cell for it.
-pub fn dispatch_modes() -> Vec<PluginMode> {
+/// The match is exhaustive so a new variant is a compile error until this
+/// list and [`expected_plugin_verdict`] are updated together. Catalog
+/// iteration is this list filtered by [`PluginMode::is_dispatch_phase`].
+pub fn all_plugin_modes() -> [PluginMode; 6] {
     match PluginMode::Sequential {
         PluginMode::Sequential
         | PluginMode::Transform
@@ -179,10 +216,16 @@ pub fn dispatch_modes() -> Vec<PluginMode> {
         PluginMode::Audit,
         PluginMode::Concurrent,
         PluginMode::FireAndForget,
+        PluginMode::Disabled,
     ]
-    .into_iter()
-    .filter(|m| m.is_dispatch_phase())
-    .collect()
+}
+
+/// Every mode the executor dispatches. `Disabled` is omitted.
+pub fn dispatch_modes() -> Vec<PluginMode> {
+    all_plugin_modes()
+        .into_iter()
+        .filter(|m| m.is_dispatch_phase())
+        .collect()
 }
 
 /// Safe verdict for one catalog cell. Exhaustive on [`PluginMode`].

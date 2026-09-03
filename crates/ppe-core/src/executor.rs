@@ -473,9 +473,10 @@ impl Executor {
     /// Run a serial phase — plugins execute one at a time, each seeing
     /// the (possibly modified) payload from the previous.
     ///
-    /// The framework retains ownership of the payload. Handlers receive
-    /// a borrow and clone only if they modify. Modified payloads in
-    /// the result replace the current payload.
+    /// The framework retains ownership of the payload. The handler runs
+    /// on a spawned task so a panic cannot unwind [`Executor::execute`],
+    /// which means the payload is cloned into the task on every invoke.
+    /// Modified payloads in the result replace the current payload.
     ///
     /// `payload_modified` is set to `true` when a handler's payload is
     /// accepted, and never cleared — this is the only place that fact is

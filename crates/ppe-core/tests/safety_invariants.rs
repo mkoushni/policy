@@ -18,13 +18,16 @@
     reason = "test and example code"
 )]
 
+use std::sync::atomic::Ordering;
+
 use praxis_policy_core::config::parse_config;
 use praxis_policy_core::executor::{Executor, ExecutorConfig};
 use praxis_policy_core::fault_testing::{
-    ExpectedVerdict, InjectedFailure, dispatch_modes, expected_plugin_verdict, fault_entry,
+    ExpectedVerdict, InjectedFailure, all_plugin_modes, dispatch_modes, expected_plugin_verdict,
+    fault_entry, probe_entry,
 };
 use praxis_policy_core::hooks::payload::{Extensions, PluginPayload};
-use praxis_policy_core::plugin::OnError;
+use praxis_policy_core::plugin::{OnError, PluginMode};
 
 #[derive(Debug, Clone)]
 #[allow(
@@ -39,14 +42,17 @@ praxis_policy_core::impl_plugin_payload!(TestPayload);
 #[test]
 fn plugin_fault_catalog_covers_every_dispatch_mode() {
     let modes = dispatch_modes();
-    assert_eq!(
-        modes.len(),
-        5,
-        "five dispatch phases; Disabled is not a phase"
-    );
-    for mode in modes {
-        assert!(mode.is_dispatch_phase(), "{mode} must be a dispatch phase");
+    for mode in all_plugin_modes() {
+        assert_eq!(
+            modes.contains(&mode),
+            mode.is_dispatch_phase(),
+            "{mode} must appear in the catalog iff it is a dispatch phase"
+        );
     }
+    assert!(
+        !modes.is_empty(),
+        "the executor has at least one dispatch phase"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -148,13 +154,188 @@ async fn empty_plugin_list_allows() {
     assert!(bg.wait_for_background_tasks().await.is_empty());
 }
 
+fn catalog_executor() -> Executor {
+    Executor::new(ExecutorConfig {
+        timeout_seconds: 1,
+        short_circuit_on_deny: true,
+    })
+}
+
+fn test_payload() -> Box<dyn PluginPayload> {
+    Box::new(TestPayload { value: "x".into() })
+}
+
+/// I4 outside concurrent: ignore and disable must not halt serial, transform,
+/// or audit, and disable must trip the circuit breaker. Concurrent already
+/// has the nine-cell matrix in `executor.rs`.
+#[tokio::test(start_paused = true)]
+async fn plugin_ignore_and_disable_do_not_halt_serial_transform_or_audit() {
+    let tracker = tokio_util::task::TaskTracker::new();
+    let modes = [
+        PluginMode::Sequential,
+        PluginMode::Transform,
+        PluginMode::Audit,
+    ];
+    for mode in modes {
+        for on_error in [OnError::Ignore, OnError::Disable] {
+            for failure in [
+                InjectedFailure::Error,
+                InjectedFailure::Hang,
+                InjectedFailure::Panic,
+            ] {
+                let entry = fault_entry("fault", mode, on_error, failure);
+                let (result, bg) = catalog_executor()
+                    .execute(
+                        std::slice::from_ref(&entry),
+                        test_payload(),
+                        Extensions::default(),
+                        None,
+                        &tracker,
+                    )
+                    .await;
+                assert!(
+                    result.continue_processing,
+                    "{mode:?} × {on_error:?} × {failure:?}: must not halt"
+                );
+                assert!(
+                    result.violation.is_none(),
+                    "{mode:?} × {on_error:?} × {failure:?}"
+                );
+                assert_eq!(
+                    result.errors.len(),
+                    1,
+                    "{mode:?} × {on_error:?} × {failure:?}: failure must be recorded"
+                );
+                assert_eq!(
+                    entry.plugin_ref.is_disabled(),
+                    on_error == OnError::Disable,
+                    "{mode:?} × {on_error:?} × {failure:?}"
+                );
+                let _ = bg.wait_for_background_tasks().await;
+            }
+        }
+    }
+}
+
+/// A contained serial panic under ignore must not skip later audit. That was
+/// the uncontained-unwind failure: audit never ran.
+#[tokio::test]
+async fn a_contained_serial_panic_under_ignore_still_runs_audit() {
+    let tracker = tokio_util::task::TaskTracker::new();
+    let audit_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let entries = [
+        fault_entry(
+            "fault",
+            PluginMode::Sequential,
+            OnError::Ignore,
+            InjectedFailure::Panic,
+        ),
+        probe_entry(
+            "audit",
+            PluginMode::Audit,
+            std::sync::Arc::clone(&audit_calls),
+        ),
+    ];
+    let (result, bg) = catalog_executor()
+        .execute(
+            &entries,
+            test_payload(),
+            Extensions::default(),
+            None,
+            &tracker,
+        )
+        .await;
+    assert!(result.continue_processing);
+    assert_eq!(result.errors.len(), 1);
+    assert_eq!(
+        audit_calls.load(Ordering::SeqCst),
+        1,
+        "audit must still run after a contained serial panic under ignore"
+    );
+    let _ = bg.wait_for_background_tasks().await;
+}
+
+/// Fail-closed serial panic is a deny. Later audit does not run; the
+/// violation is the record.
+#[tokio::test]
+async fn a_serial_fail_panic_does_not_run_audit() {
+    let tracker = tokio_util::task::TaskTracker::new();
+    let audit_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let entries = [
+        fault_entry(
+            "fault",
+            PluginMode::Sequential,
+            OnError::Fail,
+            InjectedFailure::Panic,
+        ),
+        probe_entry(
+            "audit",
+            PluginMode::Audit,
+            std::sync::Arc::clone(&audit_calls),
+        ),
+    ];
+    let (result, bg) = catalog_executor()
+        .execute(
+            &entries,
+            test_payload(),
+            Extensions::default(),
+            None,
+            &tracker,
+        )
+        .await;
+    assert!(!result.continue_processing);
+    assert_eq!(
+        result.violation.as_ref().map(|v| v.code.as_str()),
+        Some("plugin_panic")
+    );
+    assert_eq!(
+        audit_calls.load(Ordering::SeqCst),
+        0,
+        "a fail-closed serial halt must not dispatch later audit"
+    );
+    let _ = bg.wait_for_background_tasks().await;
+}
+
+#[test]
+fn omitted_on_error_in_yaml_is_fail() {
+    let yaml = "
+plugins:
+  - name: rate_limiter
+    kind: builtin
+    hooks: [cmf.tool_pre_invoke]
+    mode: sequential
+";
+    let config = parse_config(yaml).expect("a plugin with no on_error must still load");
+    assert_eq!(config.plugins.len(), 1);
+    assert_eq!(
+        config.plugins[0].on_error,
+        OnError::Fail,
+        "omitted on_error is fail-closed"
+    );
+}
+
 #[test]
 fn malformed_config_fails_the_load() {
-    let err = parse_config("global:\n  not_a_real_key: true\n")
+    let unknown = parse_config("global:\n  not_a_real_key: true\n")
         .expect_err("an unknown key must fail the load");
-    let text = err.to_string();
+    let unknown_text = unknown.to_string();
     assert!(
-        text.contains("not_a_real_key") || text.contains("unknown"),
-        "the load error must name the bad key or that it is unknown: {text}"
+        unknown_text.contains("not_a_real_key"),
+        "the load error must name the bad key: {unknown_text}"
+    );
+
+    let misspelled = parse_config("pluginss:\n  - name: x\n")
+        .expect_err("a misspelled top-level block must fail the load");
+    let misspelled_text = misspelled.to_string();
+    assert!(
+        misspelled_text.contains("pluginss") || misspelled_text.contains("unknown"),
+        "the load error must name the misspelled block: {misspelled_text}"
+    );
+
+    let unparseable = parse_config(":[ not yaml").expect_err("unparseable YAML must fail the load");
+    let unparseable_text = unparseable.to_string();
+    assert!(
+        !unparseable_text.is_empty(),
+        "unparseable YAML must produce a load error"
     );
 }
