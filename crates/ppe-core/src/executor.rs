@@ -811,6 +811,13 @@ impl Executor {
                         proto_error_code: None,
                     };
                     errors.push((&lost_err).into());
+                    if matches!(on_error, OnError::Disable) {
+                        warn!(
+                            "{} plugin '{}' disabled after lost task",
+                            phase_label, plugin_name
+                        );
+                        entry.plugin_ref.disable();
+                    }
                 },
             }
 
@@ -938,6 +945,13 @@ impl Executor {
                         proto_error_code: None,
                     };
                     errors.push((&lost_err).into());
+                    if matches!(on_error, OnError::Disable) {
+                        warn!(
+                            "{} plugin '{}' disabled after lost task",
+                            phase_label, plugin_name
+                        );
+                        entry.plugin_ref.disable();
+                    }
                 },
             }
         }

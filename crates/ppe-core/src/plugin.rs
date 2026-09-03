@@ -573,7 +573,7 @@ impl PluginMode {
     /// `Disabled` is skipped. The match is exhaustive so a new variant is a
     /// compile error until the catalog in `docs/safety-invariants.md` gains a
     /// cell for it.
-    pub fn is_dispatch_phase(self) -> bool {
+    pub fn is_dispatch_phase(&self) -> bool {
         match self {
             Self::Disabled => false,
             Self::Sequential

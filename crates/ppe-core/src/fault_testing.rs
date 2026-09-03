@@ -224,7 +224,7 @@ pub fn all_plugin_modes() -> [PluginMode; 6] {
 pub fn dispatch_modes() -> Vec<PluginMode> {
     all_plugin_modes()
         .into_iter()
-        .filter(|m| m.is_dispatch_phase())
+        .filter(PluginMode::is_dispatch_phase)
         .collect()
 }
 
