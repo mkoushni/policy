@@ -83,9 +83,11 @@ in `crates/ppe-core/tests/safety_invariants.rs`.
 Test: `empty_plugin_list_allows` in `crates/ppe-core/tests/safety_invariants.rs`.
 
 **I7. A PDP panic, error, or timeout is a deny.** The evaluator spawns
-the resolver call with a 30s budget (`PDP_EVALUATE_TIMEOUT`). Panic and
-timeout become `PdpError::Dispatch`; the `Effect::Pdp` arm already maps
-that to `Decision::Deny`. The control (`InjectedFailure::None`) allows.
+the resolver call with a 30s budget (`PDP_EVALUATE_TIMEOUT`) around the
+resolver future itself, so a timeout drops the call rather than
+detaching a hung task. Panic and timeout become `PdpError::Dispatch`;
+the `Effect::Pdp` arm already maps that to `Decision::Deny`. The control
+(`InjectedFailure::None`) allows.
 Test: `pdp_fault_catalog_asserts_the_safe_verdict` in
 `crates/ppe-apl-core/tests/safety_invariants.rs`, driven once per shipped
 dialect so a new dialect without a cell fails to compile.

@@ -550,6 +550,11 @@ pub(crate) const PDP_EVALUATE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Spawn the resolver call so a panic or hang cannot unwind or stall the
 /// phase. Both map to `PdpError::Dispatch`, which `Effect::Pdp` already
 /// turns into a fail-closed deny.
+///
+/// The timeout wraps the resolver future *inside* the spawn, matching
+/// the plugin executor's `invoke_contained`. Wrapping the `JoinHandle`
+/// `JoinHandle` from outside would detach the task when the budget
+/// fires, and a hung PDP would keep running.
 async fn evaluate_pdp_contained(
     pdp: &Arc<dyn PdpResolver>,
     call: &crate::step::PdpCall,
@@ -558,10 +563,13 @@ async fn evaluate_pdp_contained(
     let pdp = Arc::clone(pdp);
     let call = call.clone();
     let bag = bag.clone();
-    let join = tokio::spawn(async move { pdp.evaluate(&call, &bag).await });
-    match tokio::time::timeout(PDP_EVALUATE_TIMEOUT, join).await {
+    let join = tokio::spawn(async move {
+        tokio::time::timeout(PDP_EVALUATE_TIMEOUT, pdp.evaluate(&call, &bag)).await
+    });
+    match join.await {
         Ok(Ok(result)) => result,
-        Ok(Err(join_err)) => {
+        Ok(Err(_)) => Err(crate::step::PdpError::Dispatch("PDP timed out".into())),
+        Err(join_err) => {
             let message = if join_err.is_panic() {
                 format!("PDP task panicked: {join_err}")
             } else {
@@ -569,7 +577,6 @@ async fn evaluate_pdp_contained(
             };
             Err(crate::step::PdpError::Dispatch(message))
         },
-        Err(_) => Err(crate::step::PdpError::Dispatch("PDP timed out".into())),
     }
 }
 
