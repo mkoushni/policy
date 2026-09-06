@@ -428,25 +428,44 @@ fn bridge_empty_roles() -> Case {
 }
 
 fn missing_claim_string() -> Case {
-    case(
-        "missing-claim-string",
-        alice(),
-        r#"principal.claims.tenant == "acme""#,
-        r#"claim.tenant == "acme""#,
-        r#"allow if input.claim.tenant == "acme""#,
-        false,
-        Expect::Diverge("missing-claim-string"),
+    // All four deny; CEL/Cedar report a key error rather than a policy
+    // false. That is AgreeDeny, not a dialect split — APL `==` on an
+    // omitted string is false, so `require` fires.
+    with_apl(
+        case(
+            "missing-claim-string",
+            alice(),
+            r#"principal.claims.tenant == "acme""#,
+            r#"claim.tenant == "acme""#,
+            r#"allow if input.claim.tenant == "acme""#,
+            false,
+            Expect::AgreeDeny {
+                cedar: CauseKind::EvalError,
+                cel: CauseKind::EvalError,
+                opa: CauseKind::DefaultDeny,
+            },
+        ),
+        r#"require(claim.tenant == "acme")"#,
     )
 }
 
 fn missing_claim_int() -> Case {
-    case(
-        "missing-claim-int",
-        alice(),
-        "principal.claims.depth <= 2",
-        "claim.depth <= 2",
-        "allow if input.claim.depth <= 2",
-        false,
-        Expect::Diverge("missing-claim-int"),
+    // Same verdict agreement as a missing string, for `Int`. Emitting
+    // `0` would make a missing depth pass a `<= 2` gate.
+    with_apl(
+        case(
+            "missing-claim-int",
+            alice(),
+            "principal.claims.depth <= 2",
+            "claim.depth <= 2",
+            "allow if input.claim.depth <= 2",
+            false,
+            Expect::AgreeDeny {
+                cedar: CauseKind::EvalError,
+                cel: CauseKind::EvalError,
+                opa: CauseKind::DefaultDeny,
+            },
+        ),
+        "require(claim.depth <= 2)",
     )
 }

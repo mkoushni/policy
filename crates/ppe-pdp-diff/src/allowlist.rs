@@ -17,11 +17,9 @@ pub(crate) struct AllowlistEntry {
     pub(crate) opa: Outcome,
 }
 
-/// Seed entries from issue #25 (floats, missing collections) plus the
-/// omitted-scalar splits the CMF absent-value contract in
-/// `docs/cmf-extensions.md` names (missing claim string/int, missing
-/// principal). Present-empty `StringSet` is not a split: it lives in the
-/// subset as `AgreeDeny`.
+/// Seed entries from issue #25 (floats, missing collections) plus a
+/// missing principal. Present-empty `StringSet` and omitted claim
+/// scalars are not splits: they live in the subset as `AgreeDeny`.
 pub(crate) fn allowlist() -> Vec<AllowlistEntry> {
     vec![
         AllowlistEntry {
@@ -81,30 +79,6 @@ pub(crate) fn allowlist() -> Vec<AllowlistEntry> {
                      Cedar; the other dialects fail by their missing-key \
                      rules.",
             cedar: Outcome::dispatch_error(),
-            cel: Outcome::deny(CauseKind::EvalError),
-            opa: Outcome::deny(CauseKind::DefaultDeny),
-        },
-        AllowlistEntry {
-            id: "missing-claim-string",
-            reason: "Optional strings are omitted, not defaulted. Unguarded \
-                     `claim.tenant == \"acme\"` is a CEL eval error (no \
-                     `claim` namespace). Cedar injects an empty claims \
-                     record, then a missing field is an evaluation error. \
-                     OPA without `default` leaves the query undefined. APL \
-                     would treat the comparison as false; that is why the \
-                     native evaluator is not asserted here.",
-            cedar: Outcome::deny(CauseKind::EvalError),
-            cel: Outcome::deny(CauseKind::EvalError),
-            opa: Outcome::deny(CauseKind::DefaultDeny),
-        },
-        AllowlistEntry {
-            id: "missing-claim-int",
-            reason: "Same omission as a missing string, for `Int`. \
-                     `claim.depth <= 2` against an absent key is a CEL eval \
-                     error, a Cedar evaluation error on the empty claims \
-                     record, and an undefined OPA query. Emitting `0` would \
-                     make a missing depth pass a `<= 2` gate.",
-            cedar: Outcome::deny(CauseKind::EvalError),
             cel: Outcome::deny(CauseKind::EvalError),
             opa: Outcome::deny(CauseKind::DefaultDeny),
         },

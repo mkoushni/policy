@@ -35,8 +35,11 @@ including APL `require(subject.roles contains "hr")`. Cedar rebuilds
 original `subject.roles` set. The bridge writes both from the same
 `HashSet`, so they agree when empty.
 
-Unguarded probes of **omitted scalars** and of a flattened bool whose
-namespace was never written are not in the subset. See
+Unguarded probes of **omitted scalars** whose namespace was never written
+(`missing-collection`) and a missing `subject.id` are not in the subset.
+Omitted **claim** scalars (`missing-claim-string`, `missing-claim-int`)
+Deny on all four engines and are `AgreeDeny`: CEL and Cedar report a key
+error rather than a policy false. See
 [`docs/cmf-extensions.md`](../../docs/cmf-extensions.md).
 
 ## Out of subset (allowlist)
@@ -48,8 +51,6 @@ namespace was never written are not in the subset. See
 | `floats-resource` | float in Cedar `resource.attributes` | Cedar rejects at entity build (`PdpError::Dispatch`). CEL/OPA accept the bag value. |
 | `missing-collection` | no `role.*` keys, unguarded CEL `role.hr` | Cedar empty set (clean false). Unguarded CEL is an eval error. OPA without `default` is undefined. |
 | `missing-subject-id` | no `subject.id` | Cedar cannot build a principal. CEL eval error. OPA undefined. |
-| `missing-claim-string` | omitted `claim.tenant` | Optional strings are omitted. Unguarded equality is a CEL/Cedar eval error and an undefined OPA query. |
-| `missing-claim-int` | omitted `claim.depth` | Same as a missing string; emitting `0` would pass a `<= 2` gate. |
 
 Each allowlist row in `src/allowlist.rs` carries a `reason`. An unused id
 or an empty reason fails the meta tests.

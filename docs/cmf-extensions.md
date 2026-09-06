@@ -33,7 +33,7 @@ missing slots is out of scope.
 | `StringSet` | **Present and empty.** Membership is false. | CEL treats a missing key as an evaluation error. `!("banned" in subject.roles)` would deny every subject with no roles — a routine state, including a plugin that lacks `read_roles` and is handed an empty set. |
 | `Bool` as a real field (`delegation.delegated`) | **Present**, including `false`. | The field is not optional on the struct. |
 | `Bool` as a flattened member (`role.hr`) | **Omitted.** Presence means true. | Emitting `false` for every name that is not a member is impossible. APL reads a missing flattened bool as false; CEL needs `has(role.hr) && role.hr`. |
-| `Bool` derived (`authenticated`) | **Omitted** unless `subject.id` is set. | Absence is "not authenticated". Emitting `false` would collapse that with an explicit unauthenticated marker the model does not have. |
+| `Bool` derived (`authenticated`) | **Omitted** unless `subject.id` is set. | Absence is "not authenticated" in APL (`!authenticated` is true; `require(authenticated)` denies). That is not settled for CEL: on a bridge-built bag with a security slot and no `subject.id`, both `authenticated` and `!authenticated` are `Undeclared reference to 'authenticated'`, and `has(authenticated)` is a compile error (`has()` rejects a bare name). `CelResolver` routes compile errors through `compile_error_decision`, which always fails closed and does not consult `on_error`. There is no CEL guard an author can deploy, so "allow anonymous reads" is not expressible there; the deny reaches the operator as a key error. Contrast `delegation.delegated`, a non-option field that is always written, including `false`. |
 | `String` | **Omitted** when `Option::None`. A non-option string (`client.client_id`) is always written, even if empty. | Empty string and missing are different questions (`exists(subject.id)` vs `subject.id == ""`). |
 | `Int` | **Omitted** when `Option::None` (`http.status`, `agent.turn`, `completion.latency_ms`). A non-option int (`delegation.depth`) is always written, including `0`. | Emitting `0` for an unset HTTP status would make `http.status >= 500` and `http.status == 0` both lie. |
 | `Float` | Same as `Int`. `delegation.age_seconds` is non-option and always written, including `0.0`. | Same reason: a missing telemetry field is not zero. |
@@ -42,8 +42,13 @@ missing slots is out of scope.
 `ppe-pdp-diff` is the executable form of this table for the keys Cedar can
 see. Empty `subject.teams` and a subject with no roles (no `role.*` keys,
 empty `subject.roles`) must Deny on APL, CEL, cedar-direct, and OPA when the
-policy is a membership or flattened-bool gate. Unguarded CEL against an
-**omitted scalar** remains an evaluation error and lives on the allowlist.
+policy is a membership or flattened-bool gate. Unguarded probes of an
+**omitted claim scalar** also Deny on all four (CEL and Cedar report a key
+error rather than a policy false). A flattened bool whose namespace was
+never written, and a missing `subject.id`, remain allowlisted: CEL is an
+eval error, Cedar cannot build a principal without an id, and making those
+agree needs CEL root seeding and a generated Cedar schema, which is a
+follow-up to [#18](https://github.com/praxis-proxy/policy/issues/18).
 
 ---
 
@@ -120,7 +125,7 @@ read.
 
 | Engine | Missing key | Empty `StringSet` |
 |---|---|---|
-| APL | false for presence, equality, membership, and order; `!=` is true (an absent key is not equal to a value) | `contains` / `in` is false |
+| APL | false for presence, equality, membership, and order; `!=` is true (an absent key is not equal to a value, matching `!(x == y)`). Negation is the other exception: `!key` is true (`deny when not authenticated` is the idiom). | `contains` / `in` is false |
 | CEL | evaluation error; default `OnError::Deny` turns it into a denial that reports a key error, not a policy false | `in` is false |
 | cedar-direct | empty `roles` / `permissions` / `teams` / `claims` on the principal so those names exist; no `subject.id` is a dispatch error | `contains` is false |
 | OPA | undefined; without `default allow := false` the query is a default deny | `in` is false |
@@ -128,10 +133,11 @@ read.
 A policy written against a **present-empty set** therefore agrees — including
 when Cedar reads flattened `role.*` and CEL reads `subject.roles`, because the
 bridge filled both from the same set. A policy written against an **omitted
-scalar**, or against a flattened bool whose namespace was never written
-(`has(role.hr)` with no `role.*` keys), agrees only if CEL is rewritten onto
-the original set. Unguarded CEL is the `missing-collection` /
-`missing-subject-id` class of split.
+claim scalar** agrees on the verdict (all Deny) and is an `AgreeDeny` in
+`ppe-pdp-diff`; the cause still differs. A flattened bool whose namespace was
+never written (`has(role.hr)` with no `role.*` keys), or a missing
+`subject.id`, is the `missing-collection` / `missing-subject-id` class of
+split.
 
 ---
 
@@ -185,7 +191,9 @@ These are not `agent.*`. `agent.*` is session context.
 | `<ns>.selectors` | StringSet | always |
 | `<ns>.client_id` | String | `Some` |
 
-`attested_at` is not in the bag: APL has no datetime type.
+`attested_at` is not in the bag. `request.timestamp` and
+`completion.created_at` are carried as plain strings, so the bag does not
+refuse timestamps; unifying the three is out of scope here.
 
 **Other**, written whenever the security slot itself is present:
 
@@ -194,6 +202,18 @@ These are not `agent.*`. `agent.*` is session context.
 | `auth_method` | String | `Some` |
 | `security.labels` | StringSet | always |
 | `security.classification` | String | `Some` |
+
+`security.objects` and `security.data` are not in the bag. Both live on
+`SecurityExtension`, and `filter_extensions` copies them to every plugin
+(unrestricted sub-fields). The bridge does not flatten
+`ObjectSecurityProfile` or `DataPolicy` (`apply_labels`, `allowed_actions`,
+`denied_actions`, `retention`). Plugins that need them read the typed slot.
+The static `data:` payload tree (`data.*` keys) is a different source; see
+[Payloads that are not slots](#payloads-that-are-not-slots).
+
+`capability_namespaces` maps `read_*` capabilities to bag prefixes. `read_labels`
+unlocks `security.labels`; `read_workload` unlocks `caller_workload.*` and
+`this_workload.*`. Nothing writes a `workload.*` prefix.
 
 ### 2. `delegation` — `DelegationExtension`
 

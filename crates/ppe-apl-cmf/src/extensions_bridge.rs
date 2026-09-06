@@ -78,10 +78,10 @@ pub fn extract_extensions(ext: &Extensions, bag: &mut AttributeBag) {
 mod tests {
     use super::*;
     use praxis_policy_core::extensions::{
-        AgentExtension, ClientExtension, CompletionExtension, ConversationContext,
+        AgentExtension, ClientExtension, CompletionExtension, ConversationContext, DataPolicy,
         DelegationExtension, FrameworkExtension, HttpExtension, LLMExtension, MCPExtension,
-        MetaExtension, ProvenanceExtension, RequestExtension, SecurityExtension, SubjectExtension,
-        WorkloadIdentity,
+        MetaExtension, ObjectSecurityProfile, ProvenanceExtension, RequestExtension,
+        RetentionPolicy, SecurityExtension, SubjectExtension, WorkloadIdentity,
     };
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
@@ -267,5 +267,59 @@ mod tests {
             !bag.set_contains("subject.roles", "admin"),
             "a name missing from the set must not appear as a flattened true"
         );
+    }
+
+    #[test]
+    fn objects_and_data_stay_off_the_bag() {
+        // `docs/cmf-extensions.md`: security.objects / security.data are
+        // typed-slot only. filter_extensions copies them unrestricted;
+        // extract_extensions does not flatten them. Distinct from the
+        // static `data:` payload tree.
+        let mut objects = HashMap::new();
+        objects.insert(
+            "file".into(),
+            ObjectSecurityProfile {
+                managed_by: Some("alice".into()),
+                permissions: vec!["read".into()],
+                trust_domain: Some("td".into()),
+                data_scope: vec!["pii".into()],
+            },
+        );
+        let mut data = HashMap::new();
+        data.insert(
+            "ssn".into(),
+            DataPolicy {
+                apply_labels: vec!["PII".into()],
+                allowed_actions: Some(vec!["read".into()]),
+                denied_actions: vec!["delete".into()],
+                retention: Some(RetentionPolicy {
+                    max_age_seconds: Some(86_400),
+                    policy: "keep-1d".into(),
+                    delete_after: Some("2030-01-01".into()),
+                }),
+            },
+        );
+        let mut ext = Extensions::default();
+        ext.security = Some(Arc::new(SecurityExtension {
+            objects,
+            data,
+            ..Default::default()
+        }));
+        let bag = bag_of(ext);
+        assert!(
+            bag.contains("security.labels"),
+            "the security slot itself must still be bridged"
+        );
+        for (key, _) in bag.iter() {
+            assert!(
+                !key.contains("objects")
+                    && !key.starts_with("security.data")
+                    && key != "apply_labels"
+                    && key != "allowed_actions"
+                    && key != "denied_actions"
+                    && key != "retention",
+                "unbridged security.objects / security.data leaked into the bag as {key}"
+            );
+        }
     }
 }

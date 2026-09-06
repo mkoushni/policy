@@ -26,8 +26,9 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   document is the per-type absent-value contract, which key a policy author
   should write, why there is no `subject.claims` map in the bag, and a
   catalog of every key each slot emits. `ppe-pdp-diff` checks that a
-  present-empty set Denies on APL, CEL, cedar-direct, and OPA; unguarded
-  probes of omitted scalars stay on the allowlist. ([#18](https://github.com/praxis-proxy/policy/issues/18))
+  present-empty set and an omitted claim scalar Deny on APL, CEL,
+  cedar-direct, and OPA; a flattened bool with no namespace, and a missing
+  `subject.id`, stay on the allowlist. ([#18](https://github.com/praxis-proxy/policy/issues/18))
 
 ## [0.2.0] - 2026-09-03
 

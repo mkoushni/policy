@@ -147,7 +147,13 @@ mod tests {
 
     #[test]
     fn absent_value_agreement_cases_check_apl() {
-        for name in ["empty-set", "bridge-empty-teams", "bridge-empty-roles"] {
+        for name in [
+            "empty-set",
+            "bridge-empty-teams",
+            "bridge-empty-roles",
+            "missing-claim-string",
+            "missing-claim-int",
+        ] {
             let case = catalog()
                 .into_iter()
                 .find(|c| c.name == name)
