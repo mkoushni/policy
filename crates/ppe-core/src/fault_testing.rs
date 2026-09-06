@@ -242,16 +242,18 @@ pub fn expected_plugin_verdict(mode: PluginMode, failure: InjectedFailure) -> Ex
         },
         PluginMode::Transform | PluginMode::Audit => match failure {
             InjectedFailure::None => ExpectedVerdict::Allow,
-            InjectedFailure::Error | InjectedFailure::Hang | InjectedFailure::Panic | InjectedFailure::WrongType => {
-                ExpectedVerdict::Continue {
-                    record_code: failure.record_code(),
-                }
+            InjectedFailure::Error
+            | InjectedFailure::Hang
+            | InjectedFailure::Panic
+            | InjectedFailure::WrongType => ExpectedVerdict::Continue {
+                record_code: failure.record_code(),
             },
         },
         PluginMode::FireAndForget => match failure {
-            InjectedFailure::None | InjectedFailure::Error | InjectedFailure::Hang | InjectedFailure::WrongType => {
-                ExpectedVerdict::Allow
-            },
+            InjectedFailure::None
+            | InjectedFailure::Error
+            | InjectedFailure::Hang
+            | InjectedFailure::WrongType => ExpectedVerdict::Allow,
             InjectedFailure::Panic => ExpectedVerdict::AllowThenBackgroundPanic,
         },
     }
