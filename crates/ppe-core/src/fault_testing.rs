@@ -39,6 +39,9 @@ pub enum InjectedFailure {
     Hang,
     /// `panic!` inside the handler.
     Panic,
+    /// Boxed the wrong `Any` type, so [`crate::executor::extract_erased`]
+    /// returns None. A deny that cannot be read must not become Allow.
+    WrongType,
 }
 
 impl InjectedFailure {
@@ -47,7 +50,7 @@ impl InjectedFailure {
     pub const fn halt_code(self) -> Option<&'static str> {
         match self {
             Self::None => None,
-            Self::Error => Some("plugin_error"),
+            Self::Error | Self::WrongType => Some("plugin_error"),
             Self::Hang => Some("plugin_timeout"),
             Self::Panic => Some("plugin_panic"),
         }
@@ -56,7 +59,7 @@ impl InjectedFailure {
     /// `PluginErrorRecord.code` when the phase continues and records.
     pub const fn record_code(self) -> Option<&'static str> {
         match self {
-            Self::None | Self::Error => None,
+            Self::None | Self::Error | Self::WrongType => None,
             Self::Hang => Some("timeout"),
             Self::Panic => Some("panic"),
         }
@@ -110,6 +113,7 @@ impl AnyHookHandler for FaultHandler {
                 Ok(erase_result(PluginResult::<FaultPayload>::allow()))
             },
             InjectedFailure::Panic => panic!("injected panic inside a plugin"),
+            InjectedFailure::WrongType => Ok(Box::new(0_u8)),
             InjectedFailure::None => Ok(erase_result(PluginResult::<FaultPayload>::allow())),
         }
     }
@@ -238,14 +242,14 @@ pub fn expected_plugin_verdict(mode: PluginMode, failure: InjectedFailure) -> Ex
         },
         PluginMode::Transform | PluginMode::Audit => match failure {
             InjectedFailure::None => ExpectedVerdict::Allow,
-            InjectedFailure::Error | InjectedFailure::Hang | InjectedFailure::Panic => {
+            InjectedFailure::Error | InjectedFailure::Hang | InjectedFailure::Panic | InjectedFailure::WrongType => {
                 ExpectedVerdict::Continue {
                     record_code: failure.record_code(),
                 }
             },
         },
         PluginMode::FireAndForget => match failure {
-            InjectedFailure::None | InjectedFailure::Error | InjectedFailure::Hang => {
+            InjectedFailure::None | InjectedFailure::Error | InjectedFailure::Hang | InjectedFailure::WrongType => {
                 ExpectedVerdict::Allow
             },
             InjectedFailure::Panic => ExpectedVerdict::AllowThenBackgroundPanic,

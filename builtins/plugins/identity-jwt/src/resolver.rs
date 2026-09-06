@@ -41,6 +41,7 @@
 //   * `auth.audience_mismatch` — `aud` didn't include any configured aud
 //   * `auth.algorithm_mismatch` — token uses unaccepted algo
 //   * `auth.mapping_failed` — claim mapper rejected the claims
+//   * `auth.config_error` — issuer config was emptied after load (`audiences`)
 //   * `auth.token_invalid` — any other validation failure
 
 use std::sync::Arc;
@@ -469,6 +470,7 @@ impl Plugin for JwtIdentityResolver {
                     TrustedIssuer {
                         issuer: cfg.issuer.clone(),
                         audiences: cfg.audiences.clone(),
+                        skip_audience_validation: cfg.skip_audience_validation,
                         keys: Arc::new(std::sync::RwLock::new(KeyStore::empty())),
                         algorithms: cfg.algorithms.clone(),
                         leeway_seconds: cfg.leeway_seconds,
@@ -822,6 +824,18 @@ impl HookHandler<IdentityHook> for JwtIdentityResolver {
                     ),
                 ));
             },
+            Err(ValidateError::NoAudiences) => {
+                return PluginResult::deny(PluginViolation::new(
+                    "auth.config_error",
+                    format!(
+                        "issuer '{iss}' lists no audiences and did not set \
+                         skip_audience_validation, so a token minted for any \
+                         app would be accepted; this is a configuration fault \
+                         discovered at request time because `audiences` is a \
+                         public field, not a problem with the token"
+                    ),
+                ));
+            },
             Err(ValidateError::Jwt(e)) => {
                 let (code, reason) = classify_jwt_error(&e);
                 return PluginResult::deny(PluginViolation::new(code, reason));
@@ -992,6 +1006,12 @@ enum ValidateError {
     /// list as "accept any algorithm" would let an attacker pick the algorithm,
     /// which is the classic JWT confusion attack.
     NoAlgorithms,
+    /// The issuer carries no audiences and did not opt out of `aud`
+    /// checking. Same class as [`NoAlgorithms`]: an empty list read as
+    /// "any audience is acceptable" accepts a token minted for another
+    /// app. Config load rejects this; the variant exists because
+    /// `audiences` is a public field.
+    NoAudiences,
     /// jsonwebtoken's own validation outcome (signature, exp,
     /// nbf, iss, aud, algorithm).
     Jwt(jsonwebtoken::errors::Error),
@@ -1054,11 +1074,18 @@ fn validate_token(
     } else {
         issuer.leeway_seconds
     };
-    if issuer.audiences.is_empty() {
+    if issuer.skip_audience_validation {
         validation.validate_aud = false;
+    } else if issuer.audiences.is_empty() {
+        return Err(ValidateError::NoAudiences);
     } else {
         let aud_refs: Vec<&str> = issuer.audiences.iter().map(String::as_str).collect();
         validation.set_audience(&aud_refs);
+        // jsonwebtoken only checks `aud` when the claim is present.
+        // `set_required_spec_claims` replaces the set (default is `exp`),
+        // so `exp` and `iss` stay required alongside `aud`. A token with
+        // no audience is then a missing-claim error, not a pass.
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
     }
     decode::<ClaimMap>(token, key, &validation).map_err(ValidateError::Jwt)
 }
@@ -1071,6 +1098,7 @@ fn classify_jwt_error(e: &jsonwebtoken::errors::Error) -> (&'static str, String)
         ErrorKind::InvalidSignature => "auth.signature_invalid",
         ErrorKind::ImmatureSignature => "auth.token_not_yet_valid",
         ErrorKind::InvalidAudience => "auth.audience_mismatch",
+        ErrorKind::MissingRequiredClaim(c) if c == "aud" => "auth.audience_mismatch",
         ErrorKind::InvalidIssuer => "auth.untrusted_issuer",
         ErrorKind::InvalidAlgorithm | ErrorKind::InvalidAlgorithmName => "auth.algorithm_mismatch",
         ErrorKind::Base64(_) | ErrorKind::Json(_) => "auth.malformed_header",
@@ -1107,6 +1135,7 @@ mod tests {
             ValidateError::UnknownKid(kid) => format!("UnknownKid({kid:?})"),
             ValidateError::KeysUnavailable => "KeysUnavailable".to_owned(),
             ValidateError::NoAlgorithms => "NoAlgorithms".to_owned(),
+            ValidateError::NoAudiences => "NoAudiences".to_owned(),
             ValidateError::Jwt(inner) => format!("Jwt({inner})"),
         }
     }
@@ -1131,7 +1160,8 @@ mod tests {
     fn empty_algorithm_list_rejects_the_token() {
         let issuer = TrustedIssuer {
             issuer: "https://idp.example".into(),
-            audiences: vec![],
+            audiences: vec!["test-aud".into()],
+            skip_audience_validation: false,
             keys: std::sync::Arc::new(std::sync::RwLock::new(KeyStore::single_fallback(
                 jsonwebtoken::DecodingKey::from_secret(b"secret"),
             ))),
@@ -1149,6 +1179,62 @@ mod tests {
             "an empty algorithm list must surface as NoAlgorithms, not as a \
              signature or kid failure that hides the configuration fault"
         );
+    }
+
+    /// Same class as [`empty_algorithm_list_rejects_the_token`]: emptying
+    /// `audiences` after a valid build must not turn into "any `aud` is
+    /// acceptable".
+    #[test]
+    fn empty_audience_list_rejects_the_token() {
+        let issuer = TrustedIssuer {
+            issuer: "https://idp.example".into(),
+            audiences: vec![],
+            skip_audience_validation: false,
+            keys: std::sync::Arc::new(std::sync::RwLock::new(KeyStore::single_fallback(
+                jsonwebtoken::DecodingKey::from_secret(b"secret"),
+            ))),
+            algorithms: vec![jsonwebtoken::Algorithm::HS256],
+            leeway_seconds: 0,
+            source: crate::config::DecodingKeySource::Secret { secret: "k".into() },
+            refresh: crate::trusted_issuer::RefreshGate::default(),
+        };
+        let token = jwt_with_payload(r#"{"iss":"https://idp.example","sub":"alice"}"#);
+
+        let err = validate_token(&token, &issuer)
+            .expect_err("an issuer with no audiences cannot skip aud checking");
+        assert!(
+            matches!(err, ValidateError::NoAudiences),
+            "an empty audience list must surface as NoAudiences, got {}",
+            variant_of(&err)
+        );
+    }
+
+    /// Config load rejects this; the runtime path is a fallback because
+    /// `audiences` is a public field. The deny code is a config fault, not
+    /// an authentication failure on the token.
+    #[tokio::test]
+    async fn emptied_audiences_after_load_deny_as_config_error() {
+        let resolver = resolver_on_header("authorization");
+        {
+            let mut issuers = resolver.trusted_issuers.write().unwrap();
+            let current = &issuers[0];
+            let replacement = TrustedIssuer {
+                issuer: current.issuer.clone(),
+                audiences: vec![],
+                skip_audience_validation: false,
+                keys: Arc::clone(&current.keys),
+                algorithms: current.algorithms.clone(),
+                leeway_seconds: current.leeway_seconds,
+                source: current.source.clone(),
+                refresh: crate::trusted_issuer::RefreshGate::default(),
+            };
+            issuers[0] = Arc::new(replacement);
+        }
+        let payload = IdentityPayload::new(
+            jwt_with_payload(r#"{"iss":"https://idp.example","sub":"alice"}"#),
+            TokenSource::Bearer,
+        );
+        assert_eq!(deny_code_for(&resolver, payload).await, "auth.config_error");
     }
 
     #[test]
@@ -1186,6 +1272,7 @@ mod tests {
         let mut config = json!({
             "trusted_issuers": [{
                 "issuer": "https://idp.example.com",
+                "audiences": ["test-aud"],
                 "algorithms": ["HS256"],
                 "decoding_key": { "kind": "secret", "secret": "x" },
             }],
@@ -1239,10 +1326,11 @@ mod tests {
         }
     }
 
-    /// The same hole one level down, and this one is a validation bypass rather
-    /// than a surprise: `audiences` is defaulted and an empty list turns audience
-    /// checking off, so a misspelling would silently accept a token minted for
-    /// any audience.
+    /// The same hole one level down: `audiences` is defaulted, and a
+    /// misspelling used to deserialize as an empty list that turned
+    /// audience checking off. Unknown keys are rejected so that cannot
+    /// happen; an omitted list is refused at load unless
+    /// `skip_audience_validation` is set.
     #[test]
     fn new_rejects_a_misspelled_issuer_key_rather_than_dropping_audience_validation() {
         let err = format!(
@@ -1275,6 +1363,7 @@ mod tests {
                     "algorithms": ["HS256"],
                     "decoding_key": { "kind": "secret", "secret": "x" },
                     "leeway_seconds": 30,
+                    "skip_audience_validation": false,
                 }],
                 "role": "client",
                 "header": "X-Client-Token",
@@ -1688,7 +1777,7 @@ mod tests {
     /// send. Failing at load turns both into a gateway that refuses to start.
     #[test]
     fn each_malformed_config_is_refused_at_load_with_a_message_naming_the_fault() {
-        let cases: [(&str, Value, &str); 5] = [
+        let cases: [(&str, Value, &str); 8] = [
             (
                 "trusted_issuers is not a list",
                 json!({ "trusted_issuers": "https://idp.example" }),
@@ -1699,6 +1788,7 @@ mod tests {
                 json!({
                     "trusted_issuers": [{
                         "issuer": "https://idp.example",
+                        "audiences": ["test-aud"],
                         "algorithms": [],
                         "decoding_key": { "kind": "secret", "secret": "x" },
                     }],
@@ -1706,10 +1796,35 @@ mod tests {
                 "at least one algorithm",
             ),
             (
+                "an issuer entry lists no audiences",
+                json!({
+                    "trusted_issuers": [{
+                        "issuer": "https://idp.example",
+                        "algorithms": ["HS256"],
+                        "decoding_key": { "kind": "secret", "secret": "x" },
+                    }],
+                }),
+                "at least one audience",
+            ),
+            (
+                "skip_audience_validation together with a list",
+                json!({
+                    "trusted_issuers": [{
+                        "issuer": "https://idp.example",
+                        "audiences": ["test-aud"],
+                        "skip_audience_validation": true,
+                        "algorithms": ["HS256"],
+                        "decoding_key": { "kind": "secret", "secret": "x" },
+                    }],
+                }),
+                "skip_audience_validation",
+            ),
+            (
                 "an issuer's decoding key cannot be built",
                 json!({
                     "trusted_issuers": [{
                         "issuer": "https://idp.example",
+                        "audiences": ["test-aud"],
                         "algorithms": ["RS256"],
                         "decoding_key": { "kind": "pem", "pem": "not a pem document" },
                     }],
@@ -1721,6 +1836,7 @@ mod tests {
                 json!({
                     "trusted_issuers": [{
                         "issuer": "https://idp.example",
+                        "audiences": ["test-aud"],
                         "algorithms": ["HS256"],
                         "decoding_key": { "kind": "secret", "secret": "x" },
                     }],
@@ -1733,12 +1849,25 @@ mod tests {
                 json!({
                     "trusted_issuers": [{
                         "issuer": "https://idp.example",
+                        "audiences": ["test-aud"],
                         "algorithms": ["HS256"],
                         "decoding_key": { "kind": "secret", "secret": "x" },
                     }],
                     "header": "   ",
                 }),
                 "non-empty HTTP header name",
+            ),
+            (
+                "an issuer entry lists an empty audiences array",
+                json!({
+                    "trusted_issuers": [{
+                        "issuer": "https://idp.example",
+                        "audiences": [],
+                        "algorithms": ["HS256"],
+                        "decoding_key": { "kind": "secret", "secret": "x" },
+                    }],
+                }),
+                "at least one audience",
             ),
         ];
 
@@ -1867,6 +1996,94 @@ mod tests {
                 .map(|t| t.token.as_str()),
             Some(token.as_str()),
             "the stash is keyed by the configured role"
+        );
+    }
+
+    /// Omitting `audiences` used to disable `aud` checking, the same
+    /// class as an empty algorithm list. `skip_audience_validation` is
+    /// the explicit hatch: a token minted for another app is accepted.
+    #[tokio::test]
+    async fn skip_audience_validation_accepts_a_token_minted_for_another_app() {
+        let resolver = JwtIdentityResolver::new(cfg_with_config(
+            "jwt",
+            json!({
+                "trusted_issuers": [{
+                    "issuer": "https://idp.example",
+                    "skip_audience_validation": true,
+                    "algorithms": ["HS256"],
+                    "decoding_key": { "kind": "secret", "secret": "test-secret" },
+                }],
+                "role": "user",
+            }),
+        ))
+        .expect("skip_audience_validation is the hatch for no aud check");
+        let token = sign_with(
+            b"test-secret",
+            &valid_claims(json!({ "aud": "some-other-api" })),
+        );
+        let result = result_for(&resolver, &token).await;
+        assert!(
+            result.continue_processing,
+            "an explicit skip must accept any aud: {:?}",
+            result.violation
+        );
+    }
+
+    /// jsonwebtoken only checks `aud` when the claim is present. A
+    /// configured list used to pass a token that simply omitted it.
+    #[tokio::test]
+    async fn a_token_with_no_aud_claim_is_refused() {
+        let resolver = resolver_on_header("authorization");
+        let token = sign_with(
+            b"test-secret",
+            &json!({
+                "iss": "https://idp.example",
+                "sub": "alice",
+                "exp": seconds_from_now(3_600),
+            }),
+        );
+        let r = result_for(&resolver, &token).await;
+        assert!(
+            !r.continue_processing,
+            "a token with no aud must not pass a configured list: {:?}",
+            r.violation
+        );
+        assert_eq!(
+            r.violation.expect("deny carries a violation").code,
+            "auth.audience_mismatch"
+        );
+    }
+
+    /// The hatch's documented meaning is any `aud`, or none. Requiring
+    /// the claim on the default path must not leak onto this one.
+    #[tokio::test]
+    async fn skip_audience_validation_accepts_a_token_with_no_aud_claim() {
+        let resolver = JwtIdentityResolver::new(cfg_with_config(
+            "jwt",
+            json!({
+                "trusted_issuers": [{
+                    "issuer": "https://idp.example",
+                    "skip_audience_validation": true,
+                    "algorithms": ["HS256"],
+                    "decoding_key": { "kind": "secret", "secret": "test-secret" },
+                }],
+                "role": "user",
+            }),
+        ))
+        .expect("skip_audience_validation is the hatch for no aud check");
+        let token = sign_with(
+            b"test-secret",
+            &json!({
+                "iss": "https://idp.example",
+                "sub": "alice",
+                "exp": seconds_from_now(3_600),
+            }),
+        );
+        let result = result_for(&resolver, &token).await;
+        assert!(
+            result.continue_processing,
+            "the hatch accepts a token with no aud: {:?}",
+            result.violation
         );
     }
 
@@ -2043,7 +2260,8 @@ mod tests {
     fn an_issuer_with_no_keys_reports_unavailable_rather_than_blaming_the_token() {
         let issuer = TrustedIssuer {
             issuer: "https://idp.example".into(),
-            audiences: vec![],
+            audiences: vec!["test-aud".into()],
+            skip_audience_validation: false,
             keys: std::sync::Arc::new(std::sync::RwLock::new(KeyStore::empty())),
             algorithms: vec![jsonwebtoken::Algorithm::HS256],
             leeway_seconds: 0,
@@ -2067,7 +2285,8 @@ mod tests {
     fn a_token_whose_kid_matches_no_key_is_reported_as_an_unknown_kid() {
         let issuer = TrustedIssuer {
             issuer: "https://idp.example".into(),
-            audiences: vec![],
+            audiences: vec!["test-aud".into()],
+            skip_audience_validation: false,
             keys: std::sync::Arc::new(std::sync::RwLock::new(KeyStore::from_jwks_entries([(
                 "key-1".to_owned(),
                 jsonwebtoken::DecodingKey::from_secret(b"test-secret"),
