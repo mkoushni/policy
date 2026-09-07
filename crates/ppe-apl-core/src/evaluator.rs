@@ -553,8 +553,8 @@ pub(crate) const PDP_EVALUATE_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// The timeout wraps the resolver future *inside* the spawn, matching
 /// the plugin executor's `invoke_contained`. Wrapping the `JoinHandle`
-/// `JoinHandle` from outside would detach the task when the budget
-/// fires, and a hung PDP would keep running.
+/// from outside would detach the task when the budget fires, and a hung
+/// PDP would keep running.
 async fn evaluate_pdp_contained(
     pdp: &Arc<dyn PdpResolver>,
     call: &crate::step::PdpCall,
