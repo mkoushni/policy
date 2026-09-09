@@ -71,6 +71,14 @@ were already there.
 | `client.roles` | `client.role.<name> = true` | Same. |
 | `client.permissions` | `client.perm.<name> = true` | Same. |
 
+The set is the primary form. The five flattened collections exist because
+`require(role.hr)` predates the original sets; no more are added. Nine
+other `StringSet`s are set-only — `client.teams`,
+`client.authorized_scopes`, `client.authorized_audiences`,
+`caller_workload.selectors`, `this_workload.selectors`, `security.labels`,
+`agent.conversation.topics`, `meta.tags`, `llm.capabilities` — so
+`require(tag.pii)` is false forever, by design.
+
 **Authors should use the original set** for membership (`subject.roles contains
 "hr"` in APL, `"hr" in subject.roles` in CEL, `"hr" in input.subject.roles` in
 OPA). That key is present whenever the subject (or client) sub-record is, so

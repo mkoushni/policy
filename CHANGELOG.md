@@ -35,11 +35,12 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 - Added PPE documentation ([#82](https://github.com/praxis-proxy/policy/pull/82))
 
-### Changed
+### Fixed
 
 - **`read_labels` / `read_workload` bag prefixes.** `capability_namespaces`
-  maps `read_labels` to `security.labels` (the key the extractors write)
-  and `read_workload` to `caller_workload.*` / `this_workload.*`.
+  advertised nothing for `read_labels` and `workload.*` for `read_workload`,
+  neither of which the extractors write. It now returns `security.labels`
+  and `caller_workload.*` / `this_workload.*`.
 
 ### Removed
 
