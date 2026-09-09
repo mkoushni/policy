@@ -67,7 +67,13 @@ praxis-policy-orchestration = { workspace = true }
 [dev-dependencies]
 # Integration tests (`tests/`) compile against the library without
 # `cfg(test)`, so they need the feature to see `fault_testing`.
-praxis-policy-core = { workspace = true, features = ["test-util"] }
+# Path-only rather than `workspace = true`, because the workspace entry carries a
+# version requirement and a self dev-dependency cannot satisfy one: at package
+# time cargo resolves the requirement against the registry, where this version
+# does not exist yet, so `cargo package` fails before anything is uploaded.
+# Cargo drops a dev-dependency that names no version from the published manifest,
+# which is correct here: no consumer builds this crate's tests.
+praxis-policy-core = { path = ".", features = ["test-util"] }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-util = { workspace = true }
 

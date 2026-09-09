@@ -30,9 +30,14 @@ timeout before panic was contained in every phase:
 
 That difference is deliberate. Transform and audit cannot halt: a
 redactor or a logger that panics must not become an enforcement point,
-and must not skip the rest of the pipeline by unwinding. Fire-and-forget
-cannot block by construction. Sequential and concurrent *are*
-enforcement points, so fail-closed means deny.
+and must not skip the rest of the pipeline by unwinding. **A transform
+that fails under `on_error: fail` therefore continues with the original,
+unredacted payload** — the panic, error, timeout, or unreadable result
+is recorded on `PipelineResult.errors`, `payload_modified` stays false,
+and later phases see the bytes the redactor did not rewrite. That is
+the configured non-blocking policy, not a fail-open hole in sequential
+enforcement. Fire-and-forget cannot block by construction. Sequential
+and concurrent *are* enforcement points, so fail-closed means deny.
 
 There is no `PluginMode::Ref`. Audit is the read-only serial phase,
 dispatched through `run_ref_phase`. Containing panics there is the
@@ -45,13 +50,16 @@ audit cell.
 **I1. A plugin panic is contained in every dispatch phase.** It does not
 unwind `execute()`. Sequential and concurrent with `on_error: fail`
 deny with code `plugin_panic`. Transform and audit continue and record
-code `panic`. Fire-and-forget allows; after `wait_for_background_tasks`
-the panic is an error, not a test unwind. A sequential panic under
-`on_error: ignore` still runs later audit; a sequential panic under
-`on_error: fail` does not.
+code `panic`. A transform failure leaves the original payload in place
+(`payload_modified` is false). Fire-and-forget allows; after
+`wait_for_background_tasks` the panic is an error, not a test unwind. A
+sequential panic under `on_error: ignore` still runs later audit; a
+sequential panic under `on_error: fail` does not.
 Tests: `plugin_fault_catalog_asserts_the_safe_verdict`,
-`a_contained_serial_panic_under_ignore_still_runs_audit`, and
-`a_serial_fail_panic_does_not_run_audit` in
+`a_contained_serial_panic_under_ignore_still_runs_audit`,
+`a_serial_fail_panic_does_not_run_audit`,
+`a_transform_fail_panic_keeps_the_original_payload`, and
+`a_contained_serial_panic_keeps_prior_local_state` in
 `crates/ppe-core/tests/safety_invariants.rs`.
 
 **I2. A plugin error is fail-closed in blocking phases.** Sequential and
@@ -137,10 +145,11 @@ harness dialects.
 ## Catalog
 
 Plugin axis, `on_error: fail`, one cell per
-`{Sequential, Transform, Audit, Concurrent, FireAndForget} × {panic, error, timeout}`
+`{Sequential, Transform, Audit, Concurrent, FireAndForget} × {panic, error, timeout, wrong-type}`
 plus a `None` control per mode. Each cell asserts the decision (deny
 with a named code, or continue with a named record, or allow plus the
 background-task observation), not merely that no allow was returned.
+Audit discards handler results, so `WrongType` is allow there.
 
 PDP axis, one cell per `{cedar, cel, opa} × {panic, error, timeout}`
 plus a `None` control, missing-attribute, and malformed policy.

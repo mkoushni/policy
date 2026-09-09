@@ -255,6 +255,151 @@ async fn a_contained_serial_panic_under_ignore_still_runs_audit() {
     let _ = bg.wait_for_background_tasks().await;
 }
 
+/// Transform cannot halt. A panic under `on_error: fail` records the
+/// failure and continues with the original payload — redaction did not
+/// apply. That is the documented non-blocking policy.
+#[tokio::test]
+async fn a_transform_fail_panic_keeps_the_original_payload() {
+    let tracker = tokio_util::task::TaskTracker::new();
+    let entry = fault_entry(
+        "redactor",
+        PluginMode::Transform,
+        OnError::Fail,
+        InjectedFailure::Panic,
+    );
+    let (result, bg) = catalog_executor()
+        .execute(
+            std::slice::from_ref(&entry),
+            Box::new(TestPayload {
+                value: "unredacted".into(),
+            }),
+            Extensions::default(),
+            None,
+            &tracker,
+        )
+        .await;
+    assert!(
+        result.continue_processing,
+        "transform on_error:fail must not halt"
+    );
+    assert!(result.violation.is_none());
+    assert_eq!(result.errors.len(), 1);
+    assert_eq!(result.errors[0].code.as_deref(), Some("panic"));
+    assert!(
+        !result.payload_modified,
+        "a failed transform must not report a rewrite"
+    );
+    let payload = result
+        .modified_payload
+        .as_ref()
+        .expect("an allowed pipeline carries the payload");
+    let typed = payload
+        .as_any()
+        .downcast_ref::<TestPayload>()
+        .expect("original TestPayload type");
+    assert_eq!(
+        typed.value, "unredacted",
+        "the original payload continues after a transform panic"
+    );
+    let _ = bg.wait_for_background_tasks().await;
+}
+
+/// A contained serial panic must not drop `local_state` written on an
+/// earlier hook. Snapshot-and-commit leaves the previous map in the
+/// table when the task returns no context.
+#[tokio::test]
+async fn a_contained_serial_panic_keeps_prior_local_state() {
+    use std::sync::atomic::AtomicUsize;
+
+    use async_trait::async_trait;
+    use praxis_policy_core::context::PluginContext;
+    use praxis_policy_core::error::PluginError;
+    use praxis_policy_core::executor::erase_result;
+    use praxis_policy_core::hooks::PluginResult;
+    use praxis_policy_core::hooks::payload::PluginPayload;
+    use praxis_policy_core::plugin::PluginConfig;
+    use praxis_policy_core::registry::{AnyHookHandler, HookEntry, PluginRef};
+
+    struct WriteThenPanic(AtomicUsize);
+
+    #[async_trait]
+    impl AnyHookHandler for WriteThenPanic {
+        async fn invoke(
+            &self,
+            _payload: &dyn PluginPayload,
+            _extensions: &Extensions,
+            ctx: &mut PluginContext,
+        ) -> Result<Box<dyn std::any::Any + Send + Sync>, Box<PluginError>> {
+            let n = self.0.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                ctx.set_local("seen", serde_json::json!(true));
+                return Ok(erase_result(PluginResult::<TestPayload>::allow()));
+            }
+            panic!("injected panic on second invoke");
+        }
+
+        fn hook_type_name(&self) -> &'static str {
+            "write-then-panic"
+        }
+    }
+
+    let cfg = PluginConfig {
+        name: "sticky".into(),
+        mode: PluginMode::Sequential,
+        on_error: OnError::Ignore,
+        ..Default::default()
+    };
+    let entry = HookEntry {
+        plugin_ref: std::sync::Arc::new(PluginRef::new(
+            std::sync::Arc::new(praxis_policy_core::fault_testing::FaultPlugin(cfg.clone())),
+            cfg,
+        )),
+        handler: std::sync::Arc::new(WriteThenPanic(AtomicUsize::new(0))),
+    };
+    let tracker = tokio_util::task::TaskTracker::new();
+    let (first, bg1) = catalog_executor()
+        .execute(
+            std::slice::from_ref(&entry),
+            test_payload(),
+            Extensions::default(),
+            None,
+            &tracker,
+        )
+        .await;
+    assert!(first.continue_processing);
+    let plugin_id = entry.plugin_ref.id();
+    assert_eq!(
+        first.context_table.local_states.get(&plugin_id),
+        Some(&std::collections::HashMap::from([(
+            "seen".into(),
+            serde_json::json!(true)
+        )])),
+        "first invoke must commit local_state"
+    );
+    let _ = bg1.wait_for_background_tasks().await;
+
+    let (second, bg2) = catalog_executor()
+        .execute(
+            std::slice::from_ref(&entry),
+            test_payload(),
+            Extensions::default(),
+            Some(first.context_table),
+            &tracker,
+        )
+        .await;
+    assert!(second.continue_processing, "ignore must not halt");
+    assert_eq!(second.errors.len(), 1);
+    assert_eq!(
+        second.context_table.local_states.get(&plugin_id),
+        Some(&std::collections::HashMap::from([(
+            "seen".into(),
+            serde_json::json!(true)
+        )])),
+        "panic must not drop the previous local_state"
+    );
+    let _ = bg2.wait_for_background_tasks().await;
+}
+
 /// Fail-closed serial panic is a deny. Later audit does not run; the
 /// violation is the record.
 #[tokio::test]

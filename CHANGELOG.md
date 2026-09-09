@@ -27,10 +27,21 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   their own cells. Serial and audit panics are contained the same way concurrent
   already was: they route through `on_error` instead of unwinding `execute()`.
   Transform and audit still cannot halt — that difference is written down with
-  the reason. Adding a phase or a shipped dialect without a cell fails the
+  the reason, including that a failed transform continues with the original
+  payload. Adding a phase or a shipped dialect without a cell fails the
   build. ([#24](https://github.com/praxis-proxy/policy/issues/24))
 
 - Added PPE documentation ([#82](https://github.com/praxis-proxy/policy/pull/82))
+
+### Fixed
+
+- **`ppe-core` self-dev-dependency is path-only.** Same as `ppe-apl-core`: a
+  versioned workspace self-dep cannot be packaged (`make publish-dry`).
+- **Contained plugin and PDP tasks abort on drop.** Cancelling a request
+  (timeout, disconnect, shutdown) no longer leaves the spawned work running.
+- **Serial/transform panics keep prior `local_state`.** The executor snapshots
+  context into the task so a contained panic does not remove the plugin's
+  existing map.
 
 ## [0.2.0] - 2026-09-03
 

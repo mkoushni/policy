@@ -66,8 +66,14 @@ impl InjectedFailure {
     }
 
     /// Every injected failure the catalog drives, including the control.
-    pub const fn all() -> [Self; 4] {
-        [Self::None, Self::Error, Self::Hang, Self::Panic]
+    pub const fn all() -> [Self; 5] {
+        [
+            Self::None,
+            Self::Error,
+            Self::Hang,
+            Self::Panic,
+            Self::WrongType,
+        ]
     }
 }
 
@@ -240,13 +246,24 @@ pub fn expected_plugin_verdict(mode: PluginMode, failure: InjectedFailure) -> Ex
             None => ExpectedVerdict::Allow,
             Some(code) => ExpectedVerdict::Halt { code },
         },
-        PluginMode::Transform | PluginMode::Audit => match failure {
+        PluginMode::Transform => match failure {
             InjectedFailure::None => ExpectedVerdict::Allow,
             InjectedFailure::Error
             | InjectedFailure::Hang
             | InjectedFailure::Panic
             | InjectedFailure::WrongType => ExpectedVerdict::Continue {
                 record_code: failure.record_code(),
+            },
+        },
+        PluginMode::Audit => match failure {
+            // Audit discards the handler result, so a wrong boxed type is
+            // a successful invoke with nothing to apply — not a recorded
+            // failure.
+            InjectedFailure::None | InjectedFailure::WrongType => ExpectedVerdict::Allow,
+            InjectedFailure::Error | InjectedFailure::Hang | InjectedFailure::Panic => {
+                ExpectedVerdict::Continue {
+                    record_code: failure.record_code(),
+                }
             },
         },
         PluginMode::FireAndForget => match failure {

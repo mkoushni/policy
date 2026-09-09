@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::timeout;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, warn};
 
 use crate::context::{PluginContext, PluginContextTable};
@@ -80,6 +81,10 @@ enum ContainedOutcome {
 ///
 /// The payload is cloned into the task because `tokio::spawn` needs
 /// `'static`. Concurrent already cloned; this matches it.
+///
+/// The join handle aborts on drop. If the request is cancelled (timeout,
+/// disconnect, shutdown) the plugin task is cancelled instead of running
+/// detached until its inner timeout fires.
 async fn invoke_contained(
     handler: Arc<dyn AnyHookHandler>,
     payload: Box<dyn PluginPayload>,
@@ -87,14 +92,14 @@ async fn invoke_contained(
     mut ctx: PluginContext,
     timeout_dur: Duration,
 ) -> ContainedOutcome {
-    let handle = tokio::spawn(async move {
+    let handle = AbortOnDropHandle::new(tokio::spawn(async move {
         let result = timeout(
             timeout_dur,
             handler.invoke(&*payload, &extensions, &mut ctx),
         )
         .await;
         (result, ctx)
-    });
+    }));
     match handle.await {
         Ok((Ok(Ok(value)), ctx)) => ContainedOutcome::Success(value, ctx),
         Ok((Ok(Err(err)), ctx)) => ContainedOutcome::Error(err, ctx),
@@ -508,11 +513,12 @@ impl Executor {
             let plugin_id = entry.plugin_ref.id();
             let on_error = entry.plugin_ref.trusted_config().on_error;
 
-            // Take this plugin's context out of the table — pulls its stored
+            // Snapshot this plugin's context — clones its stored
             // local_state and seeds global_state from the canonical store.
-            // Replaces the previous values().last() seed, which was
-            // non-deterministic across HashMap iteration orders.
-            let ctx = ctx_table.take_context(plugin_id);
+            // Take-and-commit would drop that local_state if the task
+            // panics (no context comes back). Snapshot leaves the previous
+            // map in the table until a successful store.
+            let ctx = ctx_table.snapshot_context(plugin_id);
 
             // Filter extensions per plugin based on declared capabilities.
             // Produces a filtered view with None for ungated slots.
@@ -861,7 +867,8 @@ impl Executor {
             // Commit this plugin's context back to the table — replaces the
             // canonical global_state with its (possibly modified) copy and
             // stores the local_state for the next hook invocation. A panic
-            // drops the task, so there is no context to merge.
+            // or lost task returns no context; the snapshot above left the
+            // previous local_state in the table.
             if let Some(ctx) = ctx_after {
                 ctx_table.store_context(plugin_id, ctx);
             }

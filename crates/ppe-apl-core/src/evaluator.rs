@@ -547,6 +547,16 @@ enum EffectOutcome {
 /// Thirty seconds matches the plugin executor's default per-plugin budget.
 pub(crate) const PDP_EVALUATE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Abort `handle` if the surrounding future is dropped before join
+/// completes. A finished task is a no-op abort.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Spawn the resolver call so a panic or hang cannot unwind or stall the
 /// phase. Both map to `PdpError::Dispatch`, which `Effect::Pdp` already
 /// turns into a fail-closed deny.
@@ -554,7 +564,8 @@ pub(crate) const PDP_EVALUATE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The timeout wraps the resolver future *inside* the spawn, matching
 /// the plugin executor's `invoke_contained`. Wrapping the `JoinHandle`
 /// from outside would detach the task when the budget fires, and a hung
-/// PDP would keep running.
+/// PDP would keep running. The handle itself aborts on drop so a
+/// cancelled request does not leave the resolver running.
 async fn evaluate_pdp_contained(
     pdp: &Arc<dyn PdpResolver>,
     call: &crate::step::PdpCall,
@@ -566,6 +577,8 @@ async fn evaluate_pdp_contained(
     let join = tokio::spawn(async move {
         tokio::time::timeout(PDP_EVALUATE_TIMEOUT, pdp.evaluate(&call, &bag)).await
     });
+    let abort = join.abort_handle();
+    let _abort_on_drop = AbortOnDrop(abort);
     match join.await {
         Ok(Ok(result)) => result,
         Ok(Err(_)) => Err(crate::step::PdpError::Dispatch("PDP timed out".into())),
