@@ -10,7 +10,7 @@
 //!
 //! The semantic subset and the known-divergence allowlist are documented in
 //! this crate's `README.md`. The CMF absent-value contract those cases
-//! check is `docs/cmf-extensions.md`. The catalog and allowlist here are
+//! check is `docs/content/cmf-extensions.md`. The catalog and allowlist here are
 //! the executable form.
 
 /// Factory `kind:` strings this harness drives.
@@ -166,6 +166,23 @@ mod tests {
     }
 
     #[test]
+    fn allowlisted_apl_splits_check_apl() {
+        for case in catalog() {
+            if let Expect::Diverge(id) = case.expect {
+                let entry = allowlist_by_id(id)
+                    .unwrap_or_else(|| panic!("case '{}': unknown allowlist id '{id}'", case.name));
+                if entry.apl_allows.is_some() {
+                    assert!(
+                        case.apl_rule.is_some(),
+                        "case '{}' cites '{id}' with an APL verdict; it needs apl_rule",
+                        case.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn harness_kinds_match_drivers() {
         let mut from_const: Vec<&str> = HARNESS_PDP_KINDS.to_vec();
         let mut from_enum: Vec<&str> = Dialect::all().iter().map(|d| d.kind()).collect();
@@ -258,6 +275,9 @@ mod tests {
                     "case '{}': opa vs allowlist '{id}'; got {opa_detail}",
                     case.name
                 );
+                if let Some(want_allow) = entry.apl_allows {
+                    assert_apl(case, want_allow);
+                }
             },
         }
     }

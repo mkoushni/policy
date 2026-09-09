@@ -68,6 +68,8 @@ pub(crate) fn catalog() -> Vec<Case> {
         missing_subject_id(),
         missing_claim_string(),
         missing_claim_int(),
+        missing_claim_not_eq(),
+        missing_not_in(),
     ]
 }
 
@@ -467,5 +469,42 @@ fn missing_claim_int() -> Case {
             },
         ),
         "require(claim.depth <= 2)",
+    )
+}
+
+fn missing_claim_not_eq() -> Case {
+    // APL `!=` on a missing key is true, so require does not fire (Allow).
+    // CEL / Cedar eval-error Deny; OPA default-deny. Documented split.
+    with_apl(
+        case(
+            "missing-claim-not-eq",
+            alice(),
+            r#"principal.claims.tenant != "acme""#,
+            r#"claim.tenant != "acme""#,
+            r#"allow if input.claim.tenant != "acme""#,
+            false,
+            Expect::Diverge("missing-claim-not-eq"),
+        ),
+        r#"require(claim.tenant != "acme")"#,
+    )
+}
+
+fn missing_not_in() -> Case {
+    // APL `not in` on a missing set is true, so require Allows. CEL has no
+    // `blocked_types` namespace (eval error). Cedar has no free
+    // `blocked_types` key; the nearest missing-set denylist is a missing
+    // claim set, which is also an eval error. OPA `not (x in y)` on
+    // undefined `y` is true, so OPA Allows with APL.
+    with_apl(
+        case(
+            "missing-not-in",
+            alice(),
+            "!(principal.claims.blocked.contains(principal.type))",
+            "!(subject.type in blocked_types)",
+            "allow if not (input.subject.type in input.blocked_types)",
+            false,
+            Expect::Diverge("missing-not-in"),
+        ),
+        "require(subject.type not in blocked_types)",
     )
 }

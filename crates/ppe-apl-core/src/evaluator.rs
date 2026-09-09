@@ -2233,9 +2233,10 @@ mod tests {
 
     #[test]
     fn missing_key_matches_cmf_extensions_table() {
-        // `docs/cmf-extensions.md` "What each decision point does with a
+        // `docs/content/cmf-extensions.md` "What each decision point does with a
         // missing key" — APL row. Presence, equality, membership, and
-        // order are false; `!=` is true; `!key` is true.
+        // order are false. Every negated form is true: `!=`, `!key`,
+        // `!(...)`, and `not in`.
         let bag = AttributeBag::new();
         assert!(!eval_pred("authenticated", &bag));
         assert!(!eval_pred(r#"subject.id == "alice""#, &bag));
@@ -2249,11 +2250,26 @@ mod tests {
             eval_pred("!authenticated", &bag),
             "negation of an absent key is true"
         );
+        assert!(
+            eval_pred(r#"!(subject.id == "alice")"#, &bag),
+            "`!(...)` of a missing comparison is true"
+        );
+        assert!(
+            eval_pred("subject.type not in blocked_types", &bag),
+            "`not in` on a missing set is true"
+        );
         let rule = crate::parser::parse_rule("require(authenticated)", "test")
             .expect("require(authenticated) parses");
         assert!(
             matches!(evaluate_rules(&[rule], &bag), Decision::Deny { .. }),
             "require(authenticated) fires on an empty bag"
+        );
+        let denylist =
+            crate::parser::parse_rule("require(subject.type not in blocked_types)", "test")
+                .expect("require(not in) parses");
+        assert!(
+            matches!(evaluate_rules(&[denylist], &bag), Decision::Allow),
+            "require(subject.type not in blocked_types) Allows: missing-key `not in` is true, so require does not fire"
         );
     }
 

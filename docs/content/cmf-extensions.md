@@ -32,8 +32,8 @@ missing slots is out of scope.
 |---|---|---|
 | `StringSet` | **Present and empty.** Membership is false. | CEL treats a missing key as an evaluation error. `!("banned" in subject.roles)` would deny every subject with no roles — a routine state, including a plugin that lacks `read_roles` and is handed an empty set. |
 | `Bool` as a real field (`delegation.delegated`) | **Present**, including `false`. | The field is not optional on the struct. |
-| `Bool` as a flattened member (`role.hr`) | **Omitted.** Presence means true. | Emitting `false` for every name that is not a member is impossible. APL reads a missing flattened bool as false; CEL needs `has(role.hr) && role.hr`. |
-| `Bool` derived (`authenticated`) | **Omitted** unless `subject.id` is set. | Absence is "not authenticated" in APL (`!authenticated` is true; `require(authenticated)` denies). That is not settled for CEL: on a bridge-built bag with a security slot and no `subject.id`, both `authenticated` and `!authenticated` are `Undeclared reference to 'authenticated'`, and `has(authenticated)` is a compile error (`has()` rejects a bare name). `CelResolver` routes compile errors through `compile_error_decision`, which always fails closed and does not consult `on_error`. There is no CEL guard an author can deploy, so "allow anonymous reads" is not expressible there; the deny reaches the operator as a key error. Contrast `delegation.delegated`, a non-option field that is always written, including `false`. |
+| `Bool` as a flattened member (`role.hr`) | **Omitted.** Presence means true. | Emitting `false` for every name that is not a member is impossible. APL reads a missing flattened bool as false. Do not guard CEL with `has(role.hr)`: when no `role.*` keys exist the `role` namespace was never written, and `has(role.hr)` is an evaluation error. Use the always-present `subject.roles` set (`"hr" in subject.roles`). |
+| `Bool` derived (`authenticated`) | **Omitted** unless `subject.id` is set. | Absence is "not authenticated" in APL (`!authenticated` is true; `require(authenticated)` denies). `has(authenticated)` is a compile error (`has()` rejects a bare name), so that key itself cannot be guarded in CEL. When the `subject` namespace exists — a present subject writes empty `subject.roles` / `permissions` / `teams` even with no id — `has(subject.id)` is a valid substitute. Only a completely absent subject (no `subject.*` keys) leaves CEL with no guard; the deny then reaches the operator as a key error. Contrast `delegation.delegated`, a non-option field that is always written, including `false`. |
 | `String` | **Omitted** when `Option::None`. A non-option string (`client.client_id`) is always written, even if empty. | Empty string and missing are different questions (`exists(subject.id)` vs `subject.id == ""`). |
 | `Int` | **Omitted** when `Option::None` (`http.status`, `agent.turn`, `completion.latency_ms`). A non-option int (`delegation.depth`) is always written, including `0`. | Emitting `0` for an unset HTTP status would make `http.status >= 500` and `http.status == 0` both lie. |
 | `Float` | Same as `Int`. `delegation.age_seconds` is non-option and always written, including `0.0`. | Same reason: a missing telemetry field is not zero. |
@@ -42,11 +42,16 @@ missing slots is out of scope.
 `ppe-pdp-diff` is the executable form of this table for the keys Cedar can
 see. Empty `subject.teams` and a subject with no roles (no `role.*` keys,
 empty `subject.roles`) must Deny on APL, CEL, cedar-direct, and OPA when the
-policy is a membership or flattened-bool gate. Unguarded probes of an
-**omitted claim scalar** also Deny on all four (CEL and Cedar report a key
-error rather than a policy false). A flattened bool whose namespace was
-never written, and a missing `subject.id`, remain allowlisted: CEL is an
-eval error, Cedar cannot build a principal without an id, and making those
+policy is a membership or flattened-bool gate. Unguarded **presence,
+equality, membership, and order** probes of an omitted claim scalar also
+Deny on all four (CEL and Cedar report a key error rather than a policy
+false). That agreement does **not** cover APL `!=` or `not in`: those
+evaluate true on a missing key, so `require(claim.tenant != "acme")`
+Allows in APL while CEL, cedar-direct, and OPA Deny. `not in` Allows in
+APL (and in OPA, where `not` of undefined is true) while CEL and
+cedar-direct Deny. A flattened bool whose namespace was never
+written, and a missing `subject.id`, remain allowlisted: CEL is an eval
+error, Cedar cannot build a principal without an id, and making those
 agree needs CEL root seeding and a generated Cedar schema, which is a
 follow-up to [#18](https://github.com/praxis-proxy/policy/issues/18).
 
@@ -125,19 +130,34 @@ read.
 
 | Engine | Missing key | Empty `StringSet` |
 |---|---|---|
-| APL | false for presence, equality, membership, and order; `!=` is true (an absent key is not equal to a value, matching `!(x == y)`). Negation is the other exception: `!key` is true (`deny when not authenticated` is the idiom). | `contains` / `in` is false |
+| APL | false for presence, equality, membership, and order. Every negated form is true: `!=`, `!key`, `!(...)`, and `not in`. Negation is spelled `!`; `not` is reserved for the `not in` phrase, so the idiom is `!authenticated`. | `contains` / `in` is false |
 | CEL | evaluation error; default `OnError::Deny` turns it into a denial that reports a key error, not a policy false | `in` is false |
-| cedar-direct | empty `roles` / `permissions` / `teams` / `claims` on the principal so those names exist; no `subject.id` is a dispatch error | `contains` is false |
-| OPA | undefined; without `default allow := false` the query is a default deny | `in` is false |
+| cedar-direct | empty `roles` / `permissions` / `teams` / `claims` on the principal so those names exist; no `subject.id` is a dispatch error. A missing `subject.type` defaults to `User` (PascalCase). The bridge writes lowercase (`user` / `agent` / `service` / `system`), so a type-scoped policy (`principal is user` vs `User`) can miss a principal whose type was omitted. | `contains` is false |
+| OPA | undefined; without `default allow := false` the query is a default deny. `not` of undefined is true, so a denylist written `not (x in y)` Allows when `y` is missing. | `in` is false |
+
+`require` inverts its predicate and denies when that inversion is true, so
+the APL row above splits `require` on a missing key:
+
+| Rule (omitted keys) | APL | Other engines |
+|---|---|---|
+| `require(claim.tenant == "acme")` | Deny | Deny |
+| `require(subject.roles contains "hr")` | Deny | Deny |
+| `require(claim.tenant != "acme")` | Allow | Deny |
+| `require(subject.type not in blocked_types)` | Allow | CEL and cedar-direct Deny. OPA Allows: `not` of an undefined set is true. |
+
+Authors who need the denylist to stay closed when the key is missing write
+`require(exists(claim.tenant) & claim.tenant != "acme")`.
 
 A policy written against a **present-empty set** therefore agrees — including
 when Cedar reads flattened `role.*` and CEL reads `subject.roles`, because the
 bridge filled both from the same set. A policy written against an **omitted
-claim scalar** agrees on the verdict (all Deny) and is an `AgreeDeny` in
-`ppe-pdp-diff`; the cause still differs. A flattened bool whose namespace was
-never written (`has(role.hr)` with no `role.*` keys), or a missing
-`subject.id`, is the `missing-collection` / `missing-subject-id` class of
-split.
+claim scalar** agrees on the verdict (all Deny) for `==`, order, and
+membership, and is an `AgreeDeny` in `ppe-pdp-diff`; the cause still differs.
+`!=` and `not in` do **not** agree across all four engines: they are
+`missing-claim-not-eq` / `missing-not-in` on the allowlist. A flattened bool
+whose namespace was never written (unguarded CEL `role.hr` with no `role.*`
+keys), or a missing `subject.id`, is the `missing-collection` /
+`missing-subject-id` class of split.
 
 ---
 
@@ -154,7 +174,7 @@ map has no entry.
 | Key | Type | When |
 |---|---|---|
 | `subject.id` | String | `id` is `Some` |
-| `subject.type` | String (`user` / `agent` / `service` / `system`) | `subject_type` is `Some` |
+| `subject.type` | String (`user` / `agent` / `service` / `system`) | `subject_type` is `Some`. cedar-direct, given no key, still builds a principal typed `User`; bridged values are lowercase. |
 | `subject.roles` | StringSet | always |
 | `role.<name>` | Bool (`true`) | each member of `roles` |
 | `subject.permissions` | StringSet | always |
@@ -363,9 +383,9 @@ An empty map adds nothing.
 These use the same walker and the same absent-value rules, but they are not
 `extract_extensions` slots:
 
-| Source | Prefix |
+| Source | Keys |
 |---|---|
-| Request arguments | `args.*` |
-| Upstream result | `result.*` |
-| Static `data:` tree | `data.*` |
+| Request arguments | Object fields: `args.<dotted>`. A top-level scalar is the key `args` (String / Bool / Int / Float). A top-level scalar array is `args` as a StringSet (empty included). A top-level array of objects or nested arrays sets nothing. `null` sets nothing. |
+| Upstream result | Same shapes under `result` / `result.<dotted>`. |
+| Static `data:` tree | Same walker under `data` / `data.<dotted>`. |
 | Route identifier | `route.key` |

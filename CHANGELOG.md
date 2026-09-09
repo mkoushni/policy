@@ -19,18 +19,33 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
-- **`docs/cmf-extensions.md`, the bag contract.** The CMF bridge writes twelve
-  extension slots into a flat `AttributeBag`, and until now the empty-set
+- **`docs/content/cmf-extensions.md`, the bag contract.** The CMF bridge writes
+  twelve extension slots into a flat `AttributeBag`, and until now the empty-set
   rule for `StringSet`, the original-vs-flattened role keys, and the
   `subject.claims` gap lived only as comments beside the extractors. The
   document is the per-type absent-value contract, which key a policy author
   should write, why there is no `subject.claims` map in the bag, and a
   catalog of every key each slot emits. `ppe-pdp-diff` checks that a
   present-empty set and an omitted claim scalar Deny on APL, CEL,
-  cedar-direct, and OPA; a flattened bool with no namespace, and a missing
-  `subject.id`, stay on the allowlist. ([#18](https://github.com/praxis-proxy/policy/issues/18))
+  cedar-direct, and OPA for presence, equality, membership, and order; APL
+  `!=` on a missing key Allows while the other engines Deny; APL `not in`
+  Allows with OPA (`not` of undefined is true) while CEL and cedar-direct
+  Deny. A flattened bool with no namespace, and a missing `subject.id`,
+  stay on the allowlist. ([#18](https://github.com/praxis-proxy/policy/issues/18))
 
 - Added PPE documentation ([#82](https://github.com/praxis-proxy/policy/pull/82))
+
+### Changed
+
+- **`read_labels` / `read_workload` bag prefixes.** `capability_namespaces`
+  maps `read_labels` to `security.labels` (the key the extractors write)
+  and `read_workload` to `caller_workload.*` / `this_workload.*`.
+
+### Removed
+
+- **`BAG_WORKLOAD_PREFIX`.** The unused public `workload.` constant is gone.
+  Extractors write `caller_workload.*` and `this_workload.*`; nothing
+  emitted `workload.*`.
 
 ## [0.2.0] - 2026-09-03
 
