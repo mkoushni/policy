@@ -131,8 +131,10 @@ Test: `every_dialect_malformed_policy_is_not_allow` in
 **I12. Adding a dispatch phase without a catalog cell fails the build.**
 `PluginMode` matches in `is_dispatch_phase`, `group_by_mode`,
 `all_plugin_modes`, and `expected_plugin_verdict` are exhaustive inside
-`ppe-core`. `plugin_fault_catalog_covers_every_dispatch_mode` checks
-that the catalog visits a mode iff `is_dispatch_phase` is true.
+`ppe-core`. That compile-time match is the guard.
+`plugin_fault_catalog_every_dispatch_mode_has_a_non_allow_cell` then
+asserts that every dispatched mode has at least one injected failure
+that is not Allow, so a new phase cannot land as all-Allow.
 
 **I13. Adding a shipped PDP dialect without a catalog cell fails the
 build.** `ppe-pdp-diff::drivers::Dialect::all` and the safety catalog

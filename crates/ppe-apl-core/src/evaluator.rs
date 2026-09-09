@@ -400,6 +400,8 @@ fn looks_like_attribute_ref(s: &str) -> bool {
 /// PDP / plugin errors map to a Deny with the error in the reason, per
 /// the design's fail-closed default. `evaluate_steps`
 /// is preserved as a deprecated alias that forwards here.
+///
+/// Requires a Tokio runtime: `Effect::Pdp` spawns the resolver call.
 #[allow(clippy::too_many_arguments)]
 pub async fn evaluate_effects(
     effects: &[Effect],

@@ -23,8 +23,8 @@ use std::sync::atomic::Ordering;
 use praxis_policy_core::config::parse_config;
 use praxis_policy_core::executor::{Executor, ExecutorConfig};
 use praxis_policy_core::fault_testing::{
-    ExpectedVerdict, InjectedFailure, all_plugin_modes, dispatch_modes, expected_plugin_verdict,
-    fault_entry, probe_entry,
+    ExpectedVerdict, InjectedFailure, dispatch_modes, expected_plugin_verdict, fault_entry,
+    probe_entry,
 };
 use praxis_policy_core::hooks::payload::{Extensions, PluginPayload};
 use praxis_policy_core::plugin::{OnError, PluginMode};
@@ -40,19 +40,15 @@ struct TestPayload {
 praxis_policy_core::impl_plugin_payload!(TestPayload);
 
 #[test]
-fn plugin_fault_catalog_covers_every_dispatch_mode() {
-    let modes = dispatch_modes();
-    for mode in all_plugin_modes() {
-        assert_eq!(
-            modes.contains(&mode),
-            mode.is_dispatch_phase(),
-            "{mode} must appear in the catalog iff it is a dispatch phase"
+fn plugin_fault_catalog_every_dispatch_mode_has_a_non_allow_cell() {
+    for mode in dispatch_modes() {
+        assert!(
+            InjectedFailure::all().iter().any(|&failure| {
+                expected_plugin_verdict(mode, failure) != ExpectedVerdict::Allow
+            }),
+            "{mode} must have at least one injected failure that is not Allow"
         );
     }
-    assert!(
-        !modes.is_empty(),
-        "the executor has at least one dispatch phase"
-    );
 }
 
 #[tokio::test(start_paused = true)]

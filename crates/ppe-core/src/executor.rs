@@ -24,6 +24,11 @@
 // on_error, the same way error and timeout already were. Fire-and-forget
 // panics are contained by spawn; they cannot change a verdict already
 // returned.
+//
+// Containment costs a payload clone per plugin per hook. Audit used to
+// take `&payload` and spawn nothing; it is no longer free. The spawn is
+// load-bearing: it carries the timeout and abort-on-drop cancellation
+// as well as the panic containment.
 
 use std::any::Any;
 use std::fmt;
@@ -80,7 +85,8 @@ enum ContainedOutcome {
 /// containment for the other awaited phases.
 ///
 /// The payload is cloned into the task because `tokio::spawn` needs
-/// `'static`. Concurrent already cloned; this matches it.
+/// `'static`. Concurrent already cloned; serial, transform, and audit
+/// now match it. Audit used to take `&payload` and spawn nothing.
 ///
 /// The join handle aborts on drop. If the request is cancelled (timeout,
 /// disconnect, shutdown) the plugin task is cancelled instead of running
@@ -480,8 +486,9 @@ impl Executor {
     ///
     /// The framework retains ownership of the payload. The handler runs
     /// on a spawned task so a panic cannot unwind [`Executor::execute`],
-    /// which means the payload is cloned into the task on every invoke.
-    /// Modified payloads in the result replace the current payload.
+    /// which means the payload is cloned into the task on every invoke
+    /// (sequential and transform). Modified payloads in the result
+    /// replace the current payload.
     ///
     /// `payload_modified` is set to `true` when a handler's payload is
     /// accepted, and never cleared — this is the only place that fact is
@@ -877,7 +884,12 @@ impl Executor {
         None // no denial
     }
 
-    /// Run a read-only phase — plugins receive &payload, results discarded.
+    /// Run a read-only phase — plugins receive `&payload` inside the task;
+    /// results are discarded.
+    ///
+    /// The handler still runs on a spawned task, so the payload is cloned
+    /// per plugin. Audit used to take `&payload` and spawn nothing; it
+    /// now pays the same containment cost as serial.
     async fn run_ref_phase(
         &self,
         entries: &[HookEntry],

@@ -6,8 +6,15 @@
 // This crate is the language nucleus. It does not depend on PPE directly;
 // the bridge from praxis-policy-core extensions into the AttributeBag lives in
 // `praxis-policy-apl-cmf`, and the `PolicyEvaluator` implementation lives in `praxis-policy-apl-runtime`.
+//
+// A Tokio runtime is required: `evaluate_pdp_contained` uses `tokio::spawn`.
 
-#![doc = "APL — Authorization Policy Language."]
+//! APL — Authorization Policy Language.
+//!
+//! A Tokio runtime is required. `evaluate_pdp_contained` uses
+//! `tokio::spawn`, which panics outside a runtime, so a host driving
+//! the evaluator on a non-Tokio executor unwinds out of
+//! `evaluate_effects` on every `Effect::Pdp` instead of failing closed.
 
 /// External attribute sources loaded at config time.
 pub mod attribute_source;
