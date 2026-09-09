@@ -135,15 +135,17 @@ mod tests {
         let mut bag = AttributeBag::new();
         extract_args(&json!("hello"), &mut bag);
         assert_eq!(bag.get_string("args"), Some("hello"));
-        assert!(!bag.contains("args."));
+        assert_eq!(bag.len(), 1);
 
         let mut bag = AttributeBag::new();
         extract_args(&json!(true), &mut bag);
         assert_eq!(bag.get_bool("args"), Some(true));
+        assert_eq!(bag.len(), 1);
 
         let mut bag = AttributeBag::new();
         extract_result(&json!(42), &mut bag);
         assert_eq!(bag.get_int("result"), Some(42));
+        assert_eq!(bag.len(), 1);
     }
 
     #[test]
