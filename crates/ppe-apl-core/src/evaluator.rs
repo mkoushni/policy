@@ -2233,10 +2233,10 @@ mod tests {
 
     #[test]
     fn missing_key_matches_cmf_extensions_table() {
-        // `docs/content/cmf-extensions.md` "What each decision point does with a
-        // missing key" — APL row. Presence, equality, membership, and
-        // order are false. Every negated form is true: `!=`, `!key`,
-        // `!(...)`, and `not in`.
+        tracing::debug!(
+            "docs/content/cmf-extensions.md — APL missing-key row: \
+             presence/equality/membership/order are false; negated forms are true"
+        );
         let bag = AttributeBag::new();
         assert!(!eval_pred("authenticated", &bag));
         assert!(!eval_pred(r#"subject.id == "alice""#, &bag));

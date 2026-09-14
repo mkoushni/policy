@@ -54,6 +54,7 @@ test-util = []
 
 [dev-dependencies]
 tokio = { workspace = true }
+tracing = { workspace = true }
 # Path-only rather than `workspace = true`, because the workspace entry carries a
 # version requirement and a self dev-dependency cannot satisfy one: at package
 # time cargo resolves the requirement against the registry, where this version
