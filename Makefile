@@ -183,7 +183,7 @@ audit:
 #
 # The coverage workflow calls this target rather than repeating the threshold, so
 # this is the only copy of the number.
-COVERAGE_FLOOR ?= 95
+COVERAGE_FLOOR ?= 96
 
 # `--all-features` reaches the test targets behind `test-util`, without which the
 # compiler's test scaffolding and everything it covers fall outside the floor.
@@ -192,11 +192,35 @@ COVERAGE_FLOOR ?= 95
 # Valkey at all. `VALKEY_TESTS_OPTIONAL=1` lets them skip instead of fail, because
 # this target measures and `make test` is what asserts. Set `VALKEY_TEST_URL` to
 # measure the paths that do need a server.
+#
+# Both coverage targets share these flags. A report built from a narrower run
+# understates what the floor asserted.
+COVERAGE_ARGS := --workspace --all-features
+COVERAGE_TEST_ARGS := -- --include-ignored
+
+# `clean` first: llvm-cov merges the mappings of every instrumented binary it
+# finds, so a stale one from a run with different features (or a cached target
+# dir in CI) is counted a second time, inflating both the line count and the
+# miss count.
 .PHONY: coverage
 coverage:
 	@command -v cargo-llvm-cov >/dev/null 2>&1 || $(CARGO) install cargo-llvm-cov --locked
-	@VALKEY_TESTS_OPTIONAL=1 cargo llvm-cov --workspace --all-features --summary-only \
-		--fail-under-lines $(COVERAGE_FLOOR) -- --include-ignored
+	@cargo llvm-cov clean --workspace
+	@VALKEY_TESTS_OPTIONAL=1 cargo llvm-cov $(COVERAGE_ARGS) --summary-only \
+		--fail-under-lines $(COVERAGE_FLOOR) $(COVERAGE_TEST_ARGS)
+
+# The floor plus an LCOV artifact from one test run, for CI. `--no-report`
+# measures once and both `report` calls read that data, so the artifact and the
+# gated number cannot diverge. LCOV comes first so a red gate still leaves a
+# report to diagnose. `report` takes no feature flags; it reads the object files
+# the run above built.
+.PHONY: coverage-lcov
+coverage-lcov:
+	@command -v cargo-llvm-cov >/dev/null 2>&1 || $(CARGO) install cargo-llvm-cov --locked
+	@cargo llvm-cov clean --workspace
+	@VALKEY_TESTS_OPTIONAL=1 cargo llvm-cov $(COVERAGE_ARGS) --no-report $(COVERAGE_TEST_ARGS)
+	@cargo llvm-cov report --lcov --output-path lcov.info
+	@cargo llvm-cov report --summary-only --fail-under-lines $(COVERAGE_FLOOR)
 
 # Mutation testing. Advisory, not part of the blocking CI gate.
 .PHONY: mutants
