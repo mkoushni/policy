@@ -254,7 +254,6 @@ impl VaultSecretProvider {
             .header("content-type", "application/json")
             .and_then(|r| r.header("X-Vault-Token", token))
             .map_err(transport_err)?;
-        let req = self.with_namespace(req)?;
         let response = self.send(req, RetryPolicy::none()).await?;
         let auth = parse_auth_payload(&response)?;
         VaultSession::from_auth(&auth, Instant::now())
