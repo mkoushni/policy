@@ -22,6 +22,7 @@
 //   - native fast-path, sync inside async outer
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::attributes::{AttributeBag, AttributeValue};
 use crate::pipeline::{Pipeline, ScanKind, Stage, TaintEvent, TaintScope, TypeCheck};
@@ -399,6 +400,8 @@ fn looks_like_attribute_ref(s: &str) -> bool {
 /// PDP / plugin errors map to a Deny with the error in the reason, per
 /// the design's fail-closed default. `evaluate_steps`
 /// is preserved as a deprecated alias that forwards here.
+///
+/// Requires a Tokio runtime: `Effect::Pdp` spawns the resolver call.
 #[allow(clippy::too_many_arguments)]
 pub async fn evaluate_effects(
     effects: &[Effect],
@@ -540,6 +543,56 @@ enum EffectOutcome {
     /// phase decision stays `Allow`; pending being non-empty is what
     /// blocks the forward (see [`PendingElicitation`]).
     Pending(crate::step::PendingElicitation),
+}
+
+/// Per-call budget for a PDP `evaluate`. A hang becomes a deny, not an allow.
+/// Thirty seconds matches the plugin executor's default per-plugin budget.
+pub(crate) const PDP_EVALUATE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Abort `handle` if the surrounding future is dropped before join
+/// completes. A finished task is a no-op abort.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Spawn the resolver call so a panic or hang cannot unwind or stall the
+/// phase. Both map to `PdpError::Dispatch`, which `Effect::Pdp` already
+/// turns into a fail-closed deny.
+///
+/// The timeout wraps the resolver future *inside* the spawn, matching
+/// the plugin executor's `invoke_contained`. Wrapping the `JoinHandle`
+/// from outside would detach the task when the budget fires, and a hung
+/// PDP would keep running. The handle itself aborts on drop so a
+/// cancelled request does not leave the resolver running.
+async fn evaluate_pdp_contained(
+    pdp: &Arc<dyn PdpResolver>,
+    call: &crate::step::PdpCall,
+    bag: &AttributeBag,
+) -> Result<crate::step::PdpDecision, crate::step::PdpError> {
+    let pdp = Arc::clone(pdp);
+    let call = call.clone();
+    let bag = bag.clone();
+    let join = tokio::spawn(async move {
+        tokio::time::timeout(PDP_EVALUATE_TIMEOUT, pdp.evaluate(&call, &bag)).await
+    });
+    let abort = join.abort_handle();
+    let _abort_on_drop = AbortOnDrop(abort);
+    match join.await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(crate::step::PdpError::Dispatch("PDP timed out".into())),
+        Err(join_err) => {
+            let message = if join_err.is_panic() {
+                format!("PDP task panicked: {join_err}")
+            } else {
+                format!("PDP task cancelled: {join_err}")
+            };
+            Err(crate::step::PdpError::Dispatch(message))
+        },
+    }
 }
 
 /// Run a single effect against the evaluator's state. Called by both
@@ -833,7 +886,7 @@ async fn dispatch_effect(
         } => {
             // External PDP call — replaces `Step::Pdp`. Reactions run
             // through the same dispatch_effect path (recursively).
-            match pdp.evaluate(call, bag).await {
+            match evaluate_pdp_contained(pdp, call, bag).await {
                 Ok(pdp_result) => match pdp_result.decision {
                     Decision::Allow => {
                         // Walk on_allow; if it ends without a Halt the
