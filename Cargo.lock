@@ -2378,6 +2378,7 @@ dependencies = [
  "praxis-policy-plugin-delegator-oauth",
  "praxis-policy-plugin-elicitation-ciba",
  "praxis-policy-plugin-identity-jwt",
+ "praxis-policy-secrets-vault",
  "praxis-policy-session-valkey",
  "rustls",
  "serde_json",
@@ -2598,6 +2599,21 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "praxis-policy-secrets-vault"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "praxis-policy-core",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tracing",
+ "zeroize",
 ]
 
 [[package]]

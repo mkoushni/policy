@@ -19,7 +19,20 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Vault KV v2 secret backend**, behind the `secrets-vault` facade
+  feature. A `kind: vault` provider reads `<mount>/<path>#<field>` through
+  the host `HttpTransport` (no Vault SDK). Auth is Kubernetes or AppRole,
+  with no default. Token renewal is lazy on the next read — nothing
+  spawns a ticker — and a `403` reauthenticates once. Written against
+  the Vault 1.19 KV v2 HTTP API.
+  ([#94](https://github.com/praxis-proxy/policy/issues/94))
+
 - Added PPE documentation ([#82](https://github.com/praxis-proxy/policy/pull/82))
+
+### Changed
+
+- `execute_with_retry` is public so a `SecretProvider` that holds a host
+  transport can use the same retry policy as plugins.
 
 ## [0.2.0] - 2026-09-03
 
