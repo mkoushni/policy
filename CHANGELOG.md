@@ -28,6 +28,13 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   ([#71](https://github.com/praxis-proxy/policy/pull/71))
 - Added Criterion benchmarks for hook dispatch, full decisions, throughput,
   PDP evaluation, and session memory. ([#35](https://github.com/praxis-proxy/policy/pull/35))
+- **Vault KV v2 secret backend**, behind the `secrets-vault` facade
+  feature. A `kind: vault` provider reads `<mount>/<path>#<field>` through
+  the host `HttpTransport` (no Vault SDK). Auth is Kubernetes or AppRole,
+  with no default. Token renewal is lazy on the next read — nothing
+  spawns a ticker — and a `403` reauthenticates once. Written against
+  the Vault 1.19 KV v2 HTTP API.
+  ([#94](https://github.com/praxis-proxy/policy/issues/94))
 
 ### Changed
 
@@ -59,6 +66,11 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   ([#86](https://github.com/praxis-proxy/policy/pull/86))
 - Added multithreaded engine stress tests, a Loom memory-ordering model, and a
   nightly ThreadSanitizer job. ([#60](https://github.com/praxis-proxy/policy/pull/60))
+
+### Changed
+
+- `execute_with_retry` is public so a `SecretProvider` that holds a host
+  transport can use the same retry policy as plugins.
 
 ## [0.2.0] - 2026-09-03
 

@@ -25,6 +25,7 @@ members = [
     "builtins/pdps/cel",
     "builtins/pdps/opa",
     "builtins/session/valkey",
+    "builtins/secrets/vault",
     # Reference implementations, not published and not in the `builtins`
     # umbrella. Workspace members so they stay built, linted and tested, and so
     # they keep working as examples of an out-of-tree plugin. Each manifest says
@@ -54,6 +55,7 @@ default-members = [
     "builtins/pdps/cedar-direct",
     "builtins/pdps/cel",
     "builtins/pdps/opa",
+    "builtins/secrets/vault",
     # Reference implementations, not published and not in the `builtins`
     # umbrella. Workspace members so they stay built, linted and tested, and so
     # they keep working as examples of an out-of-tree plugin. Each manifest says
@@ -141,6 +143,7 @@ praxis-policy-pdp-cedar-direct         = { path = "builtins/pdps/cedar-direct", 
 praxis-policy-pdp-cel                  = { path = "builtins/pdps/cel",                 version = "0.3.0" }
 praxis-policy-pdp-opa                  = { path = "builtins/pdps/opa",                 version = "0.3.0" }
 praxis-policy-session-valkey           = { path = "builtins/session/valkey",           version = "0.3.0" }
+praxis-policy-secrets-vault            = { path = "builtins/secrets/vault",            version = "0.3.0" }
 
 # Criterion is only consumed by the unpublished `ppe-benches` crate (issue #19).
 # Kept in the workspace table so version bumps stay one-line.
