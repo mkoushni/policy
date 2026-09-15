@@ -38,7 +38,7 @@ const RENEW_AFTER_DEN: u32 = 3;
 const RENEW_JITTER_NUM: u32 = 1;
 const RENEW_JITTER_DEN: u32 = 10;
 
-/// Builds [`VaultSecretProvider`].
+/// Builds a Vault KV v2 [`SecretProvider`].
 pub struct VaultSecretProviderFactory {
     transport: Arc<dyn HttpTransport>,
 }
