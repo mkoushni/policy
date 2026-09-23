@@ -87,12 +87,12 @@ pub const BAG_SUBJECT_ID: &str = "subject.id";
 pub const BAG_SUBJECT_TYPE: &str = "subject.type";
 /// Bag key `subject.teams`.
 pub const BAG_SUBJECT_TEAMS: &str = "subject.teams";
-/// Bag key `subject.roles` — the full role set, mirroring the
-/// flattened `role.<name>` keys as one `StringSet` for `in`/`contains`
-/// membership tests (e.g. OPA `"hr" in input.subject.roles`).
+/// Bag key `subject.roles` — the full role set, with undotted members mirrored
+/// as flattened `role.<name>` keys, for `in`/`contains` membership tests (e.g.
+/// OPA `"hr" in input.subject.roles`).
 pub const BAG_SUBJECT_ROLES: &str = "subject.roles";
-/// Bag key `subject.permissions` — the full permission set, mirroring
-/// the flattened `perm.<name>` keys as one `StringSet`.
+/// Bag key `subject.permissions` — the full permission set, with undotted
+/// members mirrored as flattened `perm.<name>` keys.
 pub const BAG_SUBJECT_PERMISSIONS: &str = "subject.permissions";
 /// Bag key `authenticated`.
 pub const BAG_AUTHENTICATED: &str = "authenticated";
