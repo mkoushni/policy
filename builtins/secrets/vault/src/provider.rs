@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
@@ -57,18 +58,12 @@ impl SecretProviderFactory for VaultSecretProviderFactory {
     }
 
     fn build(&self, config: &SecretProviderConfig) -> Result<Arc<dyn SecretProvider>, SecretError> {
-        let settings = ValidatedSettings::from_parsed(&config.settings)?;
+        let settings = crate::config::VaultSettings::from_config(&config.settings)?;
         Ok(Arc::new(VaultSecretProvider {
             transport: Arc::clone(&self.transport),
             settings,
             session: Mutex::new(None),
         }))
-    }
-}
-
-impl ValidatedSettings {
-    fn from_parsed(settings: &serde_yaml::Value) -> Result<Self, SecretError> {
-        crate::config::VaultSettings::from_config(settings)
     }
 }
 
@@ -82,7 +77,7 @@ struct VaultSecretProvider {
 struct VaultSession {
     token: Zeroizing<String>,
     renewable: bool,
-    renew_at: Instant,
+    renew_at: Option<Instant>,
 }
 
 impl fmt::Debug for VaultSecretProvider {
@@ -103,12 +98,14 @@ impl fmt::Debug for VaultSession {
 }
 
 impl VaultSession {
-    fn from_auth(auth: &Value, now: Instant) -> Result<Self, SecretError> {
+    fn from_auth(auth: &Value, now: Instant, operation: &str) -> Result<Self, SecretError> {
         let token = auth
             .get("client_token")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| SecretError::backend("Vault login returned no client token"))?;
+            .ok_or_else(|| {
+                SecretError::backend(format!("Vault {operation} returned no client token"))
+            })?;
         let lease = auth
             .get("lease_duration")
             .and_then(Value::as_u64)
@@ -120,12 +117,12 @@ impl VaultSession {
         Ok(Self {
             token: Zeroizing::new(token.to_owned()),
             renewable,
-            renew_at: now + renew_after(Duration::from_secs(lease)),
+            renew_at: (lease > 0).then(|| now + renew_after(Duration::from_secs(lease))),
         })
     }
 
     fn needs_renewal(&self, now: Instant) -> bool {
-        now >= self.renew_at
+        self.renew_at.is_some_and(|renew_at| now >= renew_at)
     }
 }
 
@@ -218,7 +215,10 @@ impl VaultSecretProvider {
                 token_path,
             } => {
                 let jwt = read_service_account_token(token_path)?;
-                let body = json_string_object(&[("role", role.as_str()), ("jwt", jwt.as_str())]);
+                let body = json_login_body(&KubernetesLogin {
+                    role: role.as_str(),
+                    jwt: jwt.as_str(),
+                })?;
                 (mount.as_str(), body)
             },
             VaultAuth::Approle {
@@ -227,13 +227,14 @@ impl VaultSecretProvider {
                 secret_id,
             } => {
                 let secret_id = secret_id.read()?;
-                let body = json_string_object(&[
-                    ("role_id", role_id.as_str()),
-                    ("secret_id", secret_id.as_str()),
-                ]);
+                let body = json_login_body(&AppRoleLogin {
+                    role_id: role_id.as_str(),
+                    secret_id: secret_id.as_str(),
+                })?;
                 (mount.as_str(), body)
             },
         };
+        let operation = format!("login via auth mount `{mount}`");
         let bytes = Bytes::copy_from_slice(&body);
         drop(body);
         let path = format!("v1/auth/{mount}/login");
@@ -241,34 +242,39 @@ impl VaultSecretProvider {
             .send(
                 HttpRequest::post(self.url(&path), bytes)
                     .header("content-type", "application/json")
-                    .map_err(transport_err)?,
-                RetryPolicy::none(),
+                    .map_err(|err| transport_err(&operation, err))?,
+                RetryPolicy::undelivered_only(),
+                &operation,
             )
             .await?;
-        let auth = parse_auth_payload(&response)?;
-        VaultSession::from_auth(&auth, Instant::now())
+        let auth = parse_auth_payload(&response, &operation)?;
+        VaultSession::from_auth(&auth, Instant::now(), &operation)
     }
 
     async fn renew_self(&self, token: &str) -> Result<VaultSession, SecretError> {
+        let operation = "renew-self";
         let req = HttpRequest::post(self.url("v1/auth/token/renew-self"), Bytes::new())
             .header("content-type", "application/json")
             .and_then(|r| r.header("X-Vault-Token", token))
-            .map_err(transport_err)?;
-        let response = self.send(req, RetryPolicy::none()).await?;
-        let auth = parse_auth_payload(&response)?;
-        VaultSession::from_auth(&auth, Instant::now())
+            .map_err(|err| transport_err(operation, err))?;
+        let response = self.send(req, RetryPolicy::idempotent(), operation).await?;
+        let auth = parse_auth_payload(&response, operation)?;
+        VaultSession::from_auth(&auth, Instant::now(), operation)
     }
 
     async fn kv_read(&self, token: &str, kv: &KvRef) -> Result<Zeroizing<String>, ReadFault> {
+        let operation = format!("KV read `{}`", kv_ref_display(kv));
         let req = HttpRequest::get(self.url(&kv.kv_url_path()))
             .header("X-Vault-Token", token)
-            .map_err(|e| ReadFault::Failed(transport_err(e)))?;
-        let req = self.with_namespace(req).map_err(ReadFault::Failed)?;
+            .map_err(|e| ReadFault::Failed(transport_err(&operation, e)))?;
+        let req = self
+            .with_namespace(req, &operation)
+            .map_err(ReadFault::Failed)?;
         let response =
             match execute_with_retry(self.transport.as_ref(), req, RetryPolicy::idempotent()).await
             {
                 Ok(resp) => resp,
-                Err(err) => return Err(ReadFault::Failed(transport_err(err))),
+                Err(err) => return Err(ReadFault::Failed(transport_err(&operation, err))),
             };
         match response.status {
             200 => extract_field(&response.body, kv).map_err(ReadFault::Failed),
@@ -277,7 +283,11 @@ impl VaultSecretProvider {
                 "{}/{}#{}",
                 kv.mount, kv.path, kv.field
             )))),
-            other => Err(ReadFault::Failed(vault_status_error(other, &response.body))),
+            other => Err(ReadFault::Failed(vault_status_error(
+                &operation,
+                other,
+                &response.body,
+            ))),
         }
     }
 
@@ -289,9 +299,15 @@ impl VaultSecretProvider {
         )
     }
 
-    fn with_namespace(&self, req: HttpRequest) -> Result<HttpRequest, SecretError> {
+    fn with_namespace(
+        &self,
+        req: HttpRequest,
+        operation: &str,
+    ) -> Result<HttpRequest, SecretError> {
         match self.settings.namespace.as_deref() {
-            Some(ns) => req.header("X-Vault-Namespace", ns).map_err(transport_err),
+            Some(ns) => req
+                .header("X-Vault-Namespace", ns)
+                .map_err(|err| transport_err(operation, err)),
             None => Ok(req),
         }
     }
@@ -300,89 +316,69 @@ impl VaultSecretProvider {
         &self,
         req: HttpRequest,
         policy: RetryPolicy,
+        operation: &str,
     ) -> Result<HttpResponse, SecretError> {
-        let req = self.with_namespace(req)?;
+        let req = self.with_namespace(req, operation)?;
         execute_with_retry(self.transport.as_ref(), req, policy)
             .await
-            .map_err(transport_err)
+            .map_err(|err| transport_err(operation, err))
             .and_then(|resp| {
                 if resp.status == 200 {
                     Ok(resp)
                 } else {
-                    Err(vault_status_error(resp.status, &resp.body))
+                    Err(vault_status_error(operation, resp.status, &resp.body))
                 }
             })
     }
 }
 
-/// Object of string fields, held in a zeroizing buffer so login
-/// credentials do not linger in a `serde_json::Value`.
-fn json_string_object(fields: &[(&str, &str)]) -> Zeroizing<Vec<u8>> {
-    let mut out = Zeroizing::new(Vec::new());
-    out.push(b'{');
-    for (i, (k, v)) in fields.iter().enumerate() {
-        if i > 0 {
-            out.push(b',');
-        }
-        write_json_str(&mut out, k);
-        out.push(b':');
-        write_json_str(&mut out, v);
-    }
-    out.push(b'}');
-    out
+#[derive(Serialize)]
+struct KubernetesLogin<'a> {
+    role: &'a str,
+    jwt: &'a str,
 }
 
-fn write_json_str(out: &mut Vec<u8>, s: &str) {
-    out.push(b'"');
-    for &byte in s.as_bytes() {
-        match byte {
-            b'"' | b'\\' => {
-                out.push(b'\\');
-                out.push(byte);
-            },
-            b'\n' => out.extend_from_slice(br"\n"),
-            b'\r' => out.extend_from_slice(br"\r"),
-            b'\t' => out.extend_from_slice(br"\t"),
-            0x08 => out.extend_from_slice(br"\b"),
-            0x0c => out.extend_from_slice(br"\f"),
-            0x00..=0x1f => {
-                out.extend_from_slice(br"\u00");
-                out.push(hex_nibble(byte >> 4));
-                out.push(hex_nibble(byte & 0x0f));
-            },
-            _ => out.push(byte),
-        }
-    }
-    out.push(b'"');
+#[derive(Serialize)]
+struct AppRoleLogin<'a> {
+    role_id: &'a str,
+    secret_id: &'a str,
 }
 
-fn hex_nibble(n: u8) -> u8 {
-    match n {
-        0..=9 => b'0' + n,
-        10..=15 => b'a' + (n - 10),
-        _ => b'0',
-    }
+fn json_login_body<T: Serialize>(payload: &T) -> Result<Zeroizing<Vec<u8>>, SecretError> {
+    let mut out = Zeroizing::new(Vec::with_capacity(128));
+    serde_json::to_writer(&mut *out, payload)
+        .map_err(|err| SecretError::backend(format!("Vault login JSON encoding failed: {err}")))?;
+    Ok(out)
 }
 
-fn parse_auth_payload(response: &HttpResponse) -> Result<Value, SecretError> {
-    let root: Value = serde_json::from_slice(&response.body)
-        .map_err(|_json| SecretError::backend("Vault auth response was not JSON"))?;
+fn parse_auth_payload(response: &HttpResponse, operation: &str) -> Result<Value, SecretError> {
+    let root: Value = serde_json::from_slice(&response.body).map_err(|_json| {
+        SecretError::backend(format!("Vault {operation} response was not JSON"))
+    })?;
     root.get("auth")
         .cloned()
         .filter(Value::is_object)
-        .ok_or_else(|| SecretError::backend("Vault auth response had no auth object"))
+        .ok_or_else(|| {
+            SecretError::backend(format!("Vault {operation} response had no auth object"))
+        })
 }
 
 fn extract_field(body: &Bytes, kv: &KvRef) -> Result<Zeroizing<String>, SecretError> {
     let root: Value = serde_json::from_slice(body).map_err(|_json| {
         SecretError::malformed(kv_ref_display(kv), "Vault KV response was not JSON")
     })?;
-    let data = root
-        .pointer("/data/data")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            SecretError::malformed(kv_ref_display(kv), "Vault KV response had no data.data map")
-        })?;
+    let data_value = root.pointer("/data/data").ok_or_else(|| {
+        SecretError::malformed(kv_ref_display(kv), "Vault KV response had no data.data map")
+    })?;
+    if data_value.is_null() {
+        return Err(SecretError::not_found(kv_ref_display(kv)));
+    }
+    let data = data_value.as_object().ok_or_else(|| {
+        SecretError::malformed(
+            kv_ref_display(kv),
+            "Vault KV response data.data was not a map",
+        )
+    })?;
     match data.get(&kv.field) {
         None => Err(SecretError::malformed(
             kv_ref_display(kv),
@@ -415,15 +411,15 @@ fn vault_errors(body: &Bytes) -> Option<String> {
     }
 }
 
-fn vault_status_error(status: u16, body: &Bytes) -> SecretError {
+fn vault_status_error(operation: &str, status: u16, body: &Bytes) -> SecretError {
     match vault_errors(body) {
-        Some(errors) => SecretError::backend(format!("Vault HTTP {status}: {errors}")),
-        None => SecretError::backend(format!("Vault HTTP {status}")),
+        Some(errors) => SecretError::backend(format!("Vault {operation} HTTP {status}: {errors}")),
+        None => SecretError::backend(format!("Vault {operation} HTTP {status}")),
     }
 }
 
-fn transport_err(err: HttpTransportError) -> SecretError {
-    SecretError::backend(format!("Vault transport: {err}"))
+fn transport_err(operation: &str, err: HttpTransportError) -> SecretError {
+    SecretError::backend(format!("Vault {operation} transport: {err}"))
 }
 
 #[cfg(test)]
@@ -515,6 +511,19 @@ auth:
     }
 
     #[tokio::test]
+    async fn a_soft_deleted_kv_version_is_not_found() {
+        let http = FakeTransport::new()
+            .json("/auth/approle/login", 200, login_body())
+            .json("/data/deleted", 200, r#"{"data":{"data":null}}"#);
+        let p = provider(http, approle_yaml());
+        let err = p
+            .get_secret("secret/deleted#password")
+            .await
+            .expect_err("soft-deleted value");
+        assert!(matches!(err, SecretError::NotFound { .. }), "{err}");
+    }
+
+    #[tokio::test]
     async fn a_403_reauthenticates_once_and_retries() {
         let http = FakeTransport::new()
             .json("/auth/approle/login", 200, login_body())
@@ -553,6 +562,10 @@ auth:
             .await
             .expect_err("vault envelope");
         assert!(format!("{sealed}").contains("storage sealed"), "{sealed}");
+        assert!(
+            format!("{sealed}").contains("login via auth mount `approle`"),
+            "{sealed}"
+        );
 
         let transport = FakeTransport::new().fail(
             "/auth/approle/login",
@@ -564,11 +577,15 @@ auth:
             .await
             .expect_err("connect");
         assert!(format!("{refused}").contains("transport"), "{refused}");
+        assert!(
+            format!("{refused}").contains("login via auth mount `approle`"),
+            "{refused}"
+        );
     }
 
     #[tokio::test]
-    async fn a_zero_lease_renewable_token_renews_on_the_next_read() {
-        let login = r#"{"auth":{"client_token":"hvs.token","lease_duration":0,"renewable":true}}"#;
+    async fn a_short_lease_renewable_token_renews_on_the_next_read() {
+        let login = r#"{"auth":{"client_token":"hvs.token","lease_duration":1,"renewable":true}}"#;
         let renew =
             r#"{"auth":{"client_token":"hvs.renewed","lease_duration":3600,"renewable":true}}"#;
         let http = FakeTransport::new()
@@ -584,8 +601,30 @@ auth:
     }
 
     #[tokio::test]
+    async fn a_zero_lease_is_treated_as_non_expiring() {
+        let login = r#"{"auth":{"client_token":"hvs.token","lease_duration":0,"renewable":true}}"#;
+        let http = FakeTransport::new()
+            .json("/auth/approle/login", 200, login)
+            .json("/data/app", 200, &kv_body("password", "one"))
+            .json("/data/app", 200, &kv_body("password", "two"));
+        let transport = Arc::new(http);
+        let factory = VaultSecretProviderFactory::new(transport.clone());
+        let p = factory
+            .build(&SecretProviderConfig {
+                kind: KIND.to_owned(),
+                settings: serde_yaml::from_str(approle_yaml()).expect("yaml"),
+            })
+            .expect("build");
+        let first = p.get_secret("secret/app#password").await.expect("first");
+        let second = p.get_secret("secret/app#password").await.expect("second");
+        assert_eq!(first.as_str(), "one");
+        assert_eq!(second.as_str(), "two");
+        assert_eq!(transport.call_count_for("/auth/approle/login"), 1);
+    }
+
+    #[tokio::test]
     async fn a_non_renewable_token_logs_in_again_instead_of_renewing() {
-        let first = r#"{"auth":{"client_token":"hvs.one","lease_duration":0,"renewable":false}}"#;
+        let first = r#"{"auth":{"client_token":"hvs.one","lease_duration":1,"renewable":false}}"#;
         let second =
             r#"{"auth":{"client_token":"hvs.two","lease_duration":3600,"renewable":false}}"#;
         let http = FakeTransport::new()
@@ -647,7 +686,7 @@ auth:
             .json(
                 "/auth/kubernetes/login",
                 200,
-                r#"{"auth":{"client_token":"hvs.one","lease_duration":0,"renewable":false}}"#,
+                r#"{"auth":{"client_token":"hvs.one","lease_duration":1,"renewable":false}}"#,
             )
             .json(
                 "/auth/kubernetes/login",
@@ -667,6 +706,7 @@ auth:
             .expect("build");
         p.get_secret("secret/app#password").await.expect("first");
         std::fs::write(&token_path, "jwt-two\n").expect("rotate");
+        tokio::time::sleep(Duration::from_millis(700)).await;
         p.get_secret("secret/app#password").await.expect("second");
         let logins: Vec<String> = transport
             .requests()
@@ -683,9 +723,10 @@ auth:
 
     #[test]
     fn debug_does_not_print_tokens_or_secret_ids() {
-        let settings =
-            ValidatedSettings::from_parsed(&serde_yaml::from_str(approle_yaml()).expect("yaml"))
-                .expect("settings");
+        let settings = crate::config::VaultSettings::from_config(
+            &serde_yaml::from_str(approle_yaml()).expect("yaml"),
+        )
+        .expect("settings");
         let p = VaultSecretProvider {
             transport: Arc::new(FakeTransport::new()),
             settings,
@@ -724,13 +765,14 @@ auth:
     }
 
     #[tokio::test]
-    async fn a_login_connect_failure_is_not_retried() {
+    async fn a_login_connect_failure_is_retried() {
         let http = FakeTransport::new()
             .fail(
                 "/auth/approle/login",
                 HttpTransportError::Connect("refused".into()),
             )
-            .json("/auth/approle/login", 200, login_body());
+            .json("/auth/approle/login", 200, login_body())
+            .json("/data/app", 200, &kv_body("password", "hunter2"));
         let transport = Arc::new(http);
         let cloned = Arc::clone(&transport);
         let factory = VaultSecretProviderFactory::new(cloned);
@@ -740,15 +782,15 @@ auth:
                 settings: serde_yaml::from_str(approle_yaml()).expect("yaml"),
             })
             .expect("build");
-        let err = p
+        let value = p
             .get_secret("secret/app#password")
             .await
-            .expect_err("connect stands");
-        assert!(format!("{err}").contains("transport"), "{err}");
+            .expect("connect is retried");
+        assert_eq!(value.as_str(), "hunter2");
         assert_eq!(
             transport.call_count_for("/auth/approle/login"),
-            1,
-            "a connect failure on login must not mint a second token"
+            2,
+            "a connect failure is safe to retry because no request reached Vault"
         );
     }
 
@@ -873,9 +915,13 @@ auth:
 
     #[test]
     fn login_json_round_trips_and_escapes() {
-        let encoded = json_string_object(&[("role", "ppe"), ("jwt", "a\"b\\c")]);
+        let encoded = json_login_body(&KubernetesLogin {
+            role: "ppe",
+            jwt: "a\"b\\c\n\r\t\u{0008}\u{000c}\u{0001}",
+        })
+        .expect("json");
         let parsed: serde_json::Value = serde_json::from_slice(&encoded).expect("json");
         assert_eq!(parsed["role"], "ppe");
-        assert_eq!(parsed["jwt"], "a\"b\\c");
+        assert_eq!(parsed["jwt"], "a\"b\\c\n\r\t\u{0008}\u{000c}\u{0001}");
     }
 }

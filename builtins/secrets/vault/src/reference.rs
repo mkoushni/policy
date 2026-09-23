@@ -19,8 +19,9 @@ pub(crate) struct KvRef {
 }
 
 impl KvRef {
-    /// Parse `reference`. The last `#` starts the field so a path may
-    /// contain `#` (unusual) without eating the field.
+    /// Parse `reference`. The last `#` starts the field. Path characters are
+    /// encoded when the URL is built, so unusual names cannot become URI
+    /// syntax.
     pub(crate) fn parse(reference: &str) -> Result<Self, SecretError> {
         let (left, field) = reference.rsplit_once('#').ok_or_else(|| {
             SecretError::reference(reference, "expected `<mount>/<path>#<field>`")
@@ -61,7 +62,35 @@ impl KvRef {
 
     /// Path on the Vault origin, including the KV v2 `/data/` infix.
     pub(crate) fn kv_url_path(&self) -> String {
-        format!("v1/{}/data/{}", self.mount, self.path)
+        let path = self
+            .path
+            .split('/')
+            .map(percent_encode_segment)
+            .collect::<Vec<_>>()
+            .join("/");
+        format!("v1/{}/data/{path}", percent_encode_segment(&self.mount))
+    }
+}
+
+fn percent_encode_segment(segment: &str) -> String {
+    let mut encoded = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(hex_digit(byte >> 4)));
+            encoded.push(char::from(hex_digit(byte & 0x0f)));
+        }
+    }
+    encoded
+}
+
+fn hex_digit(nibble: u8) -> u8 {
+    match nibble {
+        0..=9 => b'0' + nibble,
+        10..=15 => b'A' + (nibble - 10),
+        _ => b'0',
     }
 }
 
@@ -99,5 +128,14 @@ mod tests {
             let err = KvRef::parse(bad).expect_err("not addressable");
             assert!(matches!(err, SecretError::Reference { .. }), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn uri_syntax_in_path_segments_is_percent_encoded() {
+        let parsed = KvRef::parse("secret/we#ird?name#password").expect("grammar");
+        assert_eq!(parsed.kv_url_path(), "v1/secret/data/we%23ird%3Fname");
+
+        let parsed = KvRef::parse("my mount/my app#password").expect("grammar");
+        assert_eq!(parsed.kv_url_path(), "v1/my%20mount/data/my%20app");
     }
 }

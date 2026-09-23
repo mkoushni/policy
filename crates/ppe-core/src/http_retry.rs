@@ -210,9 +210,9 @@ impl Default for RetryPolicy {
 /// which takes the policy as an argument so they never hold a transport.
 /// A [`crate::secrets::SecretProvider`] is not a plugin: the host hands
 /// it a transport at construction, and it calls this directly with the
-/// same policy a plugin would pick. A KV read is [`RetryPolicy::idempotent`];
-/// a login or a `renew-self` is [`RetryPolicy::none`], because a retried
-/// login that actually succeeded mints a second token.
+/// same policy a plugin would pick. A KV read and an idempotent `renew-self`
+/// are [`RetryPolicy::idempotent`]; a login is [`RetryPolicy::undelivered_only`]
+/// because a retry after a delivered login could mint a second token.
 ///
 /// Returns the first success, or the last error. Every attempt sends the
 /// identical request; nothing is mutated between tries.

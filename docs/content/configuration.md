@@ -257,6 +257,10 @@ Every call goes through that transport. Auth is Kubernetes or AppRole,
 with no default. The address must be `https://` unless
 `insecure_http: true`. The `ref` is `<mount>/<path>#<field>`, which is
 `GET /v1/<mount>/data/<path>` and then that field of `data.data`.
+The mount and path may contain spaces, `#`, or query-like characters; they
+are percent-encoded as URL path segments. Empty segments and `..` are refused.
+The optional `namespace` is sent as `X-Vault-Namespace` on login, renewal, and
+KV reads.
 
 In-cluster Vault (Kubernetes service DNS, RFC 1918) is refused by the
 bundled `HyperTransport` unless the host builds it with
