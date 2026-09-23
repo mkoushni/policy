@@ -32,6 +32,10 @@ use crate::reference::KvRef;
 /// deadline. Same trick as HTTP retry jitter, no extra dependency.
 static RENEW_JITTER: AtomicU64 = AtomicU64::new(0);
 
+/// Identity of the session currently held by a provider. A generation is
+/// distinct even when Vault renews a token to the same token value.
+static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 /// Renew when this fraction of `lease_duration` has elapsed.
 const RENEW_AFTER_NUM: u32 = 2;
 const RENEW_AFTER_DEN: u32 = 3;
@@ -76,6 +80,7 @@ struct VaultSecretProvider {
 
 struct VaultSession {
     token: Zeroizing<String>,
+    generation: u64,
     renewable: bool,
     renew_at: Option<Instant>,
 }
@@ -116,6 +121,7 @@ impl VaultSession {
             .unwrap_or(false);
         Ok(Self {
             token: Zeroizing::new(token.to_owned()),
+            generation: SESSION_GENERATION.fetch_add(1, Ordering::Relaxed),
             renewable,
             renew_at: (lease > 0).then(|| now + renew_after(Duration::from_secs(lease))),
         })
@@ -144,13 +150,18 @@ fn renew_after(lease: Duration) -> Duration {
 impl SecretProvider for VaultSecretProvider {
     async fn get_secret(&self, reference: &str) -> Result<Zeroizing<String>, SecretError> {
         let kv = KvRef::parse(reference)?;
-        let token = self.session_token().await?;
+        let (token, generation) = self.session_token().await?;
         match self.kv_read(token.as_str(), &kv).await {
             Ok(value) => Ok(value),
             Err(ReadFault::Forbidden) => {
                 let token = {
                     let mut session = self.session.lock().await;
-                    *session = None;
+                    if session
+                        .as_ref()
+                        .is_some_and(|current| current.generation == generation)
+                    {
+                        *session = None;
+                    }
                     self.ensure_token(&mut session).await?;
                     session
                         .as_ref()
@@ -177,12 +188,12 @@ enum ReadFault {
 }
 
 impl VaultSecretProvider {
-    async fn session_token(&self) -> Result<Zeroizing<String>, SecretError> {
+    async fn session_token(&self) -> Result<(Zeroizing<String>, u64), SecretError> {
         let mut session = self.session.lock().await;
         self.ensure_token(&mut session).await?;
         session
             .as_ref()
-            .map(|s| s.token.clone())
+            .map(|s| (s.token.clone(), s.generation))
             .ok_or_else(|| SecretError::backend("no Vault token after login"))
     }
 
@@ -547,6 +558,41 @@ auth:
         assert!(matches!(err, SecretError::Backend { .. }), "{err}");
         assert!(format!("{err}").contains("permission"), "{err}");
         assert!(!format!("{err}").contains("hvs.token"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn concurrent_403s_reauthenticate_only_once_for_the_stale_session() {
+        let http = FakeTransport::new()
+            .with_latency(Duration::from_millis(10))
+            .json("/auth/approle/login", 200, login_body())
+            .json(
+                "/auth/approle/login",
+                200,
+                &login_body().replace("hvs.token", "hvs.new"),
+            )
+            .json("/data/app", 403, r#"{"errors":["permission denied"]}"#)
+            .json("/data/app", 403, r#"{"errors":["permission denied"]}"#)
+            .json("/data/app", 200, &kv_body("password", "rotated"))
+            .json("/data/app", 200, &kv_body("password", "rotated"));
+        let transport = Arc::new(http);
+        let factory = VaultSecretProviderFactory::new(transport.clone());
+        let p = factory
+            .build(&SecretProviderConfig {
+                kind: KIND.to_owned(),
+                settings: serde_yaml::from_str(approle_yaml()).expect("yaml"),
+            })
+            .expect("build");
+        let (first, second) = tokio::join!(
+            p.get_secret("secret/app#password"),
+            p.get_secret("secret/app#password"),
+        );
+        assert_eq!(first.expect("first").as_str(), "rotated");
+        assert_eq!(second.expect("second").as_str(), "rotated");
+        assert_eq!(
+            transport.call_count_for("/auth/approle/login"),
+            2,
+            "one initial login and one reauthentication for both stale reads"
+        );
     }
 
     #[tokio::test]

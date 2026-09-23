@@ -55,7 +55,7 @@ pub(crate) struct VaultSettings {
 
 /// How this instance authenticates. No default, no other methods.
 #[derive(Deserialize)]
-#[serde(tag = "method", rename_all = "snake_case")]
+#[serde(deny_unknown_fields, tag = "method", rename_all = "snake_case")]
 pub(crate) enum VaultAuth {
     Kubernetes {
         role: String,
@@ -77,7 +77,7 @@ pub(crate) enum VaultAuth {
 /// Untagged so the document writes `{ env: NAME }`, `{ file: PATH }`, or
 /// `{ literal: VALUE }` rather than a YAML tag.
 #[derive(Deserialize)]
-#[serde(untagged)]
+#[serde(deny_unknown_fields, untagged)]
 pub(crate) enum SecretIdSource {
     Env {
         env: String,
@@ -487,5 +487,30 @@ auth:
         )
         .expect_err("unknown field");
         assert!(matches!(err, SecretError::Config { .. }), "{err}");
+    }
+
+    #[test]
+    fn unknown_nested_auth_settings_are_refused() {
+        for yaml in [
+            "
+address: https://vault.example.com
+auth:
+  method: kubernetes
+  role: ppe
+  token_paht: /wrong
+",
+            "
+address: https://vault.example.com
+auth:
+  method: approle
+  role_id: role-uuid
+  secret_id:
+    env: VAULT_SECRET_ID
+    file: /also-wrong
+",
+        ] {
+            let err = parse(yaml).expect_err("unknown nested field");
+            assert!(matches!(err, SecretError::Config { .. }), "{err}");
+        }
     }
 }
