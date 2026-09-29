@@ -99,7 +99,7 @@ KV v2, and provision the policy, AppRole, and two test values (the root token
 is development-only; the commands below use a local Vault CLI):
 
 ```console
-docker run -d --rm --name ppe-vault -p 8200:8200 \
+docker run -d --rm --name ppe-vault -p 127.0.0.1:8200:8200 \
   -e VAULT_DEV_ROOT_TOKEN_ID=root hashicorp/vault:1.19 server \
   -dev -dev-root-token-id=root
 export VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root

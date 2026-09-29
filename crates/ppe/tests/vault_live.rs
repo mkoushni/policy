@@ -4,13 +4,7 @@
 //! Live Vault KV v2 coverage. See `docs/content/testing.md` for provisioning.
 
 #![cfg(all(feature = "secrets-vault", feature = "http-hyper"))]
-#![allow(
-    missing_docs,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unwrap_used,
-    reason = "test code"
-)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 use std::env;
 use std::sync::{Arc, Mutex};
