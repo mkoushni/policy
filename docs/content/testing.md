@@ -91,10 +91,12 @@ The Vault provider's normal suite uses `FakeTransport` for deterministic
 HTTP-contract coverage. A live check is available with the `secrets-vault`
 and `http-hyper` features and is `#[ignore]`-gated because it needs a
 provisioned Vault instance. It uses AppRole, reads a normal KV v2 field, and
-then reads a version soft-deleted with Vault's real `data.data: null` response.
+then reads a version soft-deleted with Vault's real HTTP 404 and
+`data.data: null` response.
 
-Start a disposable Vault 1.19 dev server and provision the mount, policy,
-AppRole, and two test values (the root token is development-only):
+Start a disposable Vault 1.19 dev server, which already mounts `secret/` as
+KV v2, and provision the policy, AppRole, and two test values (the root token
+is development-only; the commands below use a local Vault CLI):
 
 ```console
 docker run -d --rm --name ppe-vault -p 8200:8200 \
@@ -102,7 +104,6 @@ docker run -d --rm --name ppe-vault -p 8200:8200 \
   -dev -dev-root-token-id=root
 export VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root
 until vault status >/dev/null 2>&1; do sleep 1; done
-vault secrets enable -path=secret kv-v2
 vault policy write ppe-live-read - <<'EOF'
 path "secret/data/live" { capabilities = ["read"] }
 path "secret/data/live-deleted" { capabilities = ["read"] }
@@ -123,8 +124,9 @@ cargo test -p praxis-policy --all-features --test vault_live -- --ignored --noca
 docker stop ppe-vault
 ```
 
-The test fails closed if the ordinary read is not `live-value`, or if the
-soft-deleted read is not mapped to `SecretError::NotFound`.
+The test fails if the ordinary read is not `live-value`, or if the
+soft-deleted response is not HTTP 404 with `data.data: null`, a deletion
+timestamp, and a `SecretError::NotFound` mapping.
 
 ## Running
 

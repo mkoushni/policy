@@ -13,11 +13,30 @@
 )]
 
 use std::env;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use praxis_policy::{HyperTransport, SecretProviderFactory as _, VaultSecretProviderFactory};
-use praxis_policy_core::http::HttpTransport;
+use praxis_policy_core::http::{HttpRequest, HttpResponse, HttpTransport, HttpTransportError};
 use praxis_policy_core::secrets::SecretProviderConfig;
+
+#[derive(Debug)]
+struct RecordingTransport {
+    inner: HyperTransport,
+    deleted_response: Mutex<Option<HttpResponse>>,
+}
+
+#[async_trait]
+impl HttpTransport for RecordingTransport {
+    async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, HttpTransportError> {
+        let deleted_read = request.url.ends_with("/v1/secret/data/live-deleted");
+        let response = self.inner.execute(request).await?;
+        if deleted_read {
+            *self.deleted_response.lock().expect("recording lock") = Some(response.clone());
+        }
+        Ok(response)
+    }
+}
 
 #[tokio::test]
 #[ignore = "requires a provisioned Vault server; see docs/content/testing.md"]
@@ -29,11 +48,14 @@ async fn vault_kv_v2_reads_live_and_maps_soft_deleted_versions() {
     ) else {
         return;
     };
-    let transport: Arc<dyn HttpTransport> =
-        Arc::new(HyperTransport::new().with_allow_private_destinations());
-    let factory = VaultSecretProviderFactory::new(transport);
+    let transport = Arc::new(RecordingTransport {
+        inner: HyperTransport::new().with_allow_private_destinations(),
+        deleted_response: Mutex::new(None),
+    });
+    let factory = VaultSecretProviderFactory::new(transport.clone());
     let settings = serde_yaml::from_str(&format!(
-        "address: {address}\nauth:\n  method: approle\n  role_id: {role_id}\n  secret_id:\n    literal: {secret_id}\nallow_insecure_literal: true\n"
+        "address: {address}\ninsecure_http: {}\nauth:\n  method: approle\n  role_id: {role_id}\n  secret_id:\n    literal: {secret_id}\nallow_insecure_literal: true\n",
+        address.starts_with("http://")
     ))
     .expect("settings");
     let provider = factory
@@ -58,5 +80,24 @@ async fn vault_kv_v2_reads_live_and_maps_soft_deleted_versions() {
     assert!(
         matches!(deleted, praxis_policy::SecretError::NotFound { .. }),
         "{deleted}"
+    );
+    let response = transport
+        .deleted_response
+        .lock()
+        .expect("recording lock")
+        .take()
+        .expect("soft-deleted KV response");
+    assert_eq!(response.status, 404);
+    let body: serde_json::Value = serde_json::from_slice(&response.body).expect("KV JSON");
+    assert!(
+        body.pointer("/data/data")
+            .is_some_and(serde_json::Value::is_null),
+        "{body}"
+    );
+    assert!(
+        body.pointer("/data/metadata/deletion_time")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|time| !time.is_empty()),
+        "{body}"
     );
 }

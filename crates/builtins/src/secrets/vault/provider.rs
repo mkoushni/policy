@@ -552,7 +552,7 @@ auth:
     }
 
     #[tokio::test]
-    async fn a_soft_deleted_kv_version_is_not_found() {
+    async fn a_200_null_data_response_is_not_found() {
         let http = FakeTransport::new()
             .json("/auth/approle/login", 200, login_body())
             .json("/data/deleted", 200, r#"{"data":{"data":null}}"#);
