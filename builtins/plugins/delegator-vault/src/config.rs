@@ -46,6 +46,15 @@ pub struct VaultDelegatorConfig {
 
     /// Secret path template. `{{<identity_claim>}}` is replaced with the
     /// resolved claim value at delegation time.
+    ///
+    /// This template is the contract between the enrollment workflow (how
+    /// users store credentials in Vault) and this handler. For example,
+    /// if the template is `agents/{{sub}}/github`, a user with `sub=alice`
+    /// must write their GitHub PAT to `secret/data/agents/alice/github`
+    /// in the configured KV v2 mount. The enrollment mechanism is out of
+    /// scope for this handler — it may be Vault CLI, a self-service UI,
+    /// or an infrastructure pipeline — but the path convention must be
+    /// documented for operators and communicated to end-users.
     pub secret_path_template: String,
 
     /// Which field in the KV v2 data object holds the credential.

@@ -236,6 +236,10 @@ impl VaultDelegator {
             .as_ref()
             .map_or(self.typed.cache.ttl_seconds, CredentialCache::ttl_seconds);
 
+        // Scopes are empty: a pre-stored PAT has no machine-discoverable
+        // scope set, and the framework's monotonic-narrowing invariant
+        // treats an empty list as "no scope claim made" rather than
+        // "zero permissions".
         let token = RawDelegatedToken::new(
             token_value,
             &self.typed.outbound_header,
