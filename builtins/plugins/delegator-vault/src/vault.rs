@@ -38,6 +38,9 @@ pub(crate) async fn jwt_login(
     let request = request
         .header("content-type", "application/json")
         .map_err(|e| violation_for_invalid_request("JWT login", &e))?;
+    let request = request
+        .header("x-vault-request", "true")
+        .map_err(|e| violation_for_invalid_request("JWT login", &e))?;
 
     let response = svc
         .http_request(request, RetryPolicy::undelivered_only())
@@ -84,6 +87,9 @@ pub(crate) async fn approle_login(
     let request = request
         .header("content-type", "application/json")
         .map_err(|e| violation_for_invalid_request("AppRole login", &e))?;
+    let request = request
+        .header("x-vault-request", "true")
+        .map_err(|e| violation_for_invalid_request("AppRole login", &e))?;
 
     let response = svc
         .http_request(request, RetryPolicy::undelivered_only())
@@ -124,6 +130,9 @@ pub(crate) async fn kv_read(
         .max_response_bytes(256 * 1024);
     let request = request
         .header("x-vault-token", vault_token)
+        .map_err(|e| violation_for_invalid_request("KV read", &e))?;
+    let request = request
+        .header("x-vault-request", "true")
         .map_err(|e| violation_for_invalid_request("KV read", &e))?;
 
     let response = svc

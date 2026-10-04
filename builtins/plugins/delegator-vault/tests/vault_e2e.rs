@@ -18,7 +18,10 @@
 //   * missing field in secret — surfaces `delegation.vault_field_missing`
 //   * scheme prefix — configured prefix prepended to token value
 //   * cache isolation — two callers get distinct credentials
-//   * secret rotation — after TTL, new value fetched
+//   * secret rotation — after TTL, new value fetched (unit-level; moka
+//     uses monotonic time, so wall-clock advancement requires moka's
+//     test-clock feature, which is exercised in cache.rs unit tests)
+//   * path traversal — identity with `..` rejected
 
 #![allow(
     missing_docs,
@@ -576,4 +579,63 @@ async fn metadata_populated() {
     assert_eq!(&fp.metadata["secret_source"], "vault");
     assert_eq!(&fp.metadata["vault_secret_version"], 1);
     assert_eq!(&fp.metadata["delegated_token_source"], "mint");
+}
+
+// Path traversal in identity claim is rejected before Vault call.
+#[tokio::test]
+async fn path_traversal_identity_rejected() {
+    let http = Arc::new(FakeTransport::new());
+
+    let mgr = build_manager(plugin_config_for(user_auth()), &http).await;
+    let payload = DelegationPayload::new("user-jwt", "github-api")
+        .with_target_audience("https://api.github.com");
+    let ext = ext_with_user_sub("../../admin");
+
+    let result = invoke(&mgr, payload, ext).await;
+    assert!(!result.continue_processing);
+    assert_eq!(
+        result.violation.as_ref().unwrap().code,
+        "delegation.identity_invalid"
+    );
+    // No HTTP calls should have been made
+    assert_eq!(http.call_count_for(AUTH_JWT_PATH), 0);
+}
+
+// Secret rotation: without cache, successive calls fetch fresh values.
+#[tokio::test]
+async fn uncached_fetches_fresh_each_time() {
+    let http = Arc::new(
+        FakeTransport::new()
+            .json(AUTH_JWT_PATH, 200, &vault_login_response())
+            .json(AUTH_JWT_PATH, 200, &vault_login_response())
+            .json(KV_PATH_USER123, 200, &kv_response("token", "ghp_v1"))
+            .json(KV_PATH_USER123, 200, &kv_response("token", "ghp_v2")),
+    );
+
+    // No cache configured (default)
+    let mgr = build_manager(plugin_config_for(user_auth()), &http).await;
+
+    let payload1 = DelegationPayload::new("user-jwt", "github-api")
+        .with_target_audience("https://api.github.com");
+    let r1 = invoke(&mgr, payload1, ext_with_user_sub("user-123")).await;
+    assert!(r1.continue_processing, "{:?}", r1.violation);
+
+    let payload2 = DelegationPayload::new("user-jwt", "github-api")
+        .with_target_audience("https://api.github.com");
+    let r2 = invoke(&mgr, payload2, ext_with_user_sub("user-123")).await;
+    assert!(r2.continue_processing, "{:?}", r2.violation);
+
+    let t1 = DelegationPayload::from_pipeline_result(&r1)
+        .unwrap()
+        .delegated_token
+        .unwrap();
+    let t2 = DelegationPayload::from_pipeline_result(&r2)
+        .unwrap()
+        .delegated_token
+        .unwrap();
+    assert_eq!(&*t1.token, "ghp_v1");
+    assert_eq!(&*t2.token, "ghp_v2");
+
+    assert_eq!(http.call_count_for(AUTH_JWT_PATH), 2);
+    assert_eq!(http.call_count_for(KV_PATH_USER123), 2);
 }

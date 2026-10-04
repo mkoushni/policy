@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -20,13 +21,17 @@ use crate::config::{VaultAuthMethod, VaultDelegatorConfig};
 use crate::identity;
 use crate::vault;
 
+struct ResolvedAppRole {
+    role_id: Zeroizing<String>,
+    secret_id: Zeroizing<String>,
+}
+
 /// PPE delegation handler that resolves downstream credentials from
 /// `HashiCorp` Vault KV v2, scoped to the caller's identity.
 pub struct VaultDelegator {
     cfg: PluginConfig,
     typed: VaultDelegatorConfig,
-    approle_role_id: Option<Zeroizing<String>>,
-    approle_secret_id: Option<Zeroizing<String>>,
+    approle_creds: HashMap<String, ResolvedAppRole>,
     timeout: Duration,
     cache: Option<CredentialCache>,
 }
@@ -38,12 +43,8 @@ impl std::fmt::Debug for VaultDelegator {
             .field("vault_addr", &self.typed.vault_addr)
             .field("kv_mount", &self.typed.kv_mount)
             .field(
-                "approle_role_id",
-                &self.approle_role_id.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field(
-                "approle_secret_id",
-                &self.approle_secret_id.as_ref().map(|_| "[REDACTED]"),
+                "approle_subjects",
+                &self.approle_creds.keys().collect::<Vec<_>>(),
             )
             .finish()
     }
@@ -67,18 +68,24 @@ impl VaultDelegator {
             })?
             .clone();
 
-        let typed: VaultDelegatorConfig =
+        let mut typed: VaultDelegatorConfig =
             serde_json::from_value(raw).map_err(|e| PluginError::Config {
                 message: format!("invalid delegator/vault config: {e}"),
             })?;
 
+        typed.vault_addr = typed.vault_addr.trim().to_owned();
         if typed.vault_addr.is_empty() {
             return Err(PluginError::Config {
                 message: "vault_addr must not be empty".into(),
             }
             .boxed());
         }
-        if !typed.insecure_http && !typed.vault_addr.starts_with("https://") {
+        if !typed.insecure_http
+            && !typed
+                .vault_addr
+                .to_ascii_lowercase()
+                .starts_with("https://")
+        {
             return Err(PluginError::Config {
                 message: format!(
                     "vault_addr must use https (got {}); set insecure_http: true for dev",
@@ -113,8 +120,13 @@ impl VaultDelegator {
             }
         }
 
-        // Eagerly resolve AppRole credentials
-        let (approle_role_id, approle_secret_id) = resolve_approle_creds(&typed)?;
+        // Eagerly resolve AppRole credentials (per subject)
+        let approle_creds = resolve_approle_creds(&typed)?;
+
+        // Zeroize literal secrets in the stored config now that they are resolved
+        for auth in typed.auth.values_mut() {
+            auth.redact_sources();
+        }
 
         typed.cache.validate().map_err(|e| PluginError::Config {
             message: format!("cache config invalid: {e}"),
@@ -128,8 +140,7 @@ impl VaultDelegator {
         Ok(Self {
             cfg,
             typed,
-            approle_role_id,
-            approle_secret_id,
+            approle_creds,
             timeout,
             cache,
         })
@@ -169,24 +180,19 @@ impl VaultDelegator {
                     .await?
             },
             VaultAuthMethod::AppRole { mount, .. } => {
-                let role_id = self.approle_role_id.as_ref().ok_or_else(|| {
+                let key = subject_config_key(subject);
+                let creds = self.approle_creds.get(key).ok_or_else(|| {
                     PluginViolation::new(
                         "delegation.vault_auth_failed",
-                        "AppRole role_id not resolved at construction",
-                    )
-                })?;
-                let secret_id = self.approle_secret_id.as_ref().ok_or_else(|| {
-                    PluginViolation::new(
-                        "delegation.vault_auth_failed",
-                        "AppRole secret_id not resolved at construction",
+                        format!("AppRole credentials not resolved for subject '{key}'"),
                     )
                 })?;
                 vault::approle_login(
                     ext,
                     &self.typed.vault_addr,
                     mount,
-                    role_id,
-                    secret_id,
+                    &creds.role_id,
+                    &creds.secret_id,
                     self.timeout,
                 )
                 .await?
@@ -272,6 +278,11 @@ impl HookHandler<TokenDelegateHook> for VaultDelegator {
             Err(v) => return PluginResult::deny(*v),
         };
 
+        // Validate identity value is safe for path embedding
+        if let Err(v) = identity::validate_identity_value(&identity_value) {
+            return PluginResult::deny(*v);
+        }
+
         let resolved_path = identity::resolve_path(
             &self.typed.secret_path_template,
             &self.typed.identity_claim,
@@ -354,8 +365,9 @@ fn subject_config_key(subject: &DelegationSubject) -> &'static str {
 
 fn resolve_approle_creds(
     typed: &VaultDelegatorConfig,
-) -> Result<(Option<Zeroizing<String>>, Option<Zeroizing<String>>), Box<PluginError>> {
-    for auth in typed.auth.values() {
+) -> Result<HashMap<String, ResolvedAppRole>, Box<PluginError>> {
+    let mut creds = HashMap::new();
+    for (key, auth) in &typed.auth {
         if let VaultAuthMethod::AppRole {
             role_id_source,
             secret_id_source,
@@ -363,20 +375,23 @@ fn resolve_approle_creds(
         } = auth
         {
             let role_id = role_id_source.resolve().map_err(|e| PluginError::Config {
-                message: format!("AppRole role_id: {e}"),
+                message: format!("AppRole role_id for '{key}': {e}"),
             })?;
             let secret_id = secret_id_source
                 .resolve()
                 .map_err(|e| PluginError::Config {
-                    message: format!("AppRole secret_id: {e}"),
+                    message: format!("AppRole secret_id for '{key}': {e}"),
                 })?;
-            return Ok((
-                Some(Zeroizing::new(role_id)),
-                Some(Zeroizing::new(secret_id)),
-            ));
+            creds.insert(
+                key.clone(),
+                ResolvedAppRole {
+                    role_id: Zeroizing::new(role_id),
+                    secret_id: Zeroizing::new(secret_id),
+                },
+            );
         }
     }
-    Ok((None, None))
+    Ok(creds)
 }
 
 #[cfg(test)]
@@ -482,6 +497,34 @@ mod tests {
         let debug = format!("{d:?}");
         assert!(!debug.contains("SENSITIVE_ROLE_ID"));
         assert!(!debug.contains("SENSITIVE_SECRET_ID"));
-        assert!(debug.contains("[REDACTED]"));
+        assert!(debug.contains("approle_subjects"));
+    }
+
+    #[test]
+    fn accepts_https_case_insensitive() {
+        let mut cfg = base_config();
+        cfg.config.as_mut().unwrap()["vault_addr"] = json!("HTTPS://vault.test:8200");
+        assert!(VaultDelegator::new(cfg).is_ok());
+    }
+
+    #[test]
+    fn trims_vault_addr_whitespace() {
+        let mut cfg = base_config();
+        cfg.config.as_mut().unwrap()["vault_addr"] = json!("  https://vault.test:8200  ");
+        assert!(VaultDelegator::new(cfg).is_ok());
+    }
+
+    #[test]
+    fn literal_secrets_redacted_in_stored_config() {
+        let mut cfg = base_config();
+        cfg.config.as_mut().unwrap()["auth"]["this_workload"] = json!({
+            "method": "approle",
+            "role_id_source": { "kind": "literal", "secret": "SENSITIVE" },
+            "secret_id_source": { "kind": "literal", "secret": "ALSO_SENSITIVE" },
+        });
+        let d = VaultDelegator::new(cfg).unwrap();
+        let config_debug = format!("{:?}", d.typed);
+        assert!(!config_debug.contains("SENSITIVE"));
+        assert!(!config_debug.contains("ALSO_SENSITIVE"));
     }
 }

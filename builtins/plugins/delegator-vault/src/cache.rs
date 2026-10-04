@@ -13,10 +13,18 @@ use praxis_policy_core::extensions::raw_credentials::RawDelegatedToken;
 use crate::config::CacheConfig;
 
 /// What one Vault KV read produced.
-#[derive(Debug)]
 pub(crate) struct Mint {
     pub token: RawDelegatedToken,
     pub secret_version: u64,
+}
+
+impl std::fmt::Debug for Mint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Mint")
+            .field("token", &"[REDACTED]")
+            .field("secret_version", &self.secret_version)
+            .finish()
+    }
 }
 
 /// Whether a `Served` came from the cache or a fresh Vault read.
@@ -27,11 +35,20 @@ pub(crate) enum Source {
 }
 
 /// The credential delivered to the handler, with provenance.
-#[derive(Debug)]
 pub(crate) struct Served {
     pub mint: Mint,
     pub source: Source,
     pub minted_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for Served {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Served")
+            .field("mint", &self.mint)
+            .field("source", &self.source)
+            .field("minted_at", &self.minted_at)
+            .finish()
+    }
 }
 
 /// Bounded, coalescing credential cache keyed by principal identity.
@@ -108,8 +125,7 @@ impl CredentialCache {
                     minted_at: Utc::now(),
                 })
             })
-            .await
-            .map_err(|e| Arc::new((*e).clone()))?;
+            .await?;
 
         let fresh = entry.is_fresh();
         let value = entry.into_value();

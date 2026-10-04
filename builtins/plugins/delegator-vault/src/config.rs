@@ -112,7 +112,7 @@ pub enum VaultAuthMethod {
 }
 
 /// Where to read a secret value at construction time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CredentialSource {
     /// Read from an environment variable.
@@ -132,7 +132,27 @@ pub enum CredentialSource {
     },
 }
 
+impl std::fmt::Debug for CredentialSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EnvVar { name } => f.debug_struct("EnvVar").field("name", name).finish(),
+            Self::File { path } => f.debug_struct("File").field("path", path).finish(),
+            Self::Literal { .. } => f
+                .debug_struct("Literal")
+                .field("secret", &"[REDACTED]")
+                .finish(),
+        }
+    }
+}
+
 impl CredentialSource {
+    /// Zeroize inline literal secrets after they have been resolved.
+    pub(crate) fn redact(&mut self) {
+        if let CredentialSource::Literal { secret } = self {
+            zeroize::Zeroize::zeroize(secret);
+        }
+    }
+
     /// Resolve the secret at construction time.
     ///
     /// The secret itself never appears in the error message.
@@ -195,6 +215,21 @@ impl CacheConfig {
             return Err("cache.max_entries must be > 0 when cache is enabled".into());
         }
         Ok(())
+    }
+}
+
+impl VaultAuthMethod {
+    /// Zeroize literal secrets embedded in credential sources after resolution.
+    pub(crate) fn redact_sources(&mut self) {
+        if let VaultAuthMethod::AppRole {
+            role_id_source,
+            secret_id_source,
+            ..
+        } = self
+        {
+            role_id_source.redact();
+            secret_id_source.redact();
+        }
     }
 }
 
@@ -350,6 +385,16 @@ mod tests {
             max_entries: 0,
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn literal_debug_redacts_secret() {
+        let src = CredentialSource::Literal {
+            secret: "super-secret".into(),
+        };
+        let debug = format!("{src:?}");
+        assert!(!debug.contains("super-secret"));
+        assert!(debug.contains("[REDACTED]"));
     }
 
     #[test]

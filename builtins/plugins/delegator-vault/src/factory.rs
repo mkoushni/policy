@@ -6,7 +6,7 @@ use std::sync::Arc;
 use praxis_policy_core::delegation::{HOOK_TOKEN_DELEGATE, TokenDelegateHook};
 use praxis_policy_core::error::PluginError;
 use praxis_policy_core::factory::{PluginFactory, PluginInstance};
-use praxis_policy_core::hooks::adapter::TypedHandlerAdapter;
+use praxis_policy_core::hooks::TypedHandlerAdapter;
 use praxis_policy_core::plugin::PluginConfig;
 
 use crate::delegator::VaultDelegator;

@@ -126,6 +126,38 @@ pub(crate) fn resolve_auth_token<'p>(
     }
 }
 
+/// Validate that an identity value is safe for embedding in a Vault path.
+///
+/// Rejects empty values, null bytes, path traversal sequences (`..`),
+/// and percent-encoded forms of `/` and `.` that HTTP clients may decode
+/// before sending.
+pub(crate) fn validate_identity_value(value: &str) -> Result<(), Box<PluginViolation>> {
+    if value.is_empty() {
+        return Err(Box::new(PluginViolation::new(
+            "delegation.identity_invalid",
+            "resolved identity value is empty",
+        )));
+    }
+    if value.contains('\0') {
+        return Err(Box::new(PluginViolation::new(
+            "delegation.identity_invalid",
+            "identity value contains null bytes",
+        )));
+    }
+    let has_traversal = value.split('/').any(|seg| seg == ".." || seg == ".");
+    let has_encoded = value.contains("%2e")
+        || value.contains("%2E")
+        || value.contains("%2f")
+        || value.contains("%2F");
+    if has_traversal || has_encoded {
+        return Err(Box::new(PluginViolation::new(
+            "delegation.identity_invalid",
+            "identity value contains path traversal or encoded separators",
+        )));
+    }
+    Ok(())
+}
+
 /// Replace `{{<identity_claim>}}` in the template with the resolved value.
 pub(crate) fn resolve_path(template: &str, identity_claim: &str, identity_value: &str) -> String {
     let placeholder = format!("{{{{{identity_claim}}}}}");
@@ -178,7 +210,11 @@ fn subject_label(subject: &DelegationSubject) -> Cow<'static, str> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, reason = "tests")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::assertions_on_result_states,
+    reason = "tests"
+)]
 mod tests {
     use super::*;
     use praxis_policy_core::extensions::security::{
@@ -345,5 +381,45 @@ mod tests {
         let payload = DelegationPayload::new("", "target");
         let err = resolve_auth_token(&DelegationSubject::ThisWorkload, &payload).unwrap_err();
         assert_eq!(err.code, "delegation.bad_request");
+    }
+
+    #[test]
+    fn rejects_empty_identity() {
+        let err = validate_identity_value("").unwrap_err();
+        assert_eq!(err.code, "delegation.identity_invalid");
+    }
+
+    #[test]
+    fn rejects_null_bytes() {
+        let err = validate_identity_value("user\0evil").unwrap_err();
+        assert_eq!(err.code, "delegation.identity_invalid");
+    }
+
+    #[test]
+    fn rejects_path_traversal() {
+        let err = validate_identity_value("../../admin").unwrap_err();
+        assert_eq!(err.code, "delegation.identity_invalid");
+    }
+
+    #[test]
+    fn rejects_encoded_traversal() {
+        let err = validate_identity_value("foo%2e%2e").unwrap_err();
+        assert_eq!(err.code, "delegation.identity_invalid");
+    }
+
+    #[test]
+    fn rejects_encoded_slash() {
+        let err = validate_identity_value("foo%2Fbar").unwrap_err();
+        assert_eq!(err.code, "delegation.identity_invalid");
+    }
+
+    #[test]
+    fn allows_normal_identity() {
+        validate_identity_value("user-123").unwrap();
+    }
+
+    #[test]
+    fn allows_spiffe_id() {
+        validate_identity_value("spiffe://example.com/agent").unwrap();
     }
 }
