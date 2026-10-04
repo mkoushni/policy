@@ -1,0 +1,487 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Praxis Contributors
+
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::Utc;
+use zeroize::Zeroizing;
+
+use praxis_policy_core::context::PluginContext;
+use praxis_policy_core::delegation::{DelegationPayload, DelegationSubject, TokenDelegateHook};
+use praxis_policy_core::error::{PluginError, PluginViolation};
+use praxis_policy_core::extensions::raw_credentials::RawDelegatedToken;
+use praxis_policy_core::hooks::payload::Extensions;
+use praxis_policy_core::hooks::trait_def::{HookHandler, PluginResult};
+use praxis_policy_core::plugin::{Plugin, PluginConfig};
+
+use crate::cache::{CredentialCache, Mint, Served, Source};
+use crate::config::{VaultAuthMethod, VaultDelegatorConfig};
+use crate::identity;
+use crate::vault;
+
+/// PPE delegation handler that resolves downstream credentials from
+/// `HashiCorp` Vault KV v2, scoped to the caller's identity.
+pub struct VaultDelegator {
+    cfg: PluginConfig,
+    typed: VaultDelegatorConfig,
+    approle_role_id: Option<Zeroizing<String>>,
+    approle_secret_id: Option<Zeroizing<String>>,
+    timeout: Duration,
+    cache: Option<CredentialCache>,
+}
+
+impl std::fmt::Debug for VaultDelegator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultDelegator")
+            .field("name", &self.cfg.name)
+            .field("vault_addr", &self.typed.vault_addr)
+            .field("kv_mount", &self.typed.kv_mount)
+            .field(
+                "approle_role_id",
+                &self.approle_role_id.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "approle_secret_id",
+                &self.approle_secret_id.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+impl VaultDelegator {
+    /// Construct from a `PluginConfig` whose `config:` block deserializes
+    /// to [`VaultDelegatorConfig`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the config block is missing, malformed, or fails
+    /// validation (e.g. empty `vault_addr`, `http://` without opt-in,
+    /// unknown auth subject keys, or unresolvable `AppRole` credentials).
+    pub fn new(cfg: PluginConfig) -> Result<Self, Box<PluginError>> {
+        let raw = cfg
+            .config
+            .as_ref()
+            .ok_or_else(|| PluginError::Config {
+                message: "delegator/vault requires a `config:` block".into(),
+            })?
+            .clone();
+
+        let typed: VaultDelegatorConfig =
+            serde_json::from_value(raw).map_err(|e| PluginError::Config {
+                message: format!("invalid delegator/vault config: {e}"),
+            })?;
+
+        if typed.vault_addr.is_empty() {
+            return Err(PluginError::Config {
+                message: "vault_addr must not be empty".into(),
+            }
+            .boxed());
+        }
+        if !typed.insecure_http && !typed.vault_addr.starts_with("https://") {
+            return Err(PluginError::Config {
+                message: format!(
+                    "vault_addr must use https (got {}); set insecure_http: true for dev",
+                    typed.vault_addr
+                ),
+            }
+            .boxed());
+        }
+        if typed.secret_path_template.is_empty() {
+            return Err(PluginError::Config {
+                message: "secret_path_template must not be empty".into(),
+            }
+            .boxed());
+        }
+        if typed.auth.is_empty() {
+            return Err(PluginError::Config {
+                message: "auth map must not be empty — configure at least one subject".into(),
+            }
+            .boxed());
+        }
+
+        // Validate auth keys
+        for key in typed.auth.keys() {
+            if DelegationSubject::from_config_str(key).is_none() {
+                return Err(PluginError::Config {
+                    message: format!(
+                        "unknown auth subject '{key}' — expected one of: \
+                         user, client, caller_workload, this_workload"
+                    ),
+                }
+                .boxed());
+            }
+        }
+
+        // Eagerly resolve AppRole credentials
+        let (approle_role_id, approle_secret_id) = resolve_approle_creds(&typed)?;
+
+        typed.cache.validate().map_err(|e| PluginError::Config {
+            message: format!("cache config invalid: {e}"),
+        })?;
+        let cache = CredentialCache::new(&typed.cache).map_err(|e| PluginError::Config {
+            message: format!("cache construction failed: {e}"),
+        })?;
+
+        let timeout = typed.timeout();
+
+        Ok(Self {
+            cfg,
+            typed,
+            approle_role_id,
+            approle_secret_id,
+            timeout,
+            cache,
+        })
+    }
+
+    fn auth_for(
+        &self,
+        subject: &DelegationSubject,
+    ) -> Result<&VaultAuthMethod, Box<PluginViolation>> {
+        let key = subject_config_key(subject);
+        self.typed.auth.get(key).ok_or_else(|| {
+            Box::new(PluginViolation::new(
+                "delegation.vault_auth_unconfigured",
+                format!(
+                    "no Vault auth method configured for subject '{key}' — \
+                     add it to the auth map in plugin config"
+                ),
+            ))
+        })
+    }
+
+    /// Fetch a credential from Vault: login, then KV read.
+    async fn fetch_from_vault(
+        &self,
+        subject: &DelegationSubject,
+        payload: &DelegationPayload,
+        ext: &Extensions,
+        resolved_path: &str,
+    ) -> Result<Mint, PluginViolation> {
+        let auth_method = self.auth_for(subject).map_err(|e| *e)?;
+
+        // Login to Vault with the principal's token
+        let vault_token = match auth_method {
+            VaultAuthMethod::Jwt { mount, role } => {
+                let jwt = identity::resolve_auth_token(subject, payload).map_err(|e| *e)?;
+                vault::jwt_login(ext, &self.typed.vault_addr, mount, role, jwt, self.timeout)
+                    .await?
+            },
+            VaultAuthMethod::AppRole { mount, .. } => {
+                let role_id = self.approle_role_id.as_ref().ok_or_else(|| {
+                    PluginViolation::new(
+                        "delegation.vault_auth_failed",
+                        "AppRole role_id not resolved at construction",
+                    )
+                })?;
+                let secret_id = self.approle_secret_id.as_ref().ok_or_else(|| {
+                    PluginViolation::new(
+                        "delegation.vault_auth_failed",
+                        "AppRole secret_id not resolved at construction",
+                    )
+                })?;
+                vault::approle_login(
+                    ext,
+                    &self.typed.vault_addr,
+                    mount,
+                    role_id,
+                    secret_id,
+                    self.timeout,
+                )
+                .await?
+            },
+        };
+
+        // Read the KV secret (vault_token is zeroized when dropped)
+        let kv_result = vault::kv_read(
+            ext,
+            &self.typed.vault_addr,
+            &self.typed.kv_mount,
+            resolved_path,
+            &vault_token.client_token,
+            self.timeout,
+        )
+        .await?;
+
+        // Extract the configured field
+        let secret_value = kv_result
+            .data
+            .get(&self.typed.secret_field)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                PluginViolation::new(
+                    "delegation.vault_field_missing",
+                    format!(
+                        "secret at the resolved path does not contain field '{}'",
+                        self.typed.secret_field
+                    ),
+                )
+            })?;
+
+        // Apply scheme prefix if configured
+        let token_value = match &self.typed.scheme_prefix {
+            Some(prefix) => format!("{prefix}{secret_value}"),
+            None => secret_value.to_owned(),
+        };
+
+        let ttl_secs = self
+            .cache
+            .as_ref()
+            .map_or(self.typed.cache.ttl_seconds, CredentialCache::ttl_seconds);
+
+        let token = RawDelegatedToken::new(
+            token_value,
+            &self.typed.outbound_header,
+            payload.target_audience().unwrap_or(""),
+            Vec::new(),
+            Utc::now() + chrono::Duration::seconds(i64::try_from(ttl_secs).unwrap_or(300)),
+        );
+
+        Ok(Mint {
+            token,
+            secret_version: kv_result.version,
+        })
+    }
+}
+
+#[async_trait]
+impl Plugin for VaultDelegator {
+    fn config(&self) -> &PluginConfig {
+        &self.cfg
+    }
+}
+
+impl HookHandler<TokenDelegateHook> for VaultDelegator {
+    async fn handle(
+        &self,
+        payload: &DelegationPayload,
+        ext: &Extensions,
+        _ctx: &mut PluginContext,
+    ) -> PluginResult<DelegationPayload> {
+        let subject = payload.subject();
+
+        // Validate auth is configured for this subject
+        if let Err(v) = self.auth_for(subject) {
+            return PluginResult::deny(*v);
+        }
+
+        // Resolve identity claim for path templating
+        let identity_value = match identity::resolve_identity(subject, ext, &self.typed) {
+            Ok(id) => id,
+            Err(v) => return PluginResult::deny(*v),
+        };
+
+        let resolved_path = identity::resolve_path(
+            &self.typed.secret_path_template,
+            &self.typed.identity_claim,
+            &identity_value,
+        );
+
+        // Warn if route attenuation is requested (static creds can't be attenuated)
+        if payload.route_attenuation().is_some() {
+            tracing::warn!(
+                plugin = %self.cfg.name,
+                "route attenuation requested but delegator/vault resolves \
+                 static credentials — attenuation cannot be honored"
+            );
+        }
+
+        // Resolve credential — cached or fresh
+        let served = if let Some(ref cache) = self.cache {
+            let key = CredentialCache::cache_key(subject, &identity_value);
+            match cache
+                .get_or_mint(
+                    key,
+                    self.fetch_from_vault(subject, payload, ext, &resolved_path),
+                )
+                .await
+            {
+                Ok(served) => served,
+                Err(violation) => return PluginResult::deny((*violation).clone()),
+            }
+        } else {
+            match self
+                .fetch_from_vault(subject, payload, ext, &resolved_path)
+                .await
+            {
+                Ok(mint) => Served {
+                    mint,
+                    source: Source::Mint,
+                    minted_at: Utc::now(),
+                },
+                Err(violation) => return PluginResult::deny(violation),
+            }
+        };
+
+        // Build updated payload
+        let mut updated = payload.clone();
+        updated.delegated_token = Some(served.mint.token);
+        updated.delegation_mode = Some(payload.subject().default_mode());
+        updated.minted_at = Some(served.minted_at);
+        updated.metadata.insert(
+            "secret_source".into(),
+            serde_json::Value::String("vault".into()),
+        );
+        updated.metadata.insert(
+            "delegated_token_source".into(),
+            serde_json::Value::String(
+                match served.source {
+                    Source::Cache => "cache",
+                    Source::Mint => "mint",
+                }
+                .to_owned(),
+            ),
+        );
+        updated.metadata.insert(
+            "vault_secret_version".into(),
+            serde_json::json!(served.mint.secret_version),
+        );
+
+        PluginResult::modify_payload(updated)
+    }
+}
+
+fn subject_config_key(subject: &DelegationSubject) -> &'static str {
+    match subject {
+        DelegationSubject::User => "user",
+        DelegationSubject::Client => "client",
+        DelegationSubject::CallerWorkload => "caller_workload",
+        DelegationSubject::ThisWorkload => "this_workload",
+        _ => "unknown",
+    }
+}
+
+fn resolve_approle_creds(
+    typed: &VaultDelegatorConfig,
+) -> Result<(Option<Zeroizing<String>>, Option<Zeroizing<String>>), Box<PluginError>> {
+    for auth in typed.auth.values() {
+        if let VaultAuthMethod::AppRole {
+            role_id_source,
+            secret_id_source,
+            ..
+        } = auth
+        {
+            let role_id = role_id_source.resolve().map_err(|e| PluginError::Config {
+                message: format!("AppRole role_id: {e}"),
+            })?;
+            let secret_id = secret_id_source
+                .resolve()
+                .map_err(|e| PluginError::Config {
+                    message: format!("AppRole secret_id: {e}"),
+                })?;
+            return Ok((
+                Some(Zeroizing::new(role_id)),
+                Some(Zeroizing::new(secret_id)),
+            ));
+        }
+    }
+    Ok((None, None))
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::assertions_on_result_states,
+    clippy::indexing_slicing,
+    reason = "tests"
+)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn base_config() -> PluginConfig {
+        PluginConfig {
+            name: "vault-test".into(),
+            kind: "test".into(),
+            config: Some(json!({
+                "vault_addr": "https://vault.test:8200",
+                "secret_path_template": "agents/{{sub}}/github",
+                "auth": {
+                    "user": {
+                        "method": "jwt",
+                        "role": "ppe-user"
+                    }
+                }
+            })),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn constructs_with_valid_config() {
+        let d = VaultDelegator::new(base_config());
+        assert!(d.is_ok());
+    }
+
+    #[test]
+    fn rejects_missing_config_block() {
+        let cfg = PluginConfig {
+            name: "test".into(),
+            kind: "test".into(),
+            config: None,
+            ..Default::default()
+        };
+        let err = VaultDelegator::new(cfg).unwrap_err();
+        assert!(err.to_string().contains("config:"));
+    }
+
+    #[test]
+    fn rejects_empty_vault_addr() {
+        let mut cfg = base_config();
+        cfg.config.as_mut().unwrap()["vault_addr"] = json!("");
+        let err = VaultDelegator::new(cfg).unwrap_err();
+        assert!(err.to_string().contains("vault_addr"));
+    }
+
+    #[test]
+    fn rejects_http_without_opt_in() {
+        let mut cfg = base_config();
+        cfg.config.as_mut().unwrap()["vault_addr"] = json!("http://vault.test:8200");
+        let err = VaultDelegator::new(cfg).unwrap_err();
+        assert!(err.to_string().contains("https"));
+    }
+
+    #[test]
+    fn allows_http_with_insecure_opt_in() {
+        let mut cfg = base_config();
+        cfg.config.as_mut().unwrap()["vault_addr"] = json!("http://vault.test:8200");
+        cfg.config.as_mut().unwrap()["insecure_http"] = json!(true);
+        assert!(VaultDelegator::new(cfg).is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_auth_map() {
+        let mut cfg = base_config();
+        cfg.config.as_mut().unwrap()["auth"] = json!({});
+        let err = VaultDelegator::new(cfg).unwrap_err();
+        assert!(err.to_string().contains("auth map must not be empty"));
+    }
+
+    #[test]
+    fn rejects_unknown_auth_subject() {
+        let mut cfg = base_config();
+        cfg.config.as_mut().unwrap()["auth"] = json!({
+            "invalid_subject": { "method": "jwt", "role": "r" }
+        });
+        let err = VaultDelegator::new(cfg).unwrap_err();
+        assert!(err.to_string().contains("unknown auth subject"));
+    }
+
+    #[test]
+    fn debug_redacts_approle_values() {
+        let mut cfg = base_config();
+        cfg.config.as_mut().unwrap()["auth"]["this_workload"] = json!({
+            "method": "approle",
+            "role_id_source": { "kind": "literal", "secret": "SENSITIVE_ROLE_ID" },
+            "secret_id_source": { "kind": "literal", "secret": "SENSITIVE_SECRET_ID" },
+        });
+        let d = VaultDelegator::new(cfg).unwrap();
+        let debug = format!("{d:?}");
+        assert!(!debug.contains("SENSITIVE_ROLE_ID"));
+        assert!(!debug.contains("SENSITIVE_SECRET_ID"));
+        assert!(debug.contains("[REDACTED]"));
+    }
+}
