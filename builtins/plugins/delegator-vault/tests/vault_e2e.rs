@@ -556,6 +556,21 @@ async fn cache_isolates_callers() {
     assert_eq!(&*alice_token.token, "alice-token");
     assert_eq!(&*bob_token.token, "bob-token");
     assert_ne!(&*alice_token.token, &*bob_token.token);
+
+    // Alice again — should hit cache, no new Vault calls
+    let alice_payload2 = DelegationPayload::new("alice-jwt", "github-api")
+        .with_target_audience("https://api.github.com");
+    let alice_ext2 = ext_with_user_sub("alice");
+    let alice_result2 = invoke(&mgr, alice_payload2, alice_ext2).await;
+    assert!(
+        alice_result2.continue_processing,
+        "{:?}",
+        alice_result2.violation
+    );
+    let fp2 = DelegationPayload::from_pipeline_result(&alice_result2).unwrap();
+    assert_eq!(&*fp2.delegated_token.as_ref().unwrap().token, "alice-token");
+    assert_eq!(&fp2.metadata["delegated_token_source"], "cache");
+    assert_eq!(http.call_count_for(AUTH_JWT_PATH), 2, "no new login call");
 }
 
 // Metadata includes secret_source and vault_secret_version.

@@ -144,6 +144,12 @@ pub(crate) fn validate_identity_value(value: &str) -> Result<(), Box<PluginViola
             "identity value contains null bytes",
         )));
     }
+    if value.contains('?') {
+        return Err(Box::new(PluginViolation::new(
+            "delegation.identity_invalid",
+            "identity value contains query-string separator",
+        )));
+    }
     let has_traversal = value.split('/').any(|seg| seg == ".." || seg == ".");
     let has_encoded = value.contains("%2e")
         || value.contains("%2E")
@@ -404,6 +410,12 @@ mod tests {
     #[test]
     fn rejects_encoded_traversal() {
         let err = validate_identity_value("foo%2e%2e").unwrap_err();
+        assert_eq!(err.code, "delegation.identity_invalid");
+    }
+
+    #[test]
+    fn rejects_query_string_separator() {
+        let err = validate_identity_value("user?admin=true").unwrap_err();
         assert_eq!(err.code, "delegation.identity_invalid");
     }
 

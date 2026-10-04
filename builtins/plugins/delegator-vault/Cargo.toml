@@ -37,7 +37,7 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 
 zeroize = { workspace = true }
-moka = { version = "0.12", features = ["future"] }
+moka = { workspace = true }
 
 [dev-dependencies]
 praxis-policy-core = { workspace = true, features = ["test-util"] }

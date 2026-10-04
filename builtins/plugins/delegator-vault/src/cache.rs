@@ -87,8 +87,10 @@ impl CredentialCache {
         }))
     }
 
-    /// Cache key combining subject variant and identity claim value.
-    pub(crate) fn cache_key(subject: &DelegationSubject, identity: &str) -> String {
+    /// Cache key combining subject variant, identity claim value, and target
+    /// audience. The null byte separator is safe because `validate_identity_value`
+    /// rejects null bytes in identity values.
+    pub(crate) fn cache_key(subject: &DelegationSubject, identity: &str, audience: &str) -> String {
         let tag = match subject {
             DelegationSubject::User => "u",
             DelegationSubject::Client => "c",
@@ -96,7 +98,7 @@ impl CredentialCache {
             DelegationSubject::ThisWorkload => "t",
             _ => "?",
         };
-        format!("{tag}:{identity}")
+        format!("{tag}:{identity}\0{audience}")
     }
 
     /// Get a cached credential or mint a new one.
@@ -185,11 +187,18 @@ mod tests {
 
     #[test]
     fn cache_key_includes_subject_tag() {
-        let k1 = CredentialCache::cache_key(&DelegationSubject::User, "alice");
-        let k2 = CredentialCache::cache_key(&DelegationSubject::Client, "alice");
+        let k1 = CredentialCache::cache_key(&DelegationSubject::User, "alice", "api");
+        let k2 = CredentialCache::cache_key(&DelegationSubject::Client, "alice", "api");
         assert_ne!(k1, k2);
         assert!(k1.starts_with("u:"));
         assert!(k2.starts_with("c:"));
+    }
+
+    #[test]
+    fn cache_key_includes_audience() {
+        let k1 = CredentialCache::cache_key(&DelegationSubject::User, "alice", "github");
+        let k2 = CredentialCache::cache_key(&DelegationSubject::User, "alice", "gitlab");
+        assert_ne!(k1, k2);
     }
 
     #[tokio::test]

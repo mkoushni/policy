@@ -128,11 +128,8 @@ impl VaultDelegator {
             auth.redact_sources();
         }
 
-        typed.cache.validate().map_err(|e| PluginError::Config {
-            message: format!("cache config invalid: {e}"),
-        })?;
         let cache = CredentialCache::new(&typed.cache).map_err(|e| PluginError::Config {
-            message: format!("cache construction failed: {e}"),
+            message: format!("cache config invalid: {e}"),
         })?;
 
         let timeout = typed.timeout();
@@ -304,7 +301,8 @@ impl HookHandler<TokenDelegateHook> for VaultDelegator {
 
         // Resolve credential — cached or fresh
         let served = if let Some(ref cache) = self.cache {
-            let key = CredentialCache::cache_key(subject, &identity_value);
+            let audience = payload.target_audience().unwrap_or("");
+            let key = CredentialCache::cache_key(subject, &identity_value, audience);
             match cache
                 .get_or_mint(
                     key,
