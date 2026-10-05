@@ -107,9 +107,11 @@ impl VaultDelegator {
             .boxed());
         }
 
-        // Validate auth keys
-        for key in typed.auth.keys() {
-            if DelegationSubject::from_config_str(key).is_none() {
+        const CANONICAL_SUBJECTS: [&str; 4] =
+            ["user", "client", "caller_workload", "this_workload"];
+
+        for (key, method) in &typed.auth {
+            if !CANONICAL_SUBJECTS.contains(&key.as_str()) {
                 return Err(PluginError::Config {
                     message: format!(
                         "unknown auth subject '{key}' — expected one of: \
@@ -117,6 +119,27 @@ impl VaultDelegator {
                     ),
                 }
                 .boxed());
+            }
+            match (key.as_str(), method) {
+                ("this_workload", VaultAuthMethod::Jwt { .. }) => {
+                    return Err(PluginError::Config {
+                        message: "this_workload must use approle, not jwt \
+                                  — there is no inbound token to forward"
+                            .into(),
+                    }
+                    .boxed());
+                },
+                ("user" | "client" | "caller_workload", VaultAuthMethod::AppRole { .. }) => {
+                    return Err(PluginError::Config {
+                        message: format!(
+                            "subject '{key}' must use jwt, not approle \
+                             — per-caller identity requires forwarding \
+                             the caller's own token"
+                        ),
+                    }
+                    .boxed());
+                },
+                _ => {},
             }
         }
 
@@ -485,6 +508,51 @@ mod tests {
         });
         let err = VaultDelegator::new(cfg).unwrap_err();
         assert!(err.to_string().contains("unknown auth subject"));
+    }
+
+    #[test]
+    fn rejects_alias_auth_subject() {
+        let mut cfg = base_config();
+        cfg.config.as_mut().unwrap()["auth"] = json!({
+            "gateway": { "method": "approle",
+                "role_id_source": { "kind": "literal", "secret": "r" },
+                "secret_id_source": { "kind": "literal", "secret": "s" } }
+        });
+        let err = VaultDelegator::new(cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown auth subject"),
+            "alias 'gateway' should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_this_workload_with_jwt() {
+        let mut cfg = base_config();
+        cfg.config.as_mut().unwrap()["auth"]["this_workload"] = json!({
+            "method": "jwt", "role": "bad"
+        });
+        let err = VaultDelegator::new(cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("this_workload must use approle"),
+            "expected method mismatch error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_user_with_approle() {
+        let mut cfg = base_config();
+        cfg.config.as_mut().unwrap()["auth"] = json!({
+            "user": {
+                "method": "approle",
+                "role_id_source": { "kind": "literal", "secret": "r" },
+                "secret_id_source": { "kind": "literal", "secret": "s" }
+            }
+        });
+        let err = VaultDelegator::new(cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("must use jwt"),
+            "expected method mismatch error: {err}"
+        );
     }
 
     #[test]
