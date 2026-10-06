@@ -342,7 +342,15 @@ async fn this_workload_uses_approle() {
             .json(KV_PATH_SHARED, 200, &kv_response("token", "shared-key")),
     );
 
-    let mut cfg = plugin_config_for(all_auth());
+    let this_workload_auth = json!({
+        "this_workload": {
+            "method": "approle",
+            "mount": "approle",
+            "role_id_source": { "kind": "literal", "secret": "test-role-id" },
+            "secret_id_source": { "kind": "literal", "secret": "test-secret-id" },
+        }
+    });
+    let mut cfg = plugin_config_for(this_workload_auth);
     cfg.config.as_mut().unwrap()["identity_claim"] = json!("spiffe_id");
     cfg.config.as_mut().unwrap()["secret_path_template"] = json!("shared/api-key");
 
