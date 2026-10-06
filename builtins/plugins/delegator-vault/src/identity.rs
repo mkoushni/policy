@@ -147,10 +147,10 @@ pub(crate) fn validate_identity_value(value: &str) -> Result<(), Box<PluginViola
             "identity value contains null bytes",
         )));
     }
-    if value.contains('?') {
+    if value.contains('?') || value.contains('#') {
         return Err(Box::new(PluginViolation::new(
             "delegation.identity_invalid",
-            "identity value contains query-string separator",
+            "identity value contains query-string or fragment separator",
         )));
     }
     let has_traversal = value.split('/').any(|seg| seg == ".." || seg == ".");
@@ -445,6 +445,12 @@ mod tests {
     #[test]
     fn rejects_query_string_separator() {
         let err = validate_identity_value("user?admin=true").unwrap_err();
+        assert_eq!(err.code, "delegation.identity_invalid");
+    }
+
+    #[test]
+    fn rejects_fragment_separator() {
+        let err = validate_identity_value("user#fragment").unwrap_err();
         assert_eq!(err.code, "delegation.identity_invalid");
     }
 

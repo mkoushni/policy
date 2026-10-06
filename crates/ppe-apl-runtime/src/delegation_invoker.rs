@@ -395,12 +395,12 @@ fn attenuation_from_cfg(
 /// sequence cannot silently become an empty list and bypass a downstream
 /// permissions guard.
 fn permissions_from_cfg(cfg: Option<&serde_yaml::Mapping>) -> Result<Vec<String>, DelegationError> {
-    let Some(perms) = cfg
-        .and_then(|m| m.get(serde_yaml::Value::String("permissions".into())))
-        .and_then(|v| v.as_sequence())
-    else {
+    let Some(val) = cfg.and_then(|m| m.get(serde_yaml::Value::String("permissions".into()))) else {
         return Ok(Vec::new());
     };
+    let perms = val.as_sequence().ok_or_else(|| {
+        DelegationError::InvalidConfig("`permissions:` must be a sequence".into())
+    })?;
     let mut list = Vec::with_capacity(perms.len());
     for (i, v) in perms.iter().enumerate() {
         list.push(v.as_str().map(str::to_owned).ok_or_else(|| {
@@ -523,6 +523,13 @@ mod tests {
     fn mixed_string_and_non_string_permissions_rejected() {
         let err = permissions_from_cfg(Some(&cfg("permissions:\n  - read:comp\n  - true")))
             .expect_err("mixed types must fail closed");
+        assert!(matches!(err, DelegationError::InvalidConfig(_)), "{err:?}");
+    }
+
+    #[test]
+    fn scalar_permissions_value_is_rejected() {
+        let err = permissions_from_cfg(Some(&cfg("permissions: read:comp")))
+            .expect_err("scalar permissions must fail closed");
         assert!(matches!(err, DelegationError::InvalidConfig(_)), "{err:?}");
     }
 

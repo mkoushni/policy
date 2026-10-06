@@ -143,6 +143,22 @@ impl VaultDelegator {
             }
         }
 
+        let placeholder = format!("{{{{{}}}}}", typed.identity_claim);
+        let has_jwt_subject = typed
+            .auth
+            .iter()
+            .any(|(key, _)| matches!(key.as_str(), "user" | "client" | "caller_workload"));
+        if has_jwt_subject && !typed.secret_path_template.contains(&placeholder) {
+            return Err(PluginError::Config {
+                message: format!(
+                    "secret_path_template must contain '{placeholder}' when a per-caller \
+                     subject (user/client/caller_workload) is configured — \
+                     without it every caller reads the same secret"
+                ),
+            }
+            .boxed());
+        }
+
         // Eagerly resolve AppRole credentials (per subject)
         let approle_creds = resolve_approle_creds(&typed)?;
 
@@ -597,6 +613,48 @@ mod tests {
     fn trims_vault_addr_whitespace() {
         let mut cfg = base_config();
         cfg.config.as_mut().unwrap()["vault_addr"] = json!("  https://vault.test:8200  ");
+        assert!(VaultDelegator::new(cfg).is_ok());
+    }
+
+    #[test]
+    fn rejects_jwt_subject_without_template_placeholder() {
+        let cfg = PluginConfig {
+            name: "vault-test".into(),
+            kind: "test".into(),
+            config: Some(json!({
+                "vault_addr": "https://vault.test:8200",
+                "secret_path_template": "shared/api-key",
+                "auth": {
+                    "user": { "method": "jwt", "role": "r" }
+                }
+            })),
+            ..Default::default()
+        };
+        let err = VaultDelegator::new(cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("secret_path_template"),
+            "expected placeholder error: {err}"
+        );
+    }
+
+    #[test]
+    fn allows_this_workload_only_with_fixed_path() {
+        let cfg = PluginConfig {
+            name: "vault-test".into(),
+            kind: "test".into(),
+            config: Some(json!({
+                "vault_addr": "https://vault.test:8200",
+                "secret_path_template": "shared/api-key",
+                "auth": {
+                    "this_workload": {
+                        "method": "approle",
+                        "role_id_source": { "kind": "literal", "secret": "r" },
+                        "secret_id_source": { "kind": "literal", "secret": "s" }
+                    }
+                }
+            })),
+            ..Default::default()
+        };
         assert!(VaultDelegator::new(cfg).is_ok());
     }
 
