@@ -220,9 +220,7 @@ impl CacheConfig {
         let secs = i64::try_from(self.ttl_seconds)
             .map_err(|_overflow| "cache.ttl_seconds exceeds i64::MAX".to_owned())?;
         if chrono::TimeDelta::try_seconds(secs).is_none() {
-            return Err(
-                "cache.ttl_seconds is too large for duration arithmetic".into(),
-            );
+            return Err("cache.ttl_seconds is too large for duration arithmetic".into());
         }
         if self.enabled && self.max_entries == 0 {
             return Err("cache.max_entries must be > 0 when cache is enabled".into());
