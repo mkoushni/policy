@@ -214,13 +214,13 @@ impl Default for CacheConfig {
 
 impl CacheConfig {
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if !self.enabled {
-            return Ok(());
-        }
         if self.ttl_seconds == 0 {
-            return Err("cache.ttl_seconds must be > 0 when cache is enabled".into());
+            return Err("cache.ttl_seconds must be > 0".into());
         }
-        if self.max_entries == 0 {
+        if i64::try_from(self.ttl_seconds).is_err() {
+            return Err("cache.ttl_seconds exceeds i64::MAX".into());
+        }
+        if self.enabled && self.max_entries == 0 {
             return Err("cache.max_entries must be > 0 when cache is enabled".into());
         }
         Ok(())
@@ -387,13 +387,23 @@ mod tests {
     }
 
     #[test]
-    fn disabled_cache_skips_validation() {
+    fn disabled_cache_skips_max_entries_validation() {
+        let cfg = CacheConfig {
+            enabled: false,
+            ttl_seconds: 300,
+            max_entries: 0,
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_zero_ttl_even_when_disabled() {
         let cfg = CacheConfig {
             enabled: false,
             ttl_seconds: 0,
             max_entries: 0,
         };
-        assert!(cfg.validate().is_ok());
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

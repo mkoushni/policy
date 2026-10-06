@@ -151,6 +151,10 @@ impl VaultDelegator {
             auth.redact_sources();
         }
 
+        typed.cache.validate().map_err(|e| PluginError::Config {
+            message: format!("cache config invalid: {e}"),
+        })?;
+
         let cache = CredentialCache::new(&typed.cache).map_err(|e| PluginError::Config {
             message: format!("cache config invalid: {e}"),
         })?;
@@ -260,12 +264,13 @@ impl VaultDelegator {
         // scope set, and the framework's monotonic-narrowing invariant
         // treats an empty list as "no scope claim made" rather than
         // "zero permissions".
+        let ttl_i64 = i64::try_from(ttl_secs).unwrap_or(300);
         let token = RawDelegatedToken::new(
             token_value,
             &self.typed.outbound_header,
             payload.target_audience().unwrap_or(""),
             Vec::new(),
-            Utc::now() + chrono::Duration::seconds(i64::try_from(ttl_secs).unwrap_or(300)),
+            Utc::now() + chrono::Duration::seconds(ttl_i64),
         );
 
         Ok(Mint {
@@ -313,13 +318,20 @@ impl HookHandler<TokenDelegateHook> for VaultDelegator {
             &identity_value,
         );
 
-        // Warn if route attenuation is requested (static creds can't be attenuated)
         if payload.route_attenuation().is_some() {
-            tracing::warn!(
-                plugin = %self.cfg.name,
-                "route attenuation requested but delegator/vault resolves \
-                 static credentials — attenuation cannot be honored"
-            );
+            return PluginResult::deny(PluginViolation::new(
+                "delegation.attenuation_unsupported",
+                "delegator/vault resolves static credentials — \
+                 route attenuation cannot be honored",
+            ));
+        }
+
+        if !payload.required_permissions().is_empty() {
+            return PluginResult::deny(PluginViolation::new(
+                "delegation.permissions_unsupported",
+                "delegator/vault resolves static credentials — \
+                 required_permissions cannot be enforced",
+            ));
         }
 
         // Resolve credential — cached or fresh

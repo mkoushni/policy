@@ -40,7 +40,7 @@ use praxis_policy_core::delegation::{
     DelegationPayload, DelegationSubject, HOOK_TOKEN_DELEGATE, TokenDelegateHook,
 };
 use praxis_policy_core::engine::PolicyEngine;
-use praxis_policy_core::extensions::raw_credentials::{DelegationMode, TokenRole};
+use praxis_policy_core::extensions::raw_credentials::DelegationMode;
 use praxis_policy_core::extensions::security::{
     ClientExtension, SecurityExtension, SubjectExtension, WorkloadIdentity,
 };
@@ -259,9 +259,9 @@ async fn user_subject_happy_path() {
     assert_eq!(http.call_count_for(KV_PATH_USER123), 1);
 }
 
-// CallerWorkload subject: JWT login with actor_token (not bearer_token).
+// CallerWorkload subject: JWT login with bearer_token (the inbound SVID).
 #[tokio::test]
-async fn caller_workload_uses_actor_token() {
+async fn caller_workload_uses_bearer_token() {
     let http = Arc::new(
         FakeTransport::new()
             .json(AUTH_JWT_PATH, 200, &vault_login_response())
@@ -273,10 +273,9 @@ async fn caller_workload_uses_actor_token() {
     cfg.config.as_mut().unwrap()["secret_path_template"] = json!("agents/{{spiffe_id}}/github");
 
     let mgr = build_manager(cfg, &http).await;
-    let payload = DelegationPayload::new("user-jwt-bytes", "github-api")
+    let payload = DelegationPayload::new("svid-jwt-bytes", "github-api")
         .with_subject(DelegationSubject::CallerWorkload)
-        .with_target_audience("https://api.github.com")
-        .with_actor(TokenRole::CallerWorkload, "svid-jwt-bytes");
+        .with_target_audience("https://api.github.com");
     let ext = ext_with_caller_workload("spiffe://example.com/agent");
 
     let result = invoke(&mgr, payload, ext).await;
@@ -291,15 +290,14 @@ async fn caller_workload_uses_actor_token() {
         Some(DelegationMode::AsCallerWorkload),
     ));
 
-    // Verify the JWT login used the actor_token, not the bearer
+    // Verify the JWT login used the bearer_token (the workload's SVID)
     let login_req = http
         .requests()
         .into_iter()
         .find(|r| r.url.contains("auth/jwt/login"))
         .expect("jwt login request");
     let body = String::from_utf8_lossy(&login_req.body).into_owned();
-    assert!(body.contains("svid-jwt-bytes"), "should use actor_token");
-    assert!(!body.contains("user-jwt-bytes"), "should not use bearer");
+    assert!(body.contains("svid-jwt-bytes"), "should use bearer_token");
 }
 
 // Client subject: JWT login with bearer_token, identity from client_id.

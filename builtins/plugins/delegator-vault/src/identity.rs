@@ -33,6 +33,9 @@ pub(crate) fn resolve_identity(
                 .subject
                 .as_ref()
                 .ok_or_else(|| identity_missing(subject, claim, "no subject identity resolved"))?;
+            if let (true, Some(id)) = (claim == "sub", sub.id.as_deref()) {
+                return Ok(id.to_owned());
+            }
             sub.claim_str(claim)
                 .map(Cow::into_owned)
                 .ok_or_else(|| identity_missing(subject, claim, "claim not present on subject"))
@@ -105,11 +108,11 @@ pub(crate) fn resolve_auth_token<'p>(
             Ok(t)
         },
         DelegationSubject::CallerWorkload => {
-            let t = payload.actor_token();
+            let t = payload.bearer_token();
             if t.is_empty() {
                 return Err(Box::new(PluginViolation::new(
                     "delegation.bad_request",
-                    "empty actor_token — caller workload has no JWT-SVID \
+                    "empty bearer_token — caller workload has no JWT-SVID \
                      to authenticate to Vault",
                 )));
             }
@@ -254,10 +257,8 @@ mod tests {
     }
 
     #[test]
-    fn user_subject_resolves_sub_claim() {
-        let mut claims = HashMap::new();
-        claims.insert("sub".into(), serde_json::json!("user-123"));
-        let ext = ext_with_subject(claims);
+    fn user_subject_resolves_sub_from_id() {
+        let ext = ext_with_subject(HashMap::new());
         let cfg = config_with_claim("sub");
 
         let id = resolve_identity(&DelegationSubject::User, &ext, &cfg).unwrap();
@@ -265,8 +266,37 @@ mod tests {
     }
 
     #[test]
+    fn user_subject_sub_falls_back_to_claims() {
+        let ext = Extensions {
+            security: Some(Arc::new(SecurityExtension {
+                subject: Some(SubjectExtension {
+                    id: None,
+                    claims: HashMap::from([("sub".into(), serde_json::json!("from-claims"))]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let cfg = config_with_claim("sub");
+
+        let id = resolve_identity(&DelegationSubject::User, &ext, &cfg).unwrap();
+        assert_eq!(id, "from-claims");
+    }
+
+    #[test]
     fn user_subject_missing_claim_errors() {
-        let ext = ext_with_subject(HashMap::new());
+        let ext = Extensions {
+            security: Some(Arc::new(SecurityExtension {
+                subject: Some(SubjectExtension {
+                    id: None,
+                    claims: HashMap::new(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
         let cfg = config_with_claim("sub");
 
         let err = resolve_identity(&DelegationSubject::User, &ext, &cfg).unwrap_err();
@@ -374,10 +404,9 @@ mod tests {
     }
 
     #[test]
-    fn actor_token_for_caller_workload() {
-        use praxis_policy_core::extensions::raw_credentials::TokenRole;
-        let payload = DelegationPayload::new("user-jwt", "target")
-            .with_actor(TokenRole::CallerWorkload, "svid-jwt");
+    fn bearer_token_for_caller_workload() {
+        let payload = DelegationPayload::new("svid-jwt", "target")
+            .with_subject(DelegationSubject::CallerWorkload);
         let t = resolve_auth_token(&DelegationSubject::CallerWorkload, &payload).unwrap();
         assert_eq!(t, "svid-jwt");
     }

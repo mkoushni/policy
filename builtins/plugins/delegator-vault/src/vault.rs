@@ -43,7 +43,10 @@ pub(crate) async fn jwt_login(
         .map_err(|e| violation_for_invalid_request("JWT login", &e))?;
 
     let response = svc
-        .http_request(request, RetryPolicy::undelivered_only())
+        .http_request(
+            request,
+            RetryPolicy::undelivered_only().with_total_budget(timeout),
+        )
         .await
         .map_err(|e| violation_for_transport("JWT login", &e))?;
 
@@ -92,7 +95,10 @@ pub(crate) async fn approle_login(
         .map_err(|e| violation_for_invalid_request("AppRole login", &e))?;
 
     let response = svc
-        .http_request(request, RetryPolicy::undelivered_only())
+        .http_request(
+            request,
+            RetryPolicy::undelivered_only().with_total_budget(timeout),
+        )
         .await
         .map_err(|e| violation_for_transport("AppRole login", &e))?;
 
@@ -136,7 +142,10 @@ pub(crate) async fn kv_read(
         .map_err(|e| violation_for_invalid_request("KV read", &e))?;
 
     let response = svc
-        .http_request(request, RetryPolicy::idempotent())
+        .http_request(
+            request,
+            RetryPolicy::idempotent().with_total_budget(timeout),
+        )
         .await
         .map_err(|e| violation_for_transport("KV read", &e))?;
 
