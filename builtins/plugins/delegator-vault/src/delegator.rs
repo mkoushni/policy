@@ -264,13 +264,17 @@ impl VaultDelegator {
         // scope set, and the framework's monotonic-narrowing invariant
         // treats an empty list as "no scope claim made" rather than
         // "zero permissions".
-        let ttl_i64 = i64::try_from(ttl_secs).unwrap_or(300);
+        let expires_at = i64::try_from(ttl_secs)
+            .ok()
+            .and_then(chrono::TimeDelta::try_seconds)
+            .and_then(|d| Utc::now().checked_add_signed(d))
+            .unwrap_or_else(|| Utc::now() + chrono::TimeDelta::seconds(300));
         let token = RawDelegatedToken::new(
             token_value,
             &self.typed.outbound_header,
             payload.target_audience().unwrap_or(""),
             Vec::new(),
-            Utc::now() + chrono::Duration::seconds(ttl_i64),
+            expires_at,
         );
 
         Ok(Mint {

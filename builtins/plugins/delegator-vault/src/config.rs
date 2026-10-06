@@ -217,8 +217,12 @@ impl CacheConfig {
         if self.ttl_seconds == 0 {
             return Err("cache.ttl_seconds must be > 0".into());
         }
-        if i64::try_from(self.ttl_seconds).is_err() {
-            return Err("cache.ttl_seconds exceeds i64::MAX".into());
+        let secs = i64::try_from(self.ttl_seconds)
+            .map_err(|_overflow| "cache.ttl_seconds exceeds i64::MAX".to_owned())?;
+        if chrono::TimeDelta::try_seconds(secs).is_none() {
+            return Err(
+                "cache.ttl_seconds is too large for duration arithmetic".into(),
+            );
         }
         if self.enabled && self.max_entries == 0 {
             return Err("cache.max_entries must be > 0 when cache is enabled".into());
@@ -404,6 +408,24 @@ mod tests {
             max_entries: 0,
         };
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_ttl_too_large_for_duration_arithmetic() {
+        let cfg = CacheConfig {
+            enabled: false,
+            ttl_seconds: u64::MAX,
+            max_entries: 0,
+        };
+        assert!(cfg.validate().is_err());
+
+        // A value within i64 range but too large for chrono::TimeDelta
+        let cfg2 = CacheConfig {
+            enabled: false,
+            ttl_seconds: i64::MAX as u64,
+            max_entries: 0,
+        };
+        assert!(cfg2.validate().is_err());
     }
 
     #[test]
