@@ -142,29 +142,37 @@ const SAFE_HEADERS: &[&str] = &[
 
 impl std::fmt::Debug for HttpRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        struct RedactedHeaders<'a>(&'a HeaderMap);
+
+        impl fmt::Debug for RedactedHeaders<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_list()
+                    .entries(self.0.keys().map(|k| RedactedEntry(k, self.0)))
+                    .finish()
+            }
+        }
+
+        struct RedactedEntry<'a>(&'a HeaderName, &'a HeaderMap);
+
+        impl fmt::Debug for RedactedEntry<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                if SAFE_HEADERS.contains(&self.0.as_str()) {
+                    let val = self
+                        .1
+                        .get(self.0)
+                        .map(|v| v.to_str().unwrap_or("\u{2026}"))
+                        .unwrap_or("\u{2026}");
+                    write!(f, "{}: {val}", self.0)
+                } else {
+                    write!(f, "{}: [REDACTED]", self.0)
+                }
+            }
+        }
+
         let mut dbg = f.debug_struct("HttpRequest");
         dbg.field("method", &self.method);
         dbg.field("url", &self.url);
-
-        let safe: Vec<_> = self
-            .headers
-            .keys()
-            .map(|k| {
-                if SAFE_HEADERS.contains(&k.as_str()) {
-                    format!(
-                        "{k}: {}",
-                        self.headers
-                            .get(k)
-                            .map(|v| v.to_str().unwrap_or("…"))
-                            .unwrap_or("…")
-                    )
-                } else {
-                    format!("{k}: [REDACTED]")
-                }
-            })
-            .collect();
-        dbg.field("headers", &safe);
-
+        dbg.field("headers", &RedactedHeaders(&self.headers));
         dbg.field("body", &format_args!("[{} bytes]", self.body.len()));
         dbg.field("timeout", &self.timeout);
         dbg.field("connect_timeout", &self.connect_timeout);

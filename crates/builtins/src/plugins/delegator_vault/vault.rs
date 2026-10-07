@@ -30,7 +30,7 @@ pub(crate) async fn jwt_login(
     timeout: Duration,
 ) -> Result<VaultToken, PluginViolation> {
     let body = serde_json::json!({ "jwt": jwt, "role": role }).to_string();
-    vault_login(svc, vault_addr, mount, &body, "JWT", timeout).await
+    vault_login(svc, vault_addr, mount, body, "JWT", timeout).await
 }
 
 /// Login to Vault using `AppRole` auth.
@@ -49,20 +49,20 @@ pub(crate) async fn approle_login(
         "secret_id": secret_id
     })
     .to_string();
-    vault_login(svc, vault_addr, mount, &body, "AppRole", timeout).await
+    vault_login(svc, vault_addr, mount, body, "AppRole", timeout).await
 }
 
 async fn vault_login(
     svc: &dyn HostServices,
     vault_addr: &str,
     mount: &str,
-    body: &str,
+    body: String,
     method_label: &str,
     timeout: Duration,
 ) -> Result<VaultToken, PluginViolation> {
     let url = format!("{vault_addr}/v1/auth/{mount}/login");
 
-    let request = HttpRequest::post(&url, Bytes::from(body.to_owned()))
+    let request = HttpRequest::post(&url, Bytes::from(body))
         .timeout(timeout)
         .max_response_bytes(64 * 1024);
     let request = request
@@ -81,7 +81,17 @@ async fn vault_login(
         .map_err(|e| violation_for_transport(&format!("{method_label} login"), &e))?;
 
     if !response.is_success() {
-        return Err(auth_failure_violation(response.status, method_label));
+        return if response.status >= 500 {
+            Err(PluginViolation::new(
+                "delegation.vault_error",
+                format!(
+                    "Vault {method_label} login failed — server error (HTTP {})",
+                    response.status
+                ),
+            ))
+        } else {
+            Err(auth_failure_violation(response.status, method_label))
+        };
     }
 
     let parsed: VaultAuthResponse = serde_json::from_slice(&response.body).map_err(|_e| {
@@ -276,5 +286,17 @@ mod tests {
         let v = auth_failure_violation(401, "JWT");
         assert_eq!(v.code, "delegation.vault_auth_failed");
         assert!(!v.reason.contains("eyJ"));
+    }
+
+    /// RFC 9110 §15.6.4: 503 is a server-side availability failure.
+    /// `vault_login` maps status >= 500 to `vault_error`, reserving
+    /// `vault_auth_failed` for client-side rejections (4xx). This test
+    /// pins the helper used for the 4xx branch.
+    #[test]
+    fn auth_failure_is_reserved_for_client_rejections() {
+        for status in [400, 401, 403, 404] {
+            let v = auth_failure_violation(status, "JWT");
+            assert_eq!(v.code, "delegation.vault_auth_failed");
+        }
     }
 }
