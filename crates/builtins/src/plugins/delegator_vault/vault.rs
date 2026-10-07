@@ -296,7 +296,10 @@ mod tests {
     fn auth_failure_is_reserved_for_client_rejections() {
         for status in [400, 401, 403, 404] {
             let v = auth_failure_violation(status, "JWT");
-            assert_eq!(v.code, "delegation.vault_auth_failed");
+            assert_eq!(
+                v.code, "delegation.vault_auth_failed",
+                "HTTP {status} must map to vault_auth_failed, not vault_error"
+            );
         }
     }
 }
