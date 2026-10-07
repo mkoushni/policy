@@ -16,7 +16,6 @@
 //   * Vault auth failure (401) — surfaces `delegation.vault_auth_failed`
 //   * Vault unreachable — surfaces `delegation.vault_unreachable`
 //   * missing field in secret — surfaces `delegation.vault_field_missing`
-//   * scheme prefix — configured prefix prepended to token value
 //   * cache isolation — two callers get distinct credentials
 //   * secret rotation — after TTL, new value fetched (unit-level; moka
 //     uses monotonic time, so wall-clock advancement requires moka's
@@ -448,33 +447,6 @@ async fn missing_field_in_secret() {
     assert_eq!(
         result.violation.as_ref().unwrap().code,
         "delegation.vault_field_missing"
-    );
-}
-
-// Scheme prefix is prepended to the resolved credential.
-#[tokio::test]
-async fn scheme_prefix_applied() {
-    let http = Arc::new(
-        FakeTransport::new()
-            .json(AUTH_JWT_PATH, 200, &vault_login_response())
-            .json(KV_PATH_USER123, 200, &kv_response("token", "ghp_xxx")),
-    );
-
-    let mut cfg = plugin_config_for(user_auth());
-    cfg.config.as_mut().unwrap()["scheme_prefix"] = json!("token ");
-
-    let mgr = build_manager(cfg, &http).await;
-    let payload = DelegationPayload::new("user-jwt", "github-api")
-        .with_target_audience("https://api.github.com");
-    let ext = ext_with_user_sub("user-123");
-
-    let result = invoke(&mgr, payload, ext).await;
-    assert!(result.continue_processing, "{:?}", result.violation);
-
-    let final_payload = DelegationPayload::from_pipeline_result(&result).unwrap();
-    assert_eq!(
-        &*final_payload.delegated_token.as_ref().unwrap().token,
-        "token ghp_xxx"
     );
 }
 

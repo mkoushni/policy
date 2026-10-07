@@ -127,13 +127,17 @@ pub struct HttpRequest {
     pub max_response_bytes: usize,
 }
 
-const SENSITIVE_HEADERS: &[&str] = &[
-    "authorization",
-    "proxy-authorization",
-    "x-vault-token",
-    "x-vault-request",
-    "cookie",
-    "set-cookie",
+/// Headers whose values are safe to show in debug output. Everything
+/// else is redacted by default — an unlisted header may carry a token,
+/// API key, or session cookie, and adding it to a denylist only after
+/// someone notices is too late.
+const SAFE_HEADERS: &[&str] = &[
+    "accept",
+    "content-length",
+    "content-type",
+    "host",
+    "user-agent",
+    "x-request-id",
 ];
 
 impl std::fmt::Debug for HttpRequest {
@@ -142,33 +146,24 @@ impl std::fmt::Debug for HttpRequest {
         dbg.field("method", &self.method);
         dbg.field("url", &self.url);
 
-        let redacted_count = self
+        let safe: Vec<_> = self
             .headers
             .keys()
-            .filter(|k| SENSITIVE_HEADERS.contains(&k.as_str()))
-            .count();
-        if redacted_count > 0 {
-            let safe: Vec<_> = self
-                .headers
-                .keys()
-                .map(|k| {
-                    if SENSITIVE_HEADERS.contains(&k.as_str()) {
-                        format!("{k}: [REDACTED]")
-                    } else {
-                        format!(
-                            "{k}: {}",
-                            self.headers
-                                .get(k)
-                                .map(|v| v.to_str().unwrap_or("…"))
-                                .unwrap_or("…")
-                        )
-                    }
-                })
-                .collect();
-            dbg.field("headers", &safe);
-        } else {
-            dbg.field("headers", &self.headers);
-        }
+            .map(|k| {
+                if SAFE_HEADERS.contains(&k.as_str()) {
+                    format!(
+                        "{k}: {}",
+                        self.headers
+                            .get(k)
+                            .map(|v| v.to_str().unwrap_or("…"))
+                            .unwrap_or("…")
+                    )
+                } else {
+                    format!("{k}: [REDACTED]")
+                }
+            })
+            .collect();
+        dbg.field("headers", &safe);
 
         dbg.field("body", &format_args!("[{} bytes]", self.body.len()));
         dbg.field("timeout", &self.timeout);

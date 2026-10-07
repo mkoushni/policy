@@ -40,12 +40,7 @@ impl PluginFactory for VaultDelegatorFactory {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    reason = "tests"
-)]
+#[expect(clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use super::*;
     use serde_json::json;

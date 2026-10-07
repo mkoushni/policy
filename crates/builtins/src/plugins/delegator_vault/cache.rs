@@ -60,7 +60,6 @@ impl std::fmt::Debug for Served {
 /// receive the same result. A failed fetch is not cached.
 pub(crate) struct CredentialCache {
     inner: moka::future::Cache<String, CachedMint>,
-    config: CacheConfig,
 }
 
 #[derive(Clone)]
@@ -83,10 +82,7 @@ impl CredentialCache {
             .time_to_live(Duration::from_secs(config.ttl_seconds))
             .build();
 
-        Ok(Some(Self {
-            inner,
-            config: config.clone(),
-        }))
+        Ok(Some(Self { inner }))
     }
 
     /// Cache key combining subject variant, identity claim value, target
@@ -155,15 +151,10 @@ impl CredentialCache {
             minted_at: value.minted_at,
         })
     }
-
-    /// The configured TTL, used for `expires_at` computation.
-    pub(crate) fn ttl_seconds(&self) -> u64 {
-        self.config.ttl_seconds
-    }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic, reason = "tests")]
+#[expect(clippy::unwrap_used, clippy::panic, reason = "tests")]
 mod tests {
     use super::*;
 

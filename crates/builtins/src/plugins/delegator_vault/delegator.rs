@@ -33,6 +33,7 @@ pub struct VaultDelegator {
     typed: VaultDelegatorConfig,
     approle_creds: HashMap<String, ResolvedAppRole>,
     timeout: Duration,
+    ttl: chrono::TimeDelta,
     cache: Option<CredentialCache>,
 }
 
@@ -177,11 +178,20 @@ impl VaultDelegator {
 
         let timeout = typed.timeout();
 
+        // Safe: CacheConfig::validate already proved the conversion succeeds.
+        let ttl_secs = i64::try_from(typed.cache.ttl_seconds)
+            .ok()
+            .and_then(chrono::TimeDelta::try_seconds)
+            .ok_or_else(|| PluginError::Config {
+                message: "cache.ttl_seconds is not representable as a TimeDelta".into(),
+            })?;
+
         Ok(Self {
             cfg,
             typed,
             approle_creds,
             timeout,
+            ttl: ttl_secs,
             cache,
         })
     }
@@ -265,26 +275,9 @@ impl VaultDelegator {
                 )
             })?;
 
-        // Apply scheme prefix if configured
-        let token_value = match &self.typed.scheme_prefix {
-            Some(prefix) => format!("{prefix}{secret_value}"),
-            None => secret_value.to_owned(),
-        };
+        let token_value = secret_value.to_owned();
 
-        let ttl_secs = self
-            .cache
-            .as_ref()
-            .map_or(self.typed.cache.ttl_seconds, CredentialCache::ttl_seconds);
-
-        // Scopes are empty: a pre-stored PAT has no machine-discoverable
-        // scope set, and the framework's monotonic-narrowing invariant
-        // treats an empty list as "no scope claim made" rather than
-        // "zero permissions".
-        let expires_at = i64::try_from(ttl_secs)
-            .ok()
-            .and_then(chrono::TimeDelta::try_seconds)
-            .and_then(|d| Utc::now().checked_add_signed(d))
-            .unwrap_or_else(|| Utc::now() + chrono::TimeDelta::seconds(300));
+        let expires_at = Utc::now() + self.ttl;
         let token = RawDelegatedToken::new(
             token_value,
             &self.typed.outbound_header,
@@ -481,10 +474,8 @@ fn resolve_approle_creds(
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
     clippy::assertions_on_result_states,
     clippy::indexing_slicing,
     reason = "tests"

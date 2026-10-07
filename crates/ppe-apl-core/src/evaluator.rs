@@ -1289,6 +1289,8 @@ fn dispatch_parallel<'a>(
             Vec<crate::constraint::CandidateConstraint>,
         );
         let mut branches: Vec<ErasedBranch<BranchResult>> = Vec::with_capacity(effects.len());
+        // Each branch snapshots `authorized` — changes inside a branch
+        // are discarded and do not authorize later outer effects.
         let authz_snapshot = *authorized;
         for effect in effects {
             let effect = effect.clone();
@@ -1409,11 +1411,17 @@ fn dispatch_parallel<'a>(
     })
 }
 
-/// Whether the top-level effects list contains at least one `Pdp` step.
-/// Used to enforce delegation-after-authorization: when a PDP exists in
+/// Whether the effects tree contains at least one `Pdp` step, including
+/// inside `When` bodies, `Sequential`, and `Parallel` children. Used to
+/// enforce delegation-after-authorization: when a PDP exists anywhere in
 /// the phase, `delegate(...)` must not run until the PDP has allowed.
 fn effects_contain_pdp(effects: &[Effect]) -> bool {
-    effects.iter().any(|e| matches!(e, Effect::Pdp { .. }))
+    effects.iter().any(|e| match e {
+        Effect::Pdp { .. } => true,
+        Effect::When { body, .. } => effects_contain_pdp(body),
+        Effect::Sequential(children) | Effect::Parallel(children) => effects_contain_pdp(children),
+        _ => false,
+    })
 }
 
 /// Short identity for a parallel branch in fail-closed deny reasons.

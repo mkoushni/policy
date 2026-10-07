@@ -29,41 +29,8 @@ pub(crate) async fn jwt_login(
     jwt: &str,
     timeout: Duration,
 ) -> Result<VaultToken, PluginViolation> {
-    let url = format!("{vault_addr}/v1/auth/{mount}/login");
     let body = serde_json::json!({ "jwt": jwt, "role": role }).to_string();
-
-    let request = HttpRequest::post(&url, Bytes::from(body))
-        .timeout(timeout)
-        .max_response_bytes(64 * 1024);
-    let request = request
-        .header("content-type", "application/json")
-        .map_err(|e| violation_for_invalid_request("JWT login", &e))?;
-    let request = request
-        .header("x-vault-request", "true")
-        .map_err(|e| violation_for_invalid_request("JWT login", &e))?;
-
-    let response = svc
-        .http_request(
-            request,
-            RetryPolicy::undelivered_only().with_total_budget(timeout),
-        )
-        .await
-        .map_err(|e| violation_for_transport("JWT login", &e))?;
-
-    if !response.is_success() {
-        return Err(auth_failure_violation(response.status, "JWT"));
-    }
-
-    let parsed: VaultAuthResponse = serde_json::from_slice(&response.body).map_err(|_e| {
-        PluginViolation::new(
-            "delegation.vault_error",
-            "Vault JWT login returned unparseable response",
-        )
-    })?;
-
-    Ok(VaultToken {
-        client_token: Zeroizing::new(parsed.auth.client_token),
-    })
+    vault_login(svc, vault_addr, mount, &body, "JWT", timeout).await
 }
 
 /// Login to Vault using `AppRole` auth.
@@ -77,22 +44,33 @@ pub(crate) async fn approle_login(
     secret_id: &str,
     timeout: Duration,
 ) -> Result<VaultToken, PluginViolation> {
-    let url = format!("{vault_addr}/v1/auth/{mount}/login");
     let body = serde_json::json!({
         "role_id": role_id,
         "secret_id": secret_id
     })
     .to_string();
+    vault_login(svc, vault_addr, mount, &body, "AppRole", timeout).await
+}
 
-    let request = HttpRequest::post(&url, Bytes::from(body))
+async fn vault_login(
+    svc: &dyn HostServices,
+    vault_addr: &str,
+    mount: &str,
+    body: &str,
+    method_label: &str,
+    timeout: Duration,
+) -> Result<VaultToken, PluginViolation> {
+    let url = format!("{vault_addr}/v1/auth/{mount}/login");
+
+    let request = HttpRequest::post(&url, Bytes::from(body.to_owned()))
         .timeout(timeout)
         .max_response_bytes(64 * 1024);
     let request = request
         .header("content-type", "application/json")
-        .map_err(|e| violation_for_invalid_request("AppRole login", &e))?;
+        .map_err(|e| violation_for_invalid_request(&format!("{method_label} login"), &e))?;
     let request = request
         .header("x-vault-request", "true")
-        .map_err(|e| violation_for_invalid_request("AppRole login", &e))?;
+        .map_err(|e| violation_for_invalid_request(&format!("{method_label} login"), &e))?;
 
     let response = svc
         .http_request(
@@ -100,16 +78,16 @@ pub(crate) async fn approle_login(
             RetryPolicy::undelivered_only().with_total_budget(timeout),
         )
         .await
-        .map_err(|e| violation_for_transport("AppRole login", &e))?;
+        .map_err(|e| violation_for_transport(&format!("{method_label} login"), &e))?;
 
     if !response.is_success() {
-        return Err(auth_failure_violation(response.status, "AppRole"));
+        return Err(auth_failure_violation(response.status, method_label));
     }
 
     let parsed: VaultAuthResponse = serde_json::from_slice(&response.body).map_err(|_e| {
         PluginViolation::new(
             "delegation.vault_error",
-            "Vault AppRole login returned unparseable response",
+            format!("Vault {method_label} login returned unparseable response"),
         )
     })?;
 
@@ -266,7 +244,7 @@ fn violation_for_invalid_request(operation: &str, err: &HttpTransportError) -> P
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, reason = "tests")]
+#[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
 

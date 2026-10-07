@@ -225,11 +225,7 @@ fn subject_label(subject: &DelegationSubject) -> Cow<'static, str> {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::assertions_on_result_states,
-    reason = "tests"
-)]
+#[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
     use praxis_policy_core::extensions::security::{

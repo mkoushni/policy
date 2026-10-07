@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 ///   secret_field: "token"
 ///   identity_claim: "sub"
 ///   outbound_header: "Authorization"
-///   scheme_prefix: "token "
 ///   timeout_seconds: 5
 ///   auth:
 ///     user:
@@ -66,15 +65,11 @@ pub struct VaultDelegatorConfig {
     #[serde(default = "default_identity_claim")]
     pub identity_claim: String,
 
-    /// Header name for the outbound credential.
+    /// Header name for the outbound credential. The host's outbound
+    /// filter adds the scheme (`Bearer`, `token`, …) — the token value
+    /// stored here is unprefixed.
     #[serde(default = "default_outbound_header")]
     pub outbound_header: String,
-
-    /// Optional prefix prepended to the secret value (e.g. `"Bearer "`,
-    /// `"token "`). When set, the handler stores
-    /// `format!("{scheme_prefix}{secret}")` in `RawDelegatedToken.token`.
-    #[serde(default)]
-    pub scheme_prefix: Option<String>,
 
     /// HTTP timeout for Vault calls, in seconds.
     #[serde(default = "default_timeout_seconds")]
@@ -287,7 +282,7 @@ fn default_max_entries() -> u64 {
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::unwrap_used,
     clippy::panic,
     clippy::assertions_on_result_states,
@@ -317,7 +312,6 @@ mod tests {
         assert_eq!(cfg.outbound_header, "Authorization");
         assert_eq!(cfg.timeout_seconds, 5);
         assert!(!cfg.insecure_http);
-        assert!(cfg.scheme_prefix.is_none());
         assert!(!cfg.cache.enabled);
     }
 
@@ -437,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn scheme_prefix_round_trips() {
+    fn unknown_field_rejected_by_deny_unknown() {
         let raw = json!({
             "vault_addr": "https://vault.example.com:8200",
             "secret_path_template": "agents/{{sub}}/github",
@@ -446,7 +440,6 @@ mod tests {
                 "user": { "method": "jwt", "role": "r" }
             }
         });
-        let cfg: VaultDelegatorConfig = serde_json::from_value(raw).unwrap();
-        assert_eq!(cfg.scheme_prefix.as_deref(), Some("Bearer "));
+        assert!(serde_json::from_value::<VaultDelegatorConfig>(raw).is_err());
     }
 }
