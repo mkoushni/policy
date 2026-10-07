@@ -6,11 +6,13 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
+use sha2::{Digest as _, Sha256};
+
 use praxis_policy_core::delegation::DelegationSubject;
 use praxis_policy_core::error::PluginViolation;
 use praxis_policy_core::extensions::raw_credentials::RawDelegatedToken;
 
-use crate::config::CacheConfig;
+use super::config::CacheConfig;
 
 /// What one Vault KV read produced.
 pub(crate) struct Mint {
@@ -87,10 +89,20 @@ impl CredentialCache {
         }))
     }
 
-    /// Cache key combining subject variant, identity claim value, and target
-    /// audience. The null byte separator is safe because `validate_identity_value`
+    /// Cache key combining subject variant, identity claim value, target
+    /// audience, and a SHA-256 digest of the authenticated credential.
+    ///
+    /// Including the credential hash prevents a JWT that Vault would
+    /// reject from reusing another JWT's cached credential when the
+    /// subject type, identity claim, and audience happen to match.
+    /// The null byte separator is safe because `validate_identity_value`
     /// rejects null bytes in identity values.
-    pub(crate) fn cache_key(subject: &DelegationSubject, identity: &str, audience: &str) -> String {
+    pub(crate) fn cache_key(
+        subject: &DelegationSubject,
+        identity: &str,
+        audience: &str,
+        credential: &str,
+    ) -> String {
         let tag = match subject {
             DelegationSubject::User => "u",
             DelegationSubject::Client => "c",
@@ -98,7 +110,9 @@ impl CredentialCache {
             DelegationSubject::ThisWorkload => "t",
             _ => "?",
         };
-        format!("{tag}:{identity}\0{audience}")
+        let hash = Sha256::digest(credential.as_bytes());
+        let hex: String = hash.iter().take(8).map(|b| format!("{b:02x}")).collect();
+        format!("{tag}:{identity}\0{audience}\0{hex}")
     }
 
     /// Get a cached credential or mint a new one.
@@ -187,8 +201,8 @@ mod tests {
 
     #[test]
     fn cache_key_includes_subject_tag() {
-        let k1 = CredentialCache::cache_key(&DelegationSubject::User, "alice", "api");
-        let k2 = CredentialCache::cache_key(&DelegationSubject::Client, "alice", "api");
+        let k1 = CredentialCache::cache_key(&DelegationSubject::User, "alice", "api", "jwt-a");
+        let k2 = CredentialCache::cache_key(&DelegationSubject::Client, "alice", "api", "jwt-a");
         assert_ne!(k1, k2);
         assert!(k1.starts_with("u:"));
         assert!(k2.starts_with("c:"));
@@ -196,9 +210,25 @@ mod tests {
 
     #[test]
     fn cache_key_includes_audience() {
-        let k1 = CredentialCache::cache_key(&DelegationSubject::User, "alice", "github");
-        let k2 = CredentialCache::cache_key(&DelegationSubject::User, "alice", "gitlab");
+        let k1 = CredentialCache::cache_key(&DelegationSubject::User, "alice", "github", "jwt-a");
+        let k2 = CredentialCache::cache_key(&DelegationSubject::User, "alice", "gitlab", "jwt-a");
         assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn cache_key_includes_credential_hash() {
+        let k1 =
+            CredentialCache::cache_key(&DelegationSubject::User, "alice", "api", "jwt-alice-1");
+        let k2 =
+            CredentialCache::cache_key(&DelegationSubject::User, "alice", "api", "jwt-alice-2");
+        assert_ne!(k1, k2, "different JWTs must produce different keys");
+    }
+
+    #[test]
+    fn cache_key_same_credential_same_key() {
+        let k1 = CredentialCache::cache_key(&DelegationSubject::User, "alice", "api", "jwt-alice");
+        let k2 = CredentialCache::cache_key(&DelegationSubject::User, "alice", "api", "jwt-alice");
+        assert_eq!(k1, k2);
     }
 
     #[tokio::test]

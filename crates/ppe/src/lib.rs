@@ -130,6 +130,10 @@ pub use praxis_policy_builtins::pdps::opa::OpaPdpFactory;
 pub use praxis_policy_builtins::plugins::delegator_oauth::{
     KIND as OAUTH_KIND, OAuthDelegatorFactory,
 };
+#[cfg(feature = "delegator-vault")]
+pub use praxis_policy_builtins::plugins::delegator_vault::{
+    KIND as VAULT_DELEGATOR_KIND, VaultDelegatorFactory,
+};
 #[cfg(feature = "elicitation-ciba")]
 pub use praxis_policy_builtins::plugins::elicitation_ciba::{
     CibaApproverFactory, KIND as CIBA_KIND,
@@ -150,10 +154,6 @@ pub use praxis_policy_builtins::secrets::vault::{
 #[cfg(feature = "valkey")]
 pub use praxis_policy_builtins::session::valkey::{
     KIND as VALKEY_KIND, ValkeyConfig, ValkeySessionStoreFactory,
-};
-#[cfg(feature = "delegator-vault")]
-pub use praxis_policy_plugin_delegator_vault::{
-    KIND as VAULT_DELEGATOR_KIND, VaultDelegatorFactory,
 };
 
 // =============================================================================
@@ -206,6 +206,8 @@ macro_rules! register_builtins {
 // keyed off each extension's own `KIND` const.
 #[cfg(feature = "oauth")]
 use praxis_policy_builtins::plugins::delegator_oauth as oauth_builtin;
+#[cfg(feature = "delegator-vault")]
+use praxis_policy_builtins::plugins::delegator_vault as vault_delegator_builtin;
 #[cfg(feature = "elicitation-ciba")]
 use praxis_policy_builtins::plugins::elicitation_ciba as ciba_builtin;
 #[cfg(feature = "api-key")]
@@ -214,8 +216,6 @@ use praxis_policy_builtins::plugins::identity_api_key as api_key_builtin;
 use praxis_policy_builtins::plugins::identity_jwt as jwt_builtin;
 #[cfg(feature = "experimental-quota")]
 use praxis_policy_builtins::plugins::quota as quota_builtin;
-#[cfg(feature = "delegator-vault")]
-use praxis_policy_plugin_delegator_vault as vault_delegator_builtin;
 
 #[cfg(feature = "_builtin")]
 register_builtins! {

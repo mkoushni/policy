@@ -2702,7 +2702,6 @@ dependencies = [
  "praxis-policy-builtins",
  "praxis-policy-core",
  "praxis-policy-pdp-diff",
- "praxis-policy-plugin-delegator-vault",
  "rustls",
  "serde_json",
  "tokio",
@@ -2858,22 +2857,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "praxis-policy-plugin-delegator-vault"
-version = "0.4.1"
-dependencies = [
- "async-trait",
- "bytes",
- "chrono",
- "moka",
- "praxis-policy-core",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "zeroize",
 ]
 
 [[package]]

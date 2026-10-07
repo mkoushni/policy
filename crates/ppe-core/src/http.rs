@@ -81,7 +81,7 @@ pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 /// call sites differ: a JWKS fetch at startup can afford a longer
 /// deadline than a token exchange sitting in a request's critical path.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpRequest {
     /// Request method.
     pub method: Method,
@@ -125,6 +125,57 @@ pub struct HttpRequest {
     /// body, because a truncated JWKS document is indistinguishable from
     /// a malformed one.
     pub max_response_bytes: usize,
+}
+
+const SENSITIVE_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "x-vault-token",
+    "x-vault-request",
+    "cookie",
+    "set-cookie",
+];
+
+impl std::fmt::Debug for HttpRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut dbg = f.debug_struct("HttpRequest");
+        dbg.field("method", &self.method);
+        dbg.field("url", &self.url);
+
+        let redacted_count = self
+            .headers
+            .keys()
+            .filter(|k| SENSITIVE_HEADERS.contains(&k.as_str()))
+            .count();
+        if redacted_count > 0 {
+            let safe: Vec<_> = self
+                .headers
+                .keys()
+                .map(|k| {
+                    if SENSITIVE_HEADERS.contains(&k.as_str()) {
+                        format!("{k}: [REDACTED]")
+                    } else {
+                        format!(
+                            "{k}: {}",
+                            self.headers
+                                .get(k)
+                                .map(|v| v.to_str().unwrap_or("…"))
+                                .unwrap_or("…")
+                        )
+                    }
+                })
+                .collect();
+            dbg.field("headers", &safe);
+        } else {
+            dbg.field("headers", &self.headers);
+        }
+
+        dbg.field("body", &format_args!("[{} bytes]", self.body.len()));
+        dbg.field("timeout", &self.timeout);
+        dbg.field("connect_timeout", &self.connect_timeout);
+        dbg.field("max_response_bytes", &self.max_response_bytes);
+        dbg.finish()
+    }
 }
 
 impl HttpRequest {
@@ -830,5 +881,36 @@ mod tests {
         .to_string();
         assert!(msg.contains("1024"), "{msg}");
         assert!(msg.contains("2048"), "{msg}");
+    }
+
+    #[test]
+    fn debug_redacts_sensitive_headers() {
+        let req = HttpRequest::post(
+            "https://vault.test/v1/auth/jwt/login",
+            Bytes::from(r#"{"jwt":"eyJ.SENSITIVE.jwt"}"#),
+        )
+        .header("authorization", "Bearer SENSITIVE_TOKEN")
+        .unwrap()
+        .header("x-vault-token", "s.SENSITIVE_VAULT_TOKEN")
+        .unwrap()
+        .header("content-type", "application/json")
+        .unwrap();
+        let debug = format!("{req:?}");
+        assert!(
+            !debug.contains("SENSITIVE"),
+            "Debug must not expose sensitive header values or body: {debug}"
+        );
+        assert!(debug.contains("[REDACTED]"));
+        assert!(debug.contains("content-type"));
+        assert!(debug.contains("vault.test"));
+    }
+
+    #[test]
+    fn debug_shows_safe_headers_unredacted() {
+        let req = HttpRequest::get("https://example.com")
+            .header("x-request-id", "abc-123")
+            .unwrap();
+        let debug = format!("{req:?}");
+        assert!(debug.contains("abc-123"));
     }
 }

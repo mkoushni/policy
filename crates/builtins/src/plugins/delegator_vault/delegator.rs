@@ -16,10 +16,10 @@ use praxis_policy_core::hooks::payload::Extensions;
 use praxis_policy_core::hooks::trait_def::{HookHandler, PluginResult};
 use praxis_policy_core::plugin::{Plugin, PluginConfig};
 
-use crate::cache::{CredentialCache, Mint, Served, Source};
-use crate::config::{VaultAuthMethod, VaultDelegatorConfig};
-use crate::identity;
-use crate::vault;
+use super::cache::{CredentialCache, Mint, Served, Source};
+use super::config::{VaultAuthMethod, VaultDelegatorConfig};
+use super::identity;
+use super::vault;
 
 struct ResolvedAppRole {
     role_id: Zeroizing<String>,
@@ -321,22 +321,36 @@ impl HookHandler<TokenDelegateHook> for VaultDelegator {
             return PluginResult::deny(*v);
         }
 
-        // Resolve identity claim for path templating
-        let identity_value = match identity::resolve_identity(subject, ext, &self.typed) {
-            Ok(id) => id,
-            Err(v) => return PluginResult::deny(*v),
-        };
-
-        // Validate identity value is safe for path embedding
-        if let Err(v) = identity::validate_identity_value(&identity_value) {
-            return PluginResult::deny(*v);
-        }
-
-        let resolved_path = identity::resolve_path(
+        // Resolve identity claim for path templating — skip when the
+        // path has no placeholder (e.g. `shared/api-key` with
+        // `this_workload`), since no identity value is needed.
+        let resolved_path = if identity::path_has_placeholder(
             &self.typed.secret_path_template,
             &self.typed.identity_claim,
-            &identity_value,
-        );
+        ) {
+            let identity_value = match identity::resolve_identity(subject, ext, &self.typed) {
+                Ok(id) => id,
+                Err(v) => return PluginResult::deny(*v),
+            };
+            if let Err(v) = identity::validate_identity_value(&identity_value) {
+                return PluginResult::deny(*v);
+            }
+            identity::resolve_path(
+                &self.typed.secret_path_template,
+                &self.typed.identity_claim,
+                &identity_value,
+            )
+        } else {
+            self.typed.secret_path_template.clone()
+        };
+
+        if payload.actor_role().is_some() {
+            return PluginResult::deny(PluginViolation::new(
+                "delegation.actor_unsupported",
+                "delegator/vault resolves static credentials — \
+                 actors cannot be recorded in a pre-stored secret",
+            ));
+        }
 
         if payload.route_attenuation().is_some() {
             return PluginResult::deny(PluginViolation::new(
@@ -354,10 +368,25 @@ impl HookHandler<TokenDelegateHook> for VaultDelegator {
             ));
         }
 
-        // Resolve credential — cached or fresh
+        // Resolve credential — cached or fresh.
+        //
+        // When caching, the key includes a SHA-256 prefix of the
+        // bearer token so a different JWT with the same subject claim
+        // cannot reuse another caller's cached credential. For
+        // `this_workload` (AppRole, no inbound token) the credential
+        // component is empty — safe because AppRole auth is this
+        // instance's own identity and never varies per caller.
         let served = if let Some(ref cache) = self.cache {
             let audience = payload.target_audience().unwrap_or("");
-            let key = CredentialCache::cache_key(subject, &identity_value, audience);
+            let credential = payload.bearer_token();
+            if subject.inbound_role().is_some() && credential.is_empty() {
+                return PluginResult::deny(PluginViolation::new(
+                    "delegation.bad_request",
+                    "bearer token is required for cache lookup — \
+                     cannot delegate without an authenticated credential",
+                ));
+            }
+            let key = CredentialCache::cache_key(subject, &resolved_path, audience, credential);
             match cache
                 .get_or_mint(
                     key,

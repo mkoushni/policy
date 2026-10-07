@@ -19,7 +19,6 @@ members = [
   "crates/ppe-apl-runtime",
   "crates/ppe-pdp-diff",
   "crates/builtins",
-  "builtins/plugins/delegator-vault",
   # Reference implementations, not published and not part of
   # `praxis-policy-builtins`. Workspace members so they stay built, linted and tested, and so
   # they keep working as examples of an out-of-tree plugin. Each manifest says
@@ -46,7 +45,6 @@ default-members = [
   "crates/ppe-apl-runtime",
   "crates/ppe-pdp-diff",
   "crates/builtins",
-  "builtins/plugins/delegator-vault",
   # Reference implementations, not published and not part of
   # `praxis-policy-builtins`. Workspace members so they stay built, linted and tested, and so
   # they keep working as examples of an out-of-tree plugin. Each manifest says
@@ -139,7 +137,6 @@ praxis-policy-apl-core = { path = "crates/ppe-apl-core", version = "0.4.1" }
 praxis-policy-apl-cmf = { path = "crates/ppe-apl-cmf", version = "0.4.1" }
 praxis-policy-apl-runtime = { path = "crates/ppe-apl-runtime", version = "0.4.1" }
 praxis-policy-builtins = { path = "crates/builtins", version = "0.4.1" }
-praxis-policy-plugin-delegator-vault = { path = "builtins/plugins/delegator-vault", version = "0.4.1" }
 
 # Criterion is consumed by the unpublished `ppe-benches` crate (issue #19)
 # and by `praxis-policy-builtins`' `pdp_decision_cache` bench.

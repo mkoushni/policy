@@ -9,7 +9,7 @@ use praxis_policy_core::factory::{PluginFactory, PluginInstance};
 use praxis_policy_core::hooks::TypedHandlerAdapter;
 use praxis_policy_core::plugin::PluginConfig;
 
-use crate::delegator::VaultDelegator;
+use super::delegator::VaultDelegator;
 
 /// The `kind:` value operators write in PPE YAML to select this plugin.
 ///

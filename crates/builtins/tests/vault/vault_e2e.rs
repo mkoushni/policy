@@ -23,24 +23,13 @@
 //     test-clock feature, which is exercised in cache.rs unit tests)
 //   * path traversal — identity with `..` rejected
 
-#![allow(
-    missing_docs,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::panic,
-    clippy::print_stderr,
-    clippy::print_stdout,
-    clippy::unwrap_used,
-    reason = "test and example code"
-)]
-
 use std::sync::Arc;
 
 use praxis_policy_core::delegation::{
     DelegationPayload, DelegationSubject, HOOK_TOKEN_DELEGATE, TokenDelegateHook,
 };
 use praxis_policy_core::engine::PolicyEngine;
-use praxis_policy_core::extensions::raw_credentials::DelegationMode;
+use praxis_policy_core::extensions::raw_credentials::{DelegationMode, TokenRole};
 use praxis_policy_core::extensions::security::{
     ClientExtension, SecurityExtension, SubjectExtension, WorkloadIdentity,
 };
@@ -49,7 +38,7 @@ use praxis_policy_core::http::{HttpTransport, HttpTransportError};
 use praxis_policy_core::http_testing::FakeTransport;
 use praxis_policy_core::plugin::{OnError, PluginConfig, PluginMode};
 
-use praxis_policy_plugin_delegator_vault::VaultDelegator;
+use praxis_policy_builtins::plugins::delegator_vault::VaultDelegator;
 
 use serde_json::json;
 
@@ -579,6 +568,65 @@ async fn cache_isolates_callers() {
     assert_eq!(http.call_count_for(AUTH_JWT_PATH), 2, "no new login call");
 }
 
+// Different JWTs for the same identity must NOT share a cache entry.
+// A JWT that Vault would reject must not reuse another JWT's credential.
+#[tokio::test]
+async fn cache_rejects_different_jwt_for_same_identity() {
+    let http = Arc::new(
+        FakeTransport::new()
+            .json(AUTH_JWT_PATH, 200, &vault_login_response())
+            .json(AUTH_JWT_PATH, 200, &vault_login_response())
+            .json(KV_PATH_USER123, 200, &kv_response("token", "ghp_jwt1"))
+            .json(KV_PATH_USER123, 200, &kv_response("token", "ghp_jwt2")),
+    );
+
+    let mut cfg = plugin_config_for(user_auth());
+    cfg.config.as_mut().unwrap()["cache"] = json!({
+        "enabled": true,
+        "ttl_seconds": 60,
+        "max_entries": 100,
+    });
+
+    let mgr = build_manager(cfg, &http).await;
+
+    // First call with jwt-A
+    let r1 = invoke(
+        &mgr,
+        DelegationPayload::new("jwt-A", "github-api")
+            .with_target_audience("https://api.github.com"),
+        ext_with_user_sub("user-123"),
+    )
+    .await;
+    assert!(r1.continue_processing, "{:?}", r1.violation);
+
+    // Second call with a DIFFERENT jwt-B — must NOT reuse jwt-A's cache
+    let r2 = invoke(
+        &mgr,
+        DelegationPayload::new("jwt-B", "github-api")
+            .with_target_audience("https://api.github.com"),
+        ext_with_user_sub("user-123"),
+    )
+    .await;
+    assert!(r2.continue_processing, "{:?}", r2.violation);
+
+    let t1 = DelegationPayload::from_pipeline_result(&r1)
+        .unwrap()
+        .delegated_token
+        .unwrap();
+    let t2 = DelegationPayload::from_pipeline_result(&r2)
+        .unwrap()
+        .delegated_token
+        .unwrap();
+
+    assert_eq!(&*t1.token, "ghp_jwt1");
+    assert_eq!(&*t2.token, "ghp_jwt2");
+    assert_eq!(
+        http.call_count_for(AUTH_JWT_PATH),
+        2,
+        "different JWTs must trigger separate Vault logins"
+    );
+}
+
 // Metadata includes secret_source and vault_secret_version.
 #[tokio::test]
 async fn metadata_populated() {
@@ -620,6 +668,86 @@ async fn path_traversal_identity_rejected() {
     );
     // No HTTP calls should have been made
     assert_eq!(http.call_count_for(AUTH_JWT_PATH), 0);
+}
+
+// Actor role is rejected — Vault pre-stored credentials cannot record
+// the acting party.
+#[tokio::test]
+async fn actor_role_rejected() {
+    let http = Arc::new(FakeTransport::new());
+
+    let mgr = build_manager(plugin_config_for(user_auth()), &http).await;
+
+    let payload = DelegationPayload::new("user-jwt", "github-api")
+        .with_target_audience("https://api.github.com")
+        .with_actor(TokenRole::Client, "client-jwt");
+    let ext = ext_with_user_sub("user-123");
+
+    let result = invoke(&mgr, payload, ext).await;
+    assert!(!result.continue_processing);
+    assert_eq!(
+        result.violation.as_ref().unwrap().code,
+        "delegation.actor_unsupported"
+    );
+    assert_eq!(http.call_count_for(AUTH_JWT_PATH), 0, "no Vault calls");
+}
+
+// ThisWorkload with the default identity_claim (sub) and a fixed path
+// succeeds — the handler skips the claim lookup when the path has no
+// placeholder.
+#[tokio::test]
+async fn this_workload_fixed_path_default_claim() {
+    let http = Arc::new(
+        FakeTransport::new()
+            .json(AUTH_APPROLE_PATH, 200, &vault_login_response())
+            .json(KV_PATH_SHARED, 200, &kv_response("token", "shared-key")),
+    );
+
+    let cfg = PluginConfig {
+        name: "vault-delegator".into(),
+        kind: "test".into(),
+        hooks: vec![HOOK_TOKEN_DELEGATE.into()],
+        mode: PluginMode::Sequential,
+        priority: 10,
+        on_error: OnError::Fail,
+        capabilities: ["perform_http".to_owned(), "read_workload".to_owned()].into(),
+        config: Some(json!({
+            "vault_addr": vault_addr(),
+            "secret_path_template": "shared/api-key",
+            "insecure_http": true,
+            "auth": {
+                "this_workload": {
+                    "method": "approle",
+                    "mount": "approle",
+                    "role_id_source": { "kind": "literal", "secret": "test-role-id" },
+                    "secret_id_source": { "kind": "literal", "secret": "test-secret-id" },
+                }
+            }
+        })),
+        ..Default::default()
+    };
+
+    let mgr = build_manager(cfg, &http).await;
+    let payload = DelegationPayload::new("", "legacy-api")
+        .with_subject(DelegationSubject::ThisWorkload)
+        .with_target_audience("https://legacy.example.com");
+    let ext = ext_with_this_workload("spiffe://example.com/ppe");
+
+    let result = invoke(&mgr, payload, ext).await;
+    assert!(
+        result.continue_processing,
+        "this_workload with default claim + fixed path should succeed: {:?}",
+        result.violation
+    );
+    assert_eq!(
+        &*DelegationPayload::from_pipeline_result(&result)
+            .unwrap()
+            .delegated_token
+            .as_ref()
+            .unwrap()
+            .token,
+        "shared-key"
+    );
 }
 
 // Secret rotation: without cache, successive calls fetch fresh values.

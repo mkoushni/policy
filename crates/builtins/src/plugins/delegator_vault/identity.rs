@@ -7,7 +7,7 @@ use praxis_policy_core::delegation::{DelegationPayload, DelegationSubject};
 use praxis_policy_core::error::PluginViolation;
 use praxis_policy_core::hooks::payload::Extensions;
 
-use crate::config::VaultDelegatorConfig;
+use super::config::VaultDelegatorConfig;
 
 /// Resolve the identity claim value from the authenticated principal.
 ///
@@ -165,6 +165,12 @@ pub(crate) fn validate_identity_value(value: &str) -> Result<(), Box<PluginViola
         )));
     }
     Ok(())
+}
+
+/// Whether the template contains the `{{<identity_claim>}}` placeholder.
+pub(crate) fn path_has_placeholder(template: &str, identity_claim: &str) -> bool {
+    let placeholder = format!("{{{{{identity_claim}}}}}");
+    template.contains(&placeholder)
 }
 
 /// Replace `{{<identity_claim>}}` in the template with the resolved value.
@@ -387,6 +393,21 @@ mod tests {
             resolve_path("shared/api-key", "sub", "user-42"),
             "shared/api-key"
         );
+    }
+
+    #[test]
+    fn path_has_placeholder_true() {
+        assert!(path_has_placeholder("agents/{{sub}}/github", "sub"));
+    }
+
+    #[test]
+    fn path_has_placeholder_false_fixed_path() {
+        assert!(!path_has_placeholder("shared/api-key", "sub"));
+    }
+
+    #[test]
+    fn path_has_placeholder_wrong_claim() {
+        assert!(!path_has_placeholder("agents/{{email}}/github", "sub"));
     }
 
     #[test]
