@@ -315,7 +315,10 @@ impl VaultDelegator {
                 )
             })?;
 
-        let token_value = secret_value.to_owned();
+        let token_value = self.typed.scheme_prefix.as_ref().map_or_else(
+            || secret_value.to_owned(),
+            |prefix| format!("{prefix}{secret_value}"),
+        );
 
         let expires_at = Utc::now() + self.ttl;
         let token = RawDelegatedToken::new(
@@ -447,7 +450,7 @@ impl HookHandler<TokenDelegateHook> for VaultDelegator {
         };
 
         // Build updated payload
-        let mut updated = payload.clone();
+        let mut updated = payload.clone().with_delegator_name(&self.cfg.name);
         updated.delegated_token = Some(served.mint.token);
         updated.delegation_mode = Some(payload.subject().default_mode());
         updated.minted_at = Some(served.minted_at);

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 ///   secret_path_template: "agents/{{identity}}/github"
 ///   secret_field: "token"
 ///   outbound_header: "Authorization"
+///   scheme_prefix: "token "
 ///   timeout_seconds: 5
 ///   auth:
 ///     user:
@@ -62,11 +63,15 @@ pub struct VaultDelegatorConfig {
     #[serde(default = "default_secret_field")]
     pub secret_field: String,
 
-    /// Header name for the outbound credential. The host's outbound
-    /// filter adds the scheme (`Bearer`, `token`, …) — the token value
-    /// stored here is unprefixed.
+    /// Header name for the outbound credential.
     #[serde(default = "default_outbound_header")]
     pub outbound_header: String,
+
+    /// Optional prefix prepended to the secret value before it is stored in
+    /// the delegated token (for example, `"Bearer "` or `"token "`). Leave
+    /// unset for a bare credential such as `X-API-Key: <value>`.
+    #[serde(default)]
+    pub scheme_prefix: Option<String>,
 
     /// HTTP timeout for Vault calls, in seconds.
     #[serde(default = "default_timeout_seconds")]
@@ -323,6 +328,7 @@ mod tests {
             Some("sub")
         );
         assert_eq!(cfg.outbound_header, "Authorization");
+        assert!(cfg.scheme_prefix.is_none());
         assert_eq!(cfg.timeout_seconds, 5);
         assert!(!cfg.insecure_http);
         assert!(!cfg.cache.enabled);
@@ -456,11 +462,25 @@ mod tests {
     }
 
     #[test]
+    fn scheme_prefix_round_trips() {
+        let raw = json!({
+            "vault_addr": "https://vault.example.com:8200",
+            "secret_path_template": "agents/{{identity}}/github",
+            "scheme_prefix": "token ",
+            "auth": {
+                "user": { "method": "jwt", "identity_claim": "sub", "role": "r" }
+            }
+        });
+        let cfg: VaultDelegatorConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(cfg.scheme_prefix.as_deref(), Some("token "));
+    }
+
+    #[test]
     fn unknown_field_rejected_by_deny_unknown() {
         let raw = json!({
             "vault_addr": "https://vault.example.com:8200",
             "secret_path_template": "agents/{{identity}}/github",
-            "scheme_prefix": "Bearer ",
+            "unknown_option": true,
             "auth": {
                 "user": { "method": "jwt", "identity_claim": "sub", "role": "r" }
             }

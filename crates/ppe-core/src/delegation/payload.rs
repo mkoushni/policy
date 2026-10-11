@@ -274,6 +274,11 @@ pub struct DelegationPayload {
     #[serde(default)]
     subject: DelegationSubject,
 
+    /// Plugin instance selected by the `delegate(...)` step. Empty for direct
+    /// hook callers that do not route through the APL delegation invoker.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    delegator_name: String,
+
     /// Name of the tool / agent / resource being called.
     target_name: String,
 
@@ -358,6 +363,7 @@ impl std::fmt::Debug for DelegationPayload {
             .field("actor_token", &"[REDACTED]")
             .field("actor_role", &self.actor_role)
             .field("subject", &self.subject)
+            .field("delegator_name", &self.delegator_name)
             .field("target_name", &self.target_name)
             .field("target_type", &self.target_type)
             .field("target_audience", &self.target_audience)
@@ -386,6 +392,7 @@ impl DelegationPayload {
             actor_token: Zeroizing::new(String::new()),
             actor_role: None,
             subject: DelegationSubject::default(),
+            delegator_name: String::new(),
             target_name: target_name.into(),
             target_type: TargetType::Tool,
             target_audience: None,
@@ -425,6 +432,12 @@ impl DelegationPayload {
     /// inbound credential, authenticate as yourself."
     pub fn with_subject(mut self, subject: DelegationSubject) -> Self {
         self.subject = subject;
+        self
+    }
+
+    /// Record the plugin instance selected by the delegation step.
+    pub fn with_delegator_name(mut self, delegator_name: impl Into<String>) -> Self {
+        self.delegator_name = delegator_name.into();
         self
     }
 
@@ -520,6 +533,11 @@ impl DelegationPayload {
         &self.target_name
     }
 
+    /// The plugin instance selected by the delegation step.
+    pub fn delegator_name(&self) -> &str {
+        &self.delegator_name
+    }
+
     /// The target type.
     pub fn target_type(&self) -> &TargetType {
         &self.target_type
@@ -598,17 +616,16 @@ impl DelegationPayload {
     ///
     /// - **`raw_credentials.delegated_tokens`** — if the payload
     ///   carries a `delegated_token`, it's inserted into the map under
-    ///   a `DelegationKey` derived from the input fields (audience,
-    ///   subject not yet plumbed — see "Open work" below). Pre-existing
-    ///   delegated tokens are preserved.
+    ///   a `DelegationKey` derived from the delegation inputs and resolved
+    ///   principal identity. Pre-existing delegated tokens are preserved.
     /// - **`delegation`** — `delegation_update` overlays on top of
     ///   the existing chain (Some replaces None / appends).
     ///
     /// # Key composition
     ///
-    /// `audience`, `scopes` and `mode` come off the payload. The two
-    /// principal fields are read out of the request's `Extensions`
-    /// here rather than asking outbound callers to thread them
+    /// `delegator_name`, `target_name`, `audience`, `scopes` and `mode` come
+    /// off the payload. The principal fields are read out of the request's
+    /// `Extensions` here rather than asking outbound callers to thread them
     /// through:
     ///
     /// - `subject_id` from `security.subject.id`, empty when no user
@@ -677,6 +694,8 @@ impl DelegationPayload {
                 subject_id,
                 workload_id,
                 client_id,
+                delegator_name: self.delegator_name.clone(),
+                target_name: self.target_name.clone(),
                 audience: token.audience.clone(),
                 scopes: token.scopes.clone(),
                 mode,
@@ -963,11 +982,49 @@ mod tests {
             // partitioned by one.
             workload_id: None,
             client_id: None,
+            delegator_name: String::new(),
+            target_name: "get_compensation".into(),
             audience: "https://hr.example.com".into(),
             scopes: vec!["read:compensation".into()],
             mode: DelegationMode::OnBehalfOfUser,
         };
         assert!(raw.delegated_tokens.contains_key(&expected_key));
+    }
+
+    /// Two delegators can legitimately resolve different credentials for the
+    /// same principal, target, audience, scopes, and mode. Their plugin
+    /// instance names must keep both values in the request-scoped map.
+    #[test]
+    fn delegated_tokens_are_partitioned_by_delegator_name() {
+        fn resolved(delegator: &str, token: &str) -> DelegationPayload {
+            let mut payload =
+                DelegationPayload::new("caller-jwt", "github-api").with_delegator_name(delegator);
+            payload.delegated_token = Some(RawDelegatedToken::new(
+                token,
+                "Authorization",
+                "https://api.github.com",
+                Vec::new(),
+                Utc::now() + chrono::Duration::seconds(300),
+            ));
+            payload
+        }
+
+        let after_first =
+            resolved("personal-vault", "token personal").apply_to_extensions(Extensions::default());
+        let after_both =
+            resolved("enterprise-vault", "token enterprise").apply_to_extensions(after_first);
+        let raw = after_both.raw_credentials.as_ref().unwrap();
+
+        assert_eq!(raw.delegated_tokens.len(), 2);
+        let delegators: std::collections::HashSet<&str> = raw
+            .delegated_tokens
+            .keys()
+            .map(|key| key.delegator_name.as_str())
+            .collect();
+        assert_eq!(
+            delegators,
+            ["personal-vault", "enterprise-vault"].into_iter().collect()
+        );
     }
 
     /// Two different calling agents run the same workload-subject
@@ -1040,6 +1097,8 @@ mod tests {
                     subject_id: String::new(),
                     workload_id: Some(spiffe.into()),
                     client_id: None,
+                    delegator_name: String::new(),
+                    target_name: "get_compensation".into(),
                     audience: "https://hr.example.com".into(),
                     scopes: vec!["read:compensation".into()],
                     mode: DelegationMode::AsCallerWorkload,
@@ -1118,6 +1177,7 @@ mod tests {
                         "https://hr.example.com",
                         vec!["read:compensation".into()],
                     )
+                    .with_target_name("get_compensation")
                     .with_client_id(Some(client_id.into())),
                 )
                 .map(|t| (*t.token).clone())

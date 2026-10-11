@@ -172,7 +172,9 @@ impl DelegationInvoker for DelegationPluginInvoker {
         // opaque token bytes, so this is the only way it can tell an
         // agent-acting-autonomously exchange from an on-behalf-of-user
         // one — and that decides how the minted token gets attributed.
-        let mut payload = DelegationPayload::new(bearer_token, target_name).with_subject(subject);
+        let mut payload = DelegationPayload::new(bearer_token, target_name)
+            .with_subject(subject)
+            .with_delegator_name(&step.plugin_name);
 
         if let Some(actor_role) = actor_role {
             let actor_token = current_extensions

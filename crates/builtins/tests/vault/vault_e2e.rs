@@ -67,10 +67,12 @@ fn plugin_config_for(auth: serde_json::Value) -> PluginConfig {
         on_error: OnError::Fail,
         capabilities: [
             "perform_http".to_owned(),
+            "read_inbound_credentials".to_owned(),
             "read_subject".to_owned(),
             "read_claims".to_owned(),
             "read_client".to_owned(),
             "read_workload".to_owned(),
+            "write_delegated_tokens".to_owned(),
         ]
         .into(),
         config: Some(json!({
@@ -501,6 +503,32 @@ async fn missing_field_in_secret() {
     assert_eq!(
         result.violation.as_ref().unwrap().code,
         "delegation.vault_field_missing"
+    );
+}
+
+// The configured prefix is part of the delegated token value. An absent
+// prefix leaves API keys bare; this case covers GitHub's `token` scheme.
+#[tokio::test]
+async fn scheme_prefix_applied() {
+    let http = Arc::new(
+        FakeTransport::new()
+            .json(AUTH_JWT_PATH, 200, &vault_login_response())
+            .json(KV_PATH_USER123, 200, &kv_response("token", "ghp_xxx"))
+            .json(REVOKE_SELF_PATH, 204, ""),
+    );
+    let mut cfg = plugin_config_for(user_auth());
+    cfg.config.as_mut().unwrap()["scheme_prefix"] = json!("token ");
+
+    let mgr = build_manager(cfg, &http).await;
+    let payload = DelegationPayload::new("user-jwt", "github-api")
+        .with_target_audience("https://api.github.com");
+    let result = invoke(&mgr, payload, ext_with_user_sub("user-123")).await;
+
+    assert!(result.continue_processing, "{:?}", result.violation);
+    let final_payload = DelegationPayload::from_pipeline_result(&result).unwrap();
+    assert_eq!(
+        &*final_payload.delegated_token.as_ref().unwrap().token,
+        "token ghp_xxx"
     );
 }
 

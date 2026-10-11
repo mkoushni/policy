@@ -281,10 +281,10 @@ impl RawInboundToken {
     }
 }
 
-/// Composite key for cached delegated tokens. Token cache lookups
-/// hit on `(subject, workload, audience, scopes, mode)` so different
-/// audiences or scope sets for the same subject mint independent
-/// tokens.
+/// Composite key for request-scoped delegated tokens. Lookups hit on
+/// `(subject, workload, delegator, target, audience, scopes, mode)` so
+/// different delegator instances, targets, audiences, or scope sets for the
+/// same subject remain independent.
 ///
 /// # Every distinguishing principal must appear here
 ///
@@ -328,6 +328,17 @@ pub struct DelegationKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
 
+    /// Plugin instance that produced the credential. Two delegators may serve
+    /// the same target and audience from different secret sources.
+    #[serde(default)]
+    pub delegator_name: String,
+
+    /// Logical delegation target. This defaults to the delegator plugin name
+    /// when a `delegate(...)` step omits `target`, and distinguishes separate
+    /// downstream targets served by one plugin instance.
+    #[serde(default)]
+    pub target_name: String,
+
     /// The audience the token is for.
     pub audience: String,
     /// The scopes it carries.
@@ -345,6 +356,8 @@ impl DelegationKey {
             subject_id: String::new(),
             workload_id: None,
             client_id: None,
+            delegator_name: String::new(),
+            target_name: String::new(),
             audience: audience.into(),
             scopes,
             mode,
@@ -369,6 +382,20 @@ impl DelegationKey {
     #[must_use]
     pub fn with_client_id(mut self, client_id: Option<String>) -> Self {
         self.client_id = client_id;
+        self
+    }
+
+    /// Set the logical delegation target.
+    #[must_use]
+    pub fn with_target_name(mut self, target_name: impl Into<String>) -> Self {
+        self.target_name = target_name.into();
+        self
+    }
+
+    /// Set the plugin instance that produced the credential.
+    #[must_use]
+    pub fn with_delegator_name(mut self, delegator_name: impl Into<String>) -> Self {
+        self.delegator_name = delegator_name.into();
         self
     }
 }
@@ -589,6 +616,8 @@ mod tests {
             subject_id: "alice".into(),
             workload_id: None,
             client_id: None,
+            delegator_name: "workday-oauth".into(),
+            target_name: "workday".into(),
             audience: "https://api.example.com".into(),
             scopes: vec!["read".into(), "write".into()],
             mode: DelegationMode::OnBehalfOfUser,
@@ -597,6 +626,8 @@ mod tests {
             subject_id: "alice".into(),
             workload_id: None,
             client_id: None,
+            delegator_name: "workday-oauth".into(),
+            target_name: "workday".into(),
             audience: "https://api.example.com".into(),
             scopes: vec!["read".into(), "write".into()],
             mode: DelegationMode::OnBehalfOfUser,
@@ -624,6 +655,8 @@ mod tests {
             subject_id: String::new(),
             workload_id: Some("spiffe://corp/payroll".into()),
             client_id: None,
+            delegator_name: "hr-oauth".into(),
+            target_name: "hr-vault".into(),
             audience: "https://hr.example.com".into(),
             scopes: vec!["read".into()],
             mode: DelegationMode::AsCallerWorkload,
@@ -649,6 +682,8 @@ mod tests {
             subject_id: "alice".into(),
             workload_id: None,
             client_id: None,
+            delegator_name: "hr-oauth".into(),
+            target_name: "hr-vault".into(),
             audience: "https://hr.example.com".into(),
             scopes: vec!["read".into()],
             mode: DelegationMode::OnBehalfOfUser,
