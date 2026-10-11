@@ -13,18 +13,19 @@ use serde::{Deserialize, Serialize};
 /// config:
 ///   vault_addr: "https://vault.example.com:8200"
 ///   kv_mount: "secret"
-///   secret_path_template: "agents/{{sub}}/github"
+///   secret_path_template: "agents/{{identity}}/github"
 ///   secret_field: "token"
-///   identity_claim: "sub"
 ///   outbound_header: "Authorization"
 ///   timeout_seconds: 5
 ///   auth:
 ///     user:
 ///       method: jwt
+///       identity_claim: sub
 ///       mount: "jwt"
 ///       role: "ppe-user"
 ///     this_workload:
 ///       method: approle
+///       identity_claim: spiffe_id
 ///       mount: "approle"
 ///       role_id_source: { kind: env_var, name: VAULT_ROLE_ID }
 ///       secret_id_source: { kind: env_var, name: VAULT_SECRET_ID }
@@ -43,12 +44,13 @@ pub struct VaultDelegatorConfig {
     #[serde(default = "default_kv_mount")]
     pub kv_mount: String,
 
-    /// Secret path template. `{{<identity_claim>}}` is replaced with the
-    /// resolved claim value at delegation time.
+    /// Secret path template. `{{identity}}` is replaced with the claim
+    /// selected by the active subject's auth entry at delegation time.
     ///
     /// This template is the contract between the enrollment workflow (how
     /// users store credentials in Vault) and this handler. For example,
-    /// if the template is `agents/{{sub}}/github`, a user with `sub=alice`
+    /// if the template is `agents/{{identity}}/github`, a user whose configured
+    /// identity claim resolves to `alice`
     /// must write their GitHub PAT to `secret/data/agents/alice/github`
     /// in the configured KV v2 mount. The enrollment mechanism is out of
     /// scope for this handler — it may be Vault CLI, a self-service UI,
@@ -59,11 +61,6 @@ pub struct VaultDelegatorConfig {
     /// Which field in the KV v2 data object holds the credential.
     #[serde(default = "default_secret_field")]
     pub secret_field: String,
-
-    /// Claim name resolved from the authenticated principal for path
-    /// templating. The claim source depends on the delegation subject.
-    #[serde(default = "default_identity_claim")]
-    pub identity_claim: String,
 
     /// Header name for the outbound credential. The host's outbound
     /// filter adds the scheme (`Bearer`, `token`, …) — the token value
@@ -96,6 +93,8 @@ pub struct VaultDelegatorConfig {
 pub enum VaultAuthMethod {
     /// Vault JWT auth — PPE sends the caller's JWT to Vault.
     Jwt {
+        /// Claim resolved from this authenticated principal for path templating.
+        identity_claim: String,
         /// Auth method mount path (default `"jwt"`).
         #[serde(default = "default_jwt_mount")]
         mount: String,
@@ -105,6 +104,10 @@ pub enum VaultAuthMethod {
     /// Vault `AppRole` auth — PPE authenticates as itself.
     #[serde(rename = "approle")]
     AppRole {
+        /// Workload identity field used for path templating. Required when
+        /// `secret_path_template` contains `{{identity}}`.
+        #[serde(default)]
+        identity_claim: Option<String>,
         /// Auth method mount path (default `"approle"`).
         #[serde(default = "default_approle_mount")]
         mount: String,
@@ -225,6 +228,14 @@ impl CacheConfig {
 }
 
 impl VaultAuthMethod {
+    /// The identity claim configured for this auth entry, if any.
+    pub(crate) fn identity_claim(&self) -> Option<&str> {
+        match self {
+            Self::Jwt { identity_claim, .. } => Some(identity_claim),
+            Self::AppRole { identity_claim, .. } => identity_claim.as_deref(),
+        }
+    }
+
     /// Zeroize literal secrets embedded in credential sources after resolution.
     pub(crate) fn redact_sources(&mut self) {
         if let VaultAuthMethod::AppRole {
@@ -251,10 +262,6 @@ fn default_kv_mount() -> String {
 
 fn default_secret_field() -> String {
     "token".to_owned()
-}
-
-fn default_identity_claim() -> String {
-    "sub".to_owned()
 }
 
 fn default_outbound_header() -> String {
@@ -296,10 +303,11 @@ mod tests {
     fn config_deserializes_with_defaults() {
         let raw = json!({
             "vault_addr": "https://vault.example.com:8200",
-            "secret_path_template": "agents/{{sub}}/github",
+            "secret_path_template": "agents/{{identity}}/github",
             "auth": {
                 "user": {
                     "method": "jwt",
+                    "identity_claim": "sub",
                     "role": "ppe-user"
                 }
             }
@@ -308,7 +316,12 @@ mod tests {
         assert_eq!(cfg.vault_addr, "https://vault.example.com:8200");
         assert_eq!(cfg.kv_mount, "secret");
         assert_eq!(cfg.secret_field, "token");
-        assert_eq!(cfg.identity_claim, "sub");
+        assert_eq!(
+            cfg.auth
+                .get("user")
+                .and_then(VaultAuthMethod::identity_claim),
+            Some("sub")
+        );
         assert_eq!(cfg.outbound_header, "Authorization");
         assert_eq!(cfg.timeout_seconds, 5);
         assert!(!cfg.insecure_http);
@@ -319,12 +332,18 @@ mod tests {
     fn jwt_auth_method_deserializes() {
         let raw = json!({
             "method": "jwt",
+            "identity_claim": "sub",
             "mount": "jwt-prod",
             "role": "ppe-user"
         });
         let auth: VaultAuthMethod = serde_json::from_value(raw).unwrap();
         match auth {
-            VaultAuthMethod::Jwt { mount, role } => {
+            VaultAuthMethod::Jwt {
+                identity_claim,
+                mount,
+                role,
+            } => {
+                assert_eq!(identity_claim, "sub");
                 assert_eq!(mount, "jwt-prod");
                 assert_eq!(role, "ppe-user");
             },
@@ -336,12 +355,18 @@ mod tests {
     fn approle_auth_method_deserializes() {
         let raw = json!({
             "method": "approle",
+            "identity_claim": "spiffe_id",
             "role_id_source": { "kind": "literal", "secret": "role-id" },
             "secret_id_source": { "kind": "env_var", "name": "VAULT_SECRET_ID" }
         });
         let auth: VaultAuthMethod = serde_json::from_value(raw).unwrap();
         match auth {
-            VaultAuthMethod::AppRole { mount, .. } => {
+            VaultAuthMethod::AppRole {
+                identity_claim,
+                mount,
+                ..
+            } => {
+                assert_eq!(identity_claim.as_deref(), Some("spiffe_id"));
                 assert_eq!(mount, "approle");
             },
             _ => panic!("expected AppRole variant"),
@@ -434,10 +459,10 @@ mod tests {
     fn unknown_field_rejected_by_deny_unknown() {
         let raw = json!({
             "vault_addr": "https://vault.example.com:8200",
-            "secret_path_template": "agents/{{sub}}/github",
+            "secret_path_template": "agents/{{identity}}/github",
             "scheme_prefix": "Bearer ",
             "auth": {
-                "user": { "method": "jwt", "role": "r" }
+                "user": { "method": "jwt", "identity_claim": "sub", "role": "r" }
             }
         });
         assert!(serde_json::from_value::<VaultDelegatorConfig>(raw).is_err());

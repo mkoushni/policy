@@ -173,6 +173,47 @@ pub(crate) async fn kv_read(
     })
 }
 
+/// Revoke the current Vault token after its single KV read.
+///
+/// `POST /v1/auth/token/revoke-self` with the token in `X-Vault-Token`.
+pub(crate) async fn revoke_self(
+    svc: &dyn HostServices,
+    vault_addr: &str,
+    vault_token: &str,
+    timeout: Duration,
+) -> Result<(), PluginViolation> {
+    let url = format!("{vault_addr}/v1/auth/token/revoke-self");
+    let request = HttpRequest::post(&url, Bytes::new())
+        .timeout(timeout)
+        .max_response_bytes(64 * 1024);
+    let request = request
+        .header("x-vault-token", vault_token)
+        .map_err(|e| violation_for_invalid_request("token revocation", &e))?;
+    let request = request
+        .header("x-vault-request", "true")
+        .map_err(|e| violation_for_invalid_request("token revocation", &e))?;
+
+    let response = svc
+        .http_request(
+            request,
+            RetryPolicy::undelivered_only().with_total_budget(timeout),
+        )
+        .await
+        .map_err(|e| violation_for_transport("token revocation", &e))?;
+
+    if !response.is_success() {
+        return Err(PluginViolation::new(
+            "delegation.vault_revoke_failed",
+            format!(
+                "Vault token revocation failed (HTTP {}) — no delegated credential was returned",
+                response.status
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Parsed result of a KV v2 read.
 pub(crate) struct KvReadResult {
     pub data: HashMap<String, serde_json::Value>,

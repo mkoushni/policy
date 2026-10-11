@@ -33,7 +33,7 @@ use praxis_policy_core::extensions::security::{
     ClientExtension, SecurityExtension, SubjectExtension, WorkloadIdentity,
 };
 use praxis_policy_core::hooks::payload::Extensions;
-use praxis_policy_core::http::{HttpTransport, HttpTransportError};
+use praxis_policy_core::http::{HttpTransport, HttpTransportError, Method};
 use praxis_policy_core::http_testing::FakeTransport;
 use praxis_policy_core::plugin::{OnError, PluginConfig, PluginMode};
 
@@ -47,6 +47,7 @@ use serde_json::json;
 
 const AUTH_JWT_PATH: &str = "/v1/auth/jwt/login";
 const AUTH_APPROLE_PATH: &str = "/v1/auth/approle/login";
+const REVOKE_SELF_PATH: &str = "/v1/auth/token/revoke-self";
 const KV_PATH_USER123: &str = "/v1/secret/data/agents/user-123/github";
 const KV_PATH_MYAPP: &str = "/v1/secret/data/agents/my-app/github";
 const KV_PATH_AGENT: &str = "/v1/secret/data/agents/spiffe://example.com/agent/github";
@@ -75,9 +76,8 @@ fn plugin_config_for(auth: serde_json::Value) -> PluginConfig {
         config: Some(json!({
             "vault_addr": vault_addr(),
             "kv_mount": "secret",
-            "secret_path_template": "agents/{{sub}}/github",
+            "secret_path_template": "agents/{{identity}}/github",
             "secret_field": "token",
-            "identity_claim": "sub",
             "outbound_header": "X-API-Key",
             "insecure_http": true,
             "auth": auth,
@@ -88,17 +88,29 @@ fn plugin_config_for(auth: serde_json::Value) -> PluginConfig {
 
 fn user_auth() -> serde_json::Value {
     json!({
-        "user": { "method": "jwt", "mount": "jwt", "role": "ppe-user" }
+        "user": {
+            "method": "jwt",
+            "identity_claim": "sub",
+            "mount": "jwt",
+            "role": "ppe-user"
+        }
     })
 }
 
 fn all_auth() -> serde_json::Value {
     json!({
-        "user": { "method": "jwt", "mount": "jwt", "role": "ppe-user" },
-        "client": { "method": "jwt", "mount": "jwt", "role": "ppe-client" },
-        "caller_workload": { "method": "jwt", "mount": "jwt", "role": "ppe-workload" },
+        "user": {
+            "method": "jwt", "identity_claim": "sub", "mount": "jwt", "role": "ppe-user"
+        },
+        "client": {
+            "method": "jwt", "identity_claim": "client_id", "mount": "jwt", "role": "ppe-client"
+        },
+        "caller_workload": {
+            "method": "jwt", "identity_claim": "spiffe_id", "mount": "jwt", "role": "ppe-workload"
+        },
         "this_workload": {
             "method": "approle",
+            "identity_claim": "spiffe_id",
             "mount": "approle",
             "role_id_source": { "kind": "literal", "secret": "test-role-id" },
             "secret_id_source": { "kind": "literal", "secret": "test-secret-id" },
@@ -212,7 +224,8 @@ async fn user_subject_happy_path() {
     let http = Arc::new(
         FakeTransport::new()
             .json(AUTH_JWT_PATH, 200, &vault_login_response())
-            .json(KV_PATH_USER123, 200, &kv_response("token", "ghp_user123")),
+            .json(KV_PATH_USER123, 200, &kv_response("token", "ghp_user123"))
+            .json(REVOKE_SELF_PATH, 204, ""),
     );
 
     let mgr = build_manager(plugin_config_for(user_auth()), &http).await;
@@ -245,6 +258,20 @@ async fn user_subject_happy_path() {
 
     assert_eq!(http.call_count_for(AUTH_JWT_PATH), 1);
     assert_eq!(http.call_count_for(KV_PATH_USER123), 1);
+    assert_eq!(http.call_count_for(REVOKE_SELF_PATH), 1);
+    let revoke_request = http
+        .requests()
+        .into_iter()
+        .find(|request| request.url.contains(REVOKE_SELF_PATH))
+        .expect("revoke-self request");
+    assert_eq!(revoke_request.method, Method::POST);
+    assert_eq!(
+        revoke_request
+            .headers
+            .get("x-vault-token")
+            .and_then(|value| value.to_str().ok()),
+        Some("s.fake-vault-token")
+    );
 }
 
 // CallerWorkload subject: JWT login with bearer_token (the inbound SVID).
@@ -253,13 +280,11 @@ async fn caller_workload_uses_bearer_token() {
     let http = Arc::new(
         FakeTransport::new()
             .json(AUTH_JWT_PATH, 200, &vault_login_response())
-            .json(KV_PATH_AGENT, 200, &kv_response("token", "ghp_agent")),
+            .json(KV_PATH_AGENT, 200, &kv_response("token", "ghp_agent"))
+            .json(REVOKE_SELF_PATH, 204, ""),
     );
 
-    let mut cfg = plugin_config_for(all_auth());
-    cfg.config.as_mut().unwrap()["identity_claim"] = json!("spiffe_id");
-    cfg.config.as_mut().unwrap()["secret_path_template"] = json!("agents/{{spiffe_id}}/github");
-
+    let cfg = plugin_config_for(all_auth());
     let mgr = build_manager(cfg, &http).await;
     let payload = DelegationPayload::new("svid-jwt-bytes", "github-api")
         .with_subject(DelegationSubject::CallerWorkload)
@@ -294,13 +319,11 @@ async fn client_subject_uses_client_id() {
     let http = Arc::new(
         FakeTransport::new()
             .json(AUTH_JWT_PATH, 200, &vault_login_response())
-            .json(KV_PATH_MYAPP, 200, &kv_response("token", "ghp_client")),
+            .json(KV_PATH_MYAPP, 200, &kv_response("token", "ghp_client"))
+            .json(REVOKE_SELF_PATH, 204, ""),
     );
 
-    let mut cfg = plugin_config_for(all_auth());
-    cfg.config.as_mut().unwrap()["identity_claim"] = json!("client_id");
-    cfg.config.as_mut().unwrap()["secret_path_template"] = json!("agents/{{client_id}}/github");
-
+    let cfg = plugin_config_for(all_auth());
     let mgr = build_manager(cfg, &http).await;
     let payload = DelegationPayload::new("client-cred-jwt", "github-api")
         .with_subject(DelegationSubject::Client)
@@ -327,7 +350,8 @@ async fn this_workload_uses_approle() {
     let http = Arc::new(
         FakeTransport::new()
             .json(AUTH_APPROLE_PATH, 200, &vault_login_response())
-            .json(KV_PATH_SHARED, 200, &kv_response("token", "shared-key")),
+            .json(KV_PATH_SHARED, 200, &kv_response("token", "shared-key"))
+            .json(REVOKE_SELF_PATH, 204, ""),
     );
 
     let this_workload_auth = json!({
@@ -339,7 +363,6 @@ async fn this_workload_uses_approle() {
         }
     });
     let mut cfg = plugin_config_for(this_workload_auth);
-    cfg.config.as_mut().unwrap()["identity_claim"] = json!("spiffe_id");
     cfg.config.as_mut().unwrap()["secret_path_template"] = json!("shared/api-key");
 
     let mgr = build_manager(cfg, &http).await;
@@ -371,7 +394,8 @@ async fn missing_secret_returns_enrollment_error() {
     let http = Arc::new(
         FakeTransport::new()
             .json(AUTH_JWT_PATH, 200, &vault_login_response())
-            .json(KV_PATH_USER123, 404, r#"{"errors":[]}"#),
+            .json(KV_PATH_USER123, 404, r#"{"errors":[]}"#)
+            .json(REVOKE_SELF_PATH, 204, ""),
     );
 
     let mgr = build_manager(plugin_config_for(user_auth()), &http).await;
@@ -384,6 +408,7 @@ async fn missing_secret_returns_enrollment_error() {
     let v = result.violation.as_ref().unwrap();
     assert_eq!(v.code, "delegation.vault_secret_not_found");
     assert!(v.reason.contains("enrolled"));
+    assert_eq!(http.call_count_for(REVOKE_SELF_PATH), 1);
 }
 
 // Vault auth failure (401) returns a specific violation.
@@ -406,6 +431,34 @@ async fn vault_auth_failure() {
         result.violation.as_ref().unwrap().code,
         "delegation.vault_auth_failed"
     );
+}
+
+// A successful read is not released when PPE cannot revoke the temporary
+// Vault token that authorized it.
+#[tokio::test]
+async fn vault_revoke_failure_denies_delegation() {
+    let http = Arc::new(
+        FakeTransport::new()
+            .json(AUTH_JWT_PATH, 200, &vault_login_response())
+            .json(
+                KV_PATH_USER123,
+                200,
+                &kv_response("token", "must-not-escape"),
+            )
+            .json(REVOKE_SELF_PATH, 500, r#"{"errors":["unavailable"]}"#),
+    );
+
+    let mgr = build_manager(plugin_config_for(user_auth()), &http).await;
+    let payload = DelegationPayload::new("user-jwt", "github-api")
+        .with_target_audience("https://api.github.com");
+    let result = invoke(&mgr, payload, ext_with_user_sub("user-123")).await;
+
+    assert!(!result.continue_processing);
+    assert_eq!(
+        result.violation.as_ref().unwrap().code,
+        "delegation.vault_revoke_failed"
+    );
+    assert!(DelegationPayload::from_pipeline_result(&result).is_none());
 }
 
 // Vault unreachable: transport connect failure.
@@ -434,7 +487,8 @@ async fn missing_field_in_secret() {
     let http = Arc::new(
         FakeTransport::new()
             .json(AUTH_JWT_PATH, 200, &vault_login_response())
-            .json(KV_PATH_USER123, 200, &kv_response("wrong_field", "value")),
+            .json(KV_PATH_USER123, 200, &kv_response("wrong_field", "value"))
+            .json(REVOKE_SELF_PATH, 204, ""),
     );
 
     let mgr = build_manager(plugin_config_for(user_auth()), &http).await;
@@ -481,7 +535,8 @@ async fn cache_isolates_callers() {
             .json(AUTH_JWT_PATH, 200, &vault_login_response())
             .json(AUTH_JWT_PATH, 200, &vault_login_response())
             .json(kv_path_alice, 200, &kv_response("token", "alice-token"))
-            .json(kv_path_bob, 200, &kv_response("token", "bob-token")),
+            .json(kv_path_bob, 200, &kv_response("token", "bob-token"))
+            .json(REVOKE_SELF_PATH, 204, ""),
     );
 
     let mut cfg = plugin_config_for(user_auth());
@@ -549,7 +604,8 @@ async fn cache_rejects_different_jwt_for_same_identity() {
             .json(AUTH_JWT_PATH, 200, &vault_login_response())
             .json(AUTH_JWT_PATH, 200, &vault_login_response())
             .json(KV_PATH_USER123, 200, &kv_response("token", "ghp_jwt1"))
-            .json(KV_PATH_USER123, 200, &kv_response("token", "ghp_jwt2")),
+            .json(KV_PATH_USER123, 200, &kv_response("token", "ghp_jwt2"))
+            .json(REVOKE_SELF_PATH, 204, ""),
     );
 
     let mut cfg = plugin_config_for(user_auth());
@@ -605,7 +661,8 @@ async fn metadata_populated() {
     let http = Arc::new(
         FakeTransport::new()
             .json(AUTH_JWT_PATH, 200, &vault_login_response())
-            .json(KV_PATH_USER123, 200, &kv_response("token", "ghp_xxx")),
+            .json(KV_PATH_USER123, 200, &kv_response("token", "ghp_xxx"))
+            .json(REVOKE_SELF_PATH, 204, ""),
     );
 
     let mgr = build_manager(plugin_config_for(user_auth()), &http).await;
@@ -664,15 +721,15 @@ async fn actor_role_rejected() {
     assert_eq!(http.call_count_for(AUTH_JWT_PATH), 0, "no Vault calls");
 }
 
-// ThisWorkload with the default identity_claim (sub) and a fixed path
-// succeeds — the handler skips the claim lookup when the path has no
-// placeholder.
+// ThisWorkload without identity_claim and with a fixed path succeeds —
+// the handler skips the claim lookup when the path has no placeholder.
 #[tokio::test]
 async fn this_workload_fixed_path_default_claim() {
     let http = Arc::new(
         FakeTransport::new()
             .json(AUTH_APPROLE_PATH, 200, &vault_login_response())
-            .json(KV_PATH_SHARED, 200, &kv_response("token", "shared-key")),
+            .json(KV_PATH_SHARED, 200, &kv_response("token", "shared-key"))
+            .json(REVOKE_SELF_PATH, 204, ""),
     );
 
     let cfg = PluginConfig {
@@ -730,7 +787,8 @@ async fn uncached_fetches_fresh_each_time() {
             .json(AUTH_JWT_PATH, 200, &vault_login_response())
             .json(AUTH_JWT_PATH, 200, &vault_login_response())
             .json(KV_PATH_USER123, 200, &kv_response("token", "ghp_v1"))
-            .json(KV_PATH_USER123, 200, &kv_response("token", "ghp_v2")),
+            .json(KV_PATH_USER123, 200, &kv_response("token", "ghp_v2"))
+            .json(REVOKE_SELF_PATH, 204, ""),
     );
 
     // No cache configured (default)

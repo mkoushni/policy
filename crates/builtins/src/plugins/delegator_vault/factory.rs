@@ -51,9 +51,13 @@ mod tests {
             kind: KIND.into(),
             config: Some(json!({
                 "vault_addr": "https://vault.test:8200",
-                "secret_path_template": "agents/{{sub}}/github",
+                "secret_path_template": "agents/{{identity}}/github",
                 "auth": {
-                    "user": { "method": "jwt", "role": "ppe-user" }
+                    "user": {
+                        "method": "jwt",
+                        "identity_claim": "sub",
+                        "role": "ppe-user"
+                    }
                 }
             })),
             ..Default::default()

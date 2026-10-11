@@ -7,8 +7,6 @@ use praxis_policy_core::delegation::{DelegationPayload, DelegationSubject};
 use praxis_policy_core::error::PluginViolation;
 use praxis_policy_core::hooks::payload::Extensions;
 
-use super::config::VaultDelegatorConfig;
-
 /// Resolve the identity claim value from the authenticated principal.
 ///
 /// The claim source depends on the delegation subject:
@@ -19,9 +17,9 @@ use super::config::VaultDelegatorConfig;
 pub(crate) fn resolve_identity(
     subject: &DelegationSubject,
     ext: &Extensions,
-    config: &VaultDelegatorConfig,
+    identity_claim: &str,
 ) -> Result<String, Box<PluginViolation>> {
-    let claim = &config.identity_claim;
+    let claim = identity_claim;
     let security = ext
         .security
         .as_ref()
@@ -50,7 +48,7 @@ pub(crate) fn resolve_identity(
             }
             client
                 .claims
-                .get(claim.as_str())
+                .get(claim)
                 .and_then(scalar_to_string)
                 .ok_or_else(|| identity_missing(subject, claim, "claim not present on client"))
         },
@@ -167,16 +165,14 @@ pub(crate) fn validate_identity_value(value: &str) -> Result<(), Box<PluginViola
     Ok(())
 }
 
-/// Whether the template contains the `{{<identity_claim>}}` placeholder.
-pub(crate) fn path_has_placeholder(template: &str, identity_claim: &str) -> bool {
-    let placeholder = format!("{{{{{identity_claim}}}}}");
-    template.contains(&placeholder)
+/// Whether the template contains the subject-neutral identity placeholder.
+pub(crate) fn path_has_identity_placeholder(template: &str) -> bool {
+    template.contains("{{identity}}")
 }
 
-/// Replace `{{<identity_claim>}}` in the template with the resolved value.
-pub(crate) fn resolve_path(template: &str, identity_claim: &str, identity_value: &str) -> String {
-    let placeholder = format!("{{{{{identity_claim}}}}}");
-    template.replace(&placeholder, identity_value)
+/// Replace `{{identity}}` in the template with the resolved value.
+pub(crate) fn resolve_path(template: &str, identity_value: &str) -> String {
+    template.replace("{{identity}}", identity_value)
 }
 
 fn workload_field(
@@ -248,22 +244,10 @@ mod tests {
         }
     }
 
-    fn config_with_claim(claim: &str) -> VaultDelegatorConfig {
-        serde_json::from_value(serde_json::json!({
-            "vault_addr": "https://vault.test",
-            "secret_path_template": "x",
-            "identity_claim": claim,
-            "auth": {}
-        }))
-        .unwrap()
-    }
-
     #[test]
     fn user_subject_resolves_sub_from_id() {
         let ext = ext_with_subject(HashMap::new());
-        let cfg = config_with_claim("sub");
-
-        let id = resolve_identity(&DelegationSubject::User, &ext, &cfg).unwrap();
+        let id = resolve_identity(&DelegationSubject::User, &ext, "sub").unwrap();
         assert_eq!(id, "user-123");
     }
 
@@ -280,9 +264,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let cfg = config_with_claim("sub");
-
-        let id = resolve_identity(&DelegationSubject::User, &ext, &cfg).unwrap();
+        let id = resolve_identity(&DelegationSubject::User, &ext, "sub").unwrap();
         assert_eq!(id, "from-claims");
     }
 
@@ -299,9 +281,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let cfg = config_with_claim("sub");
-
-        let err = resolve_identity(&DelegationSubject::User, &ext, &cfg).unwrap_err();
+        let err = resolve_identity(&DelegationSubject::User, &ext, "sub").unwrap_err();
         assert_eq!(err.code, "delegation.identity_missing");
     }
 
@@ -317,9 +297,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let cfg = config_with_claim("client_id");
-
-        let id = resolve_identity(&DelegationSubject::Client, &ext, &cfg).unwrap();
+        let id = resolve_identity(&DelegationSubject::Client, &ext, "client_id").unwrap();
         assert_eq!(id, "my-app");
     }
 
@@ -335,9 +313,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let cfg = config_with_claim("spiffe_id");
-
-        let id = resolve_identity(&DelegationSubject::CallerWorkload, &ext, &cfg).unwrap();
+        let id = resolve_identity(&DelegationSubject::CallerWorkload, &ext, "spiffe_id").unwrap();
         assert_eq!(id, "spiffe://example.com/agent");
     }
 
@@ -353,9 +329,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let cfg = config_with_claim("spiffe_id");
-
-        let id = resolve_identity(&DelegationSubject::ThisWorkload, &ext, &cfg).unwrap();
+        let id = resolve_identity(&DelegationSubject::ThisWorkload, &ext, "spiffe_id").unwrap();
         assert_eq!(id, "spiffe://example.com/ppe");
     }
 
@@ -368,9 +342,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let cfg = config_with_claim("email");
-
-        let err = resolve_identity(&DelegationSubject::CallerWorkload, &ext, &cfg).unwrap_err();
+        let err = resolve_identity(&DelegationSubject::CallerWorkload, &ext, "email").unwrap_err();
         assert_eq!(err.code, "delegation.identity_missing");
         assert!(err.reason.contains("spiffe_id"));
     }
@@ -378,32 +350,24 @@ mod tests {
     #[test]
     fn path_template_substitution() {
         assert_eq!(
-            resolve_path("agents/{{sub}}/github", "sub", "user-42"),
+            resolve_path("agents/{{identity}}/github", "user-42"),
             "agents/user-42/github"
         );
     }
 
     #[test]
     fn path_template_no_match_unchanged() {
-        assert_eq!(
-            resolve_path("shared/api-key", "sub", "user-42"),
-            "shared/api-key"
-        );
+        assert_eq!(resolve_path("shared/api-key", "user-42"), "shared/api-key");
     }
 
     #[test]
     fn path_has_placeholder_true() {
-        assert!(path_has_placeholder("agents/{{sub}}/github", "sub"));
+        assert!(path_has_identity_placeholder("agents/{{identity}}/github"));
     }
 
     #[test]
     fn path_has_placeholder_false_fixed_path() {
-        assert!(!path_has_placeholder("shared/api-key", "sub"));
-    }
-
-    #[test]
-    fn path_has_placeholder_wrong_claim() {
-        assert!(!path_has_placeholder("agents/{{email}}/github", "sub"));
+        assert!(!path_has_identity_placeholder("shared/api-key"));
     }
 
     #[test]

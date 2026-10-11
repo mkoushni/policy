@@ -111,6 +111,8 @@ impl VaultDelegator {
         const CANONICAL_SUBJECTS: [&str; 4] =
             ["user", "client", "caller_workload", "this_workload"];
 
+        let path_uses_identity =
+            identity::path_has_identity_placeholder(&typed.secret_path_template);
         for (key, method) in &typed.auth {
             if !CANONICAL_SUBJECTS.contains(&key.as_str()) {
                 return Err(PluginError::Config {
@@ -142,20 +144,48 @@ impl VaultDelegator {
                 },
                 _ => {},
             }
+
+            let identity_claim = method.identity_claim();
+            if path_uses_identity && identity_claim.is_none() {
+                return Err(PluginError::Config {
+                    message: format!(
+                        "auth.{key}.identity_claim is required when secret_path_template \
+                         contains '{{{{identity}}}}'"
+                    ),
+                }
+                .boxed());
+            }
+            if identity_claim.is_some_and(str::is_empty) {
+                return Err(PluginError::Config {
+                    message: format!("auth.{key}.identity_claim must not be empty"),
+                }
+                .boxed());
+            }
+            if matches!(key.as_str(), "caller_workload" | "this_workload")
+                && identity_claim.is_some_and(|claim| {
+                    !matches!(claim, "spiffe_id" | "trust_domain" | "client_id")
+                })
+            {
+                return Err(PluginError::Config {
+                    message: format!(
+                        "auth.{key}.identity_claim must be one of: \
+                         spiffe_id, trust_domain, client_id"
+                    ),
+                }
+                .boxed());
+            }
         }
 
-        let placeholder = format!("{{{{{}}}}}", typed.identity_claim);
         let has_jwt_subject = typed
             .auth
             .iter()
             .any(|(key, _)| matches!(key.as_str(), "user" | "client" | "caller_workload"));
-        if has_jwt_subject && !typed.secret_path_template.contains(&placeholder) {
+        if has_jwt_subject && !path_uses_identity {
             return Err(PluginError::Config {
-                message: format!(
-                    "secret_path_template must contain '{placeholder}' when a per-caller \
-                     subject (user/client/caller_workload) is configured — \
-                     without it every caller reads the same secret"
-                ),
+                message: "secret_path_template must contain '{{identity}}' when a per-caller \
+                          subject (user/client/caller_workload) is configured — \
+                          without it every caller reads the same secret"
+                    .into(),
             }
             .boxed());
         }
@@ -224,7 +254,7 @@ impl VaultDelegator {
 
         // Login to Vault with the principal's token
         let vault_token = match auth_method {
-            VaultAuthMethod::Jwt { mount, role } => {
+            VaultAuthMethod::Jwt { mount, role, .. } => {
                 let jwt = identity::resolve_auth_token(subject, payload).map_err(|e| *e)?;
                 vault::jwt_login(ext, &self.typed.vault_addr, mount, role, jwt, self.timeout)
                     .await?
@@ -249,7 +279,9 @@ impl VaultDelegator {
             },
         };
 
-        // Read the KV secret (vault_token is zeroized when dropped)
+        // Read the KV secret, then revoke the login token even when the read
+        // fails. A revocation failure takes precedence because it leaves a
+        // live credential server-side; no downstream credential is returned.
         let kv_result = vault::kv_read(
             ext,
             &self.typed.vault_addr,
@@ -258,7 +290,15 @@ impl VaultDelegator {
             &vault_token.client_token,
             self.timeout,
         )
+        .await;
+        vault::revoke_self(
+            ext,
+            &self.typed.vault_addr,
+            &vault_token.client_token,
+            self.timeout,
+        )
         .await?;
+        let kv_result = kv_result?;
 
         // Extract the configured field
         let secret_value = kv_result
@@ -309,33 +349,35 @@ impl HookHandler<TokenDelegateHook> for VaultDelegator {
     ) -> PluginResult<DelegationPayload> {
         let subject = payload.subject();
 
-        // Validate auth is configured for this subject
-        if let Err(v) = self.auth_for(subject) {
-            return PluginResult::deny(*v);
-        }
+        // Validate auth is configured for this subject.
+        let auth_method = match self.auth_for(subject) {
+            Ok(method) => method,
+            Err(v) => return PluginResult::deny(*v),
+        };
 
         // Resolve identity claim for path templating — skip when the
         // path has no placeholder (e.g. `shared/api-key` with
         // `this_workload`), since no identity value is needed.
-        let resolved_path = if identity::path_has_placeholder(
-            &self.typed.secret_path_template,
-            &self.typed.identity_claim,
-        ) {
-            let identity_value = match identity::resolve_identity(subject, ext, &self.typed) {
-                Ok(id) => id,
-                Err(v) => return PluginResult::deny(*v),
+        let resolved_path =
+            if identity::path_has_identity_placeholder(&self.typed.secret_path_template) {
+                let Some(identity_claim) = auth_method.identity_claim() else {
+                    return PluginResult::deny(PluginViolation::new(
+                        "delegation.vault_auth_unconfigured",
+                        "Vault auth entry has no identity_claim for an identity-templated path",
+                    ));
+                };
+                let identity_value = match identity::resolve_identity(subject, ext, identity_claim)
+                {
+                    Ok(id) => id,
+                    Err(v) => return PluginResult::deny(*v),
+                };
+                if let Err(v) = identity::validate_identity_value(&identity_value) {
+                    return PluginResult::deny(*v);
+                }
+                identity::resolve_path(&self.typed.secret_path_template, &identity_value)
+            } else {
+                self.typed.secret_path_template.clone()
             };
-            if let Err(v) = identity::validate_identity_value(&identity_value) {
-                return PluginResult::deny(*v);
-            }
-            identity::resolve_path(
-                &self.typed.secret_path_template,
-                &self.typed.identity_claim,
-                &identity_value,
-            )
-        } else {
-            self.typed.secret_path_template.clone()
-        };
 
         if payload.actor_role().is_some() {
             return PluginResult::deny(PluginViolation::new(
@@ -490,10 +532,11 @@ mod tests {
             kind: "test".into(),
             config: Some(json!({
                 "vault_addr": "https://vault.test:8200",
-                "secret_path_template": "agents/{{sub}}/github",
+                "secret_path_template": "agents/{{identity}}/github",
                 "auth": {
                     "user": {
                         "method": "jwt",
+                        "identity_claim": "sub",
                         "role": "ppe-user"
                     }
                 }
@@ -556,7 +599,7 @@ mod tests {
     fn rejects_unknown_auth_subject() {
         let mut cfg = base_config();
         cfg.config.as_mut().unwrap()["auth"] = json!({
-            "invalid_subject": { "method": "jwt", "role": "r" }
+            "invalid_subject": { "method": "jwt", "identity_claim": "sub", "role": "r" }
         });
         let err = VaultDelegator::new(cfg).unwrap_err();
         assert!(err.to_string().contains("unknown auth subject"));
@@ -581,7 +624,7 @@ mod tests {
     fn rejects_this_workload_with_jwt() {
         let mut cfg = base_config();
         cfg.config.as_mut().unwrap()["auth"]["this_workload"] = json!({
-            "method": "jwt", "role": "bad"
+            "method": "jwt", "identity_claim": "spiffe_id", "role": "bad"
         });
         let err = VaultDelegator::new(cfg).unwrap_err();
         assert!(
@@ -608,10 +651,60 @@ mod tests {
     }
 
     #[test]
+    fn supports_subject_specific_identity_claims_in_one_instance() {
+        let mut cfg = base_config();
+        cfg.config.as_mut().unwrap()["auth"] = json!({
+            "user": { "method": "jwt", "identity_claim": "sub", "role": "user" },
+            "client": { "method": "jwt", "identity_claim": "client_id", "role": "client" },
+            "caller_workload": {
+                "method": "jwt", "identity_claim": "spiffe_id", "role": "workload"
+            },
+            "this_workload": {
+                "method": "approle",
+                "identity_claim": "trust_domain",
+                "role_id_source": { "kind": "literal", "secret": "r" },
+                "secret_id_source": { "kind": "literal", "secret": "s" }
+            }
+        });
+
+        assert!(VaultDelegator::new(cfg).is_ok());
+    }
+
+    #[test]
+    fn rejects_unsupported_workload_identity_claim_at_construction() {
+        let mut cfg = base_config();
+        cfg.config.as_mut().unwrap()["auth"] = json!({
+            "caller_workload": {
+                "method": "jwt", "identity_claim": "sub", "role": "workload"
+            }
+        });
+
+        let err = VaultDelegator::new(cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("spiffe_id, trust_domain, client_id"),
+            "expected workload identity-claim config error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_top_level_identity_claim() {
+        let mut cfg = base_config();
+        cfg.config.as_mut().unwrap()["identity_claim"] = json!("sub");
+
+        let err = VaultDelegator::new(cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field `identity_claim`"),
+            "expected old global identity claim to be rejected: {err}"
+        );
+    }
+
+    #[test]
     fn debug_redacts_approle_values() {
         let mut cfg = base_config();
         cfg.config.as_mut().unwrap()["auth"]["this_workload"] = json!({
             "method": "approle",
+            "identity_claim": "spiffe_id",
             "role_id_source": { "kind": "literal", "secret": "SENSITIVE_ROLE_ID" },
             "secret_id_source": { "kind": "literal", "secret": "SENSITIVE_SECRET_ID" },
         });
@@ -645,7 +738,7 @@ mod tests {
                 "vault_addr": "https://vault.test:8200",
                 "secret_path_template": "shared/api-key",
                 "auth": {
-                    "user": { "method": "jwt", "role": "r" }
+                    "user": { "method": "jwt", "identity_claim": "sub", "role": "r" }
                 }
             })),
             ..Default::default()
@@ -683,6 +776,7 @@ mod tests {
         let mut cfg = base_config();
         cfg.config.as_mut().unwrap()["auth"]["this_workload"] = json!({
             "method": "approle",
+            "identity_claim": "spiffe_id",
             "role_id_source": { "kind": "literal", "secret": "SENSITIVE" },
             "secret_id_source": { "kind": "literal", "secret": "ALSO_SENSITIVE" },
         });
