@@ -794,6 +794,13 @@ Omitting `scheme_prefix` deliberately produces the bare `X-API-Key` value.
 | `cache.ttl_seconds` | Reread interval and host-side delegated-token expiry bound; default `300`. |
 | `cache.max_entries` | Maximum entries when enabled; default `10000`. |
 
+> **Praxis host compatibility:** `RawDelegatedToken` carries the exact
+> `outbound_prefix`, and this repository's reference host honors it. The
+> separately maintained Praxis proxy filter currently hard-codes `Bearer `
+> when attaching delegated tokens. Bare values and prefixes such as `token `
+> are therefore deferred until that consumer reads `outbound_prefix`; do not
+> deploy those configurations through the Praxis filter yet.
+
 #### Vault delegation denial codes
 
 | Code | Meaning |

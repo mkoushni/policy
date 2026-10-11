@@ -33,7 +33,7 @@ pub(crate) struct RevokeGuard {
 
 impl RevokeGuard {
     /// Arm revocation immediately after login, before starting the KV read.
-    #[allow(
+    #[expect(
         clippy::result_large_err,
         reason = "PluginViolation is the hook boundary error type and preserves structured denial details"
     )]
@@ -252,7 +252,7 @@ pub(crate) async fn kv_read(
 /// Revoke the current Vault token after its single KV read.
 ///
 /// `POST /v1/auth/token/revoke-self` with the token in `X-Vault-Token`.
-#[allow(
+#[expect(
     clippy::result_large_err,
     reason = "PluginViolation is the hook boundary error type and preserves invalid-request details"
 )]
@@ -275,7 +275,7 @@ fn revoke_request(
     Ok(request)
 }
 
-#[allow(
+#[expect(
     clippy::result_large_err,
     reason = "PluginViolation is the hook boundary error type and preserves revocation failure details"
 )]
