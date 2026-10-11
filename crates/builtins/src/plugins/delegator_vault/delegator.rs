@@ -352,30 +352,6 @@ impl HookHandler<TokenDelegateHook> for VaultDelegator {
             Err(v) => return PluginResult::deny(*v),
         };
 
-        // Resolve identity claim for path templating — skip when the
-        // path has no placeholder (e.g. `shared/api-key` with
-        // `this_workload`), since no identity value is needed.
-        let resolved_path =
-            if identity::path_has_identity_placeholder(&self.typed.secret_path_template) {
-                let Some(identity_claim) = auth_method.identity_claim() else {
-                    return PluginResult::deny(PluginViolation::new(
-                        "delegation.vault_auth_unconfigured",
-                        "Vault auth entry has no identity_claim for an identity-templated path",
-                    ));
-                };
-                let identity_value = match identity::resolve_identity(subject, ext, identity_claim)
-                {
-                    Ok(id) => id,
-                    Err(v) => return PluginResult::deny(*v),
-                };
-                if let Err(v) = identity::validate_identity_value(&identity_value) {
-                    return PluginResult::deny(*v);
-                }
-                identity::resolve_path(&self.typed.secret_path_template, &identity_value)
-            } else {
-                self.typed.secret_path_template.clone()
-            };
-
         if payload.actor_role().is_some() {
             return PluginResult::deny(PluginViolation::new(
                 "delegation.actor_unsupported",
@@ -399,6 +375,30 @@ impl HookHandler<TokenDelegateHook> for VaultDelegator {
                  required_permissions cannot be enforced",
             ));
         }
+
+        // Resolve identity claim for path templating — skip when the
+        // path has no placeholder (e.g. `shared/api-key` with
+        // `this_workload`), since no identity value is needed.
+        let resolved_path =
+            if identity::path_has_identity_placeholder(&self.typed.secret_path_template) {
+                let Some(identity_claim) = auth_method.identity_claim() else {
+                    return PluginResult::deny(PluginViolation::new(
+                        "delegation.vault_auth_unconfigured",
+                        "Vault auth entry has no identity_claim for an identity-templated path",
+                    ));
+                };
+                let identity_value = match identity::resolve_identity(subject, ext, identity_claim)
+                {
+                    Ok(id) => id,
+                    Err(v) => return PluginResult::deny(*v),
+                };
+                if let Err(v) = identity::validate_identity_value(&identity_value) {
+                    return PluginResult::deny(*v);
+                }
+                identity::resolve_path(&self.typed.secret_path_template, &identity_value)
+            } else {
+                self.typed.secret_path_template.clone()
+            };
 
         // Resolve credential — cached or fresh.
         //

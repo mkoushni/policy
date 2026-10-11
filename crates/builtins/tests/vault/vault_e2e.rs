@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use praxis_policy_core::delegation::{
-    DelegationPayload, DelegationSubject, HOOK_TOKEN_DELEGATE, TokenDelegateHook,
+    AttenuationConfig, DelegationPayload, DelegationSubject, HOOK_TOKEN_DELEGATE, TokenDelegateHook,
 };
 use praxis_policy_core::engine::PolicyEngine;
 use praxis_policy_core::extensions::raw_credentials::{DelegationMode, TokenRole};
@@ -457,10 +457,13 @@ async fn vault_revoke_failure_denies_delegation() {
         .with_target_audience("https://api.github.com");
     let result = invoke(&mgr, payload, ext_with_user_sub("user-123")).await;
 
+    assert_eq!(http.call_count_for(KV_PATH_USER123), 1);
     assert!(!result.continue_processing);
-    assert_eq!(
-        result.violation.as_ref().unwrap().code,
-        "delegation.vault_revoke_failed"
+    let violation = result.violation.as_ref().unwrap();
+    assert_eq!(violation.code, "delegation.vault_revoke_failed");
+    assert!(
+        !violation.reason.contains("must-not-escape"),
+        "fetched secret leaked into the violation reason"
     );
     assert!(DelegationPayload::from_pipeline_result(&result).is_none());
 }
@@ -783,25 +786,36 @@ async fn path_traversal_identity_rejected() {
     assert_eq!(http.call_count_for(AUTH_JWT_PATH), 0);
 }
 
-// Actor role is rejected — Vault pre-stored credentials cannot record
-// the acting party.
+// Unsupported static-credential request features are rejected before identity
+// resolution, so extension state cannot mask their deterministic result.
 #[tokio::test]
-async fn actor_role_rejected() {
+async fn unsupported_request_features_precede_identity_resolution() {
     let http = Arc::new(FakeTransport::new());
-
     let mgr = build_manager(plugin_config_for(user_auth()), &http).await;
 
-    let payload = DelegationPayload::new("user-jwt", "github-api")
-        .with_target_audience("https://api.github.com")
-        .with_actor(TokenRole::Client, "client-jwt");
-    let ext = ext_with_user_sub("user-123");
+    let requests = [
+        (
+            DelegationPayload::new("user-jwt", "github-api")
+                .with_actor(TokenRole::Client, "client-jwt"),
+            "delegation.actor_unsupported",
+        ),
+        (
+            DelegationPayload::new("user-jwt", "github-api")
+                .with_route_attenuation(AttenuationConfig::default()),
+            "delegation.attenuation_unsupported",
+        ),
+        (
+            DelegationPayload::new("user-jwt", "github-api")
+                .with_required_permissions(vec!["repo:read".to_owned()]),
+            "delegation.permissions_unsupported",
+        ),
+    ];
 
-    let result = invoke(&mgr, payload, ext).await;
-    assert!(!result.continue_processing);
-    assert_eq!(
-        result.violation.as_ref().unwrap().code,
-        "delegation.actor_unsupported"
-    );
+    for (payload, expected_code) in requests {
+        let result = invoke(&mgr, payload, Extensions::default()).await;
+        assert!(!result.continue_processing);
+        assert_eq!(result.violation.as_ref().unwrap().code, expected_code);
+    }
     assert_eq!(http.call_count_for(AUTH_JWT_PATH), 0, "no Vault calls");
 }
 
