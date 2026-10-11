@@ -414,6 +414,13 @@ pub struct RawDelegatedToken {
     /// audience-specific.
     pub outbound_header: String,
 
+    /// Prefix the consuming host prepends to `token` when constructing the
+    /// outbound header value. Defaults to `"Bearer "` for compatibility with
+    /// OAuth delegates; an API key uses an empty prefix and schemes such as
+    /// GitHub's use `"token "`.
+    #[serde(default = "default_delegated_outbound_prefix")]
+    pub outbound_prefix: String,
+
     /// The audience the token was minted for. Cache keys include
     /// this; the field here is for audit / debugging.
     pub audience: String,
@@ -433,6 +440,7 @@ impl std::fmt::Debug for RawDelegatedToken {
         f.debug_struct("RawDelegatedToken")
             .field("token", &"[REDACTED]")
             .field("outbound_header", &self.outbound_header)
+            .field("outbound_prefix", &self.outbound_prefix)
             .field("audience", &self.audience)
             .field("scopes", &self.scopes)
             .field("expires_at", &self.expires_at)
@@ -452,11 +460,23 @@ impl RawDelegatedToken {
         Self {
             token: Zeroizing::new(token.into()),
             outbound_header: outbound_header.into(),
+            outbound_prefix: default_delegated_outbound_prefix(),
             audience: audience.into(),
             scopes,
             expires_at,
         }
     }
+
+    /// Set the exact prefix the consuming host prepends to the token.
+    #[must_use]
+    pub fn with_outbound_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.outbound_prefix = prefix.into();
+        self
+    }
+}
+
+fn default_delegated_outbound_prefix() -> String {
+    "Bearer ".to_owned()
 }
 
 /// The Layer-3 raw-credentials extension.
@@ -592,12 +612,27 @@ mod tests {
             vec!["read".into()],
             Utc::now(),
         );
+        assert_eq!(tok.outbound_prefix, "Bearer ");
         let json = serde_json::to_string(&tok).unwrap();
         assert!(
             !json.contains("minted-secret-bytes"),
             "delegated token leaked: {json}"
         );
         assert!(json.contains("downstream.example.com"));
+    }
+
+    #[test]
+    fn delegated_token_outbound_prefix_is_explicit() {
+        let token = RawDelegatedToken::new(
+            "ghp_example",
+            "Authorization",
+            "https://api.github.com",
+            Vec::new(),
+            Utc::now(),
+        )
+        .with_outbound_prefix("token ");
+        assert_eq!(token.outbound_prefix, "token ");
+        assert_eq!(&*token.token, "ghp_example");
     }
 
     #[test]
@@ -756,6 +791,7 @@ mod tests {
             .expect("the key must round-trip");
         assert_eq!(&*restored_tok.token, "", "token stays skipped");
         assert_eq!(restored_tok.audience, "workday-api");
+        assert_eq!(restored_tok.outbound_prefix, "Bearer ");
     }
 
     #[test]

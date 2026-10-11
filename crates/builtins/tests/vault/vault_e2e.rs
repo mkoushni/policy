@@ -23,6 +23,7 @@
 //   * path traversal — identity with `..` rejected
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use praxis_policy_core::delegation::{
     DelegationPayload, DelegationSubject, HOOK_TOKEN_DELEGATE, TokenDelegateHook,
@@ -251,6 +252,7 @@ async fn user_subject_happy_path() {
 
     assert_eq!(&*token.token, "ghp_user123");
     assert_eq!(token.outbound_header, "X-API-Key");
+    assert_eq!(token.outbound_prefix, "");
     assert_eq!(token.audience, "https://api.github.com");
     assert!(token.scopes.is_empty());
     assert!(matches!(
@@ -463,6 +465,52 @@ async fn vault_revoke_failure_denies_delegation() {
     assert!(DelegationPayload::from_pipeline_result(&result).is_none());
 }
 
+// Cancellation after login must not strand the temporary Vault token. The
+// independently armed cleanup request runs even though the handler future is
+// aborted while its KV read is in flight.
+#[tokio::test]
+async fn cancellation_during_kv_read_still_revokes_login_token() {
+    let http = Arc::new(
+        FakeTransport::new()
+            .json(AUTH_JWT_PATH, 200, &vault_login_response())
+            .json(
+                KV_PATH_USER123,
+                200,
+                &kv_response("token", "must-not-escape"),
+            )
+            .json(REVOKE_SELF_PATH, 204, "")
+            .with_latency(Duration::from_millis(50)),
+    );
+    let mgr = build_manager(plugin_config_for(user_auth()), &http).await;
+    let invocation = tokio::spawn({
+        let mgr = Arc::clone(&mgr);
+        async move {
+            let payload = DelegationPayload::new("user-jwt", "github-api")
+                .with_target_audience("https://api.github.com");
+            invoke(&mgr, payload, ext_with_user_sub("user-123")).await
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while http.call_count_for(KV_PATH_USER123) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("KV read should start");
+    invocation.abort();
+    let _ = invocation.await;
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while http.call_count_for(REVOKE_SELF_PATH) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancellation cleanup should revoke the token");
+    assert_eq!(http.call_count_for(REVOKE_SELF_PATH), 1);
+}
+
 // Vault unreachable: transport connect failure.
 #[tokio::test]
 async fn vault_unreachable() {
@@ -528,7 +576,15 @@ async fn scheme_prefix_applied() {
     let final_payload = DelegationPayload::from_pipeline_result(&result).unwrap();
     assert_eq!(
         &*final_payload.delegated_token.as_ref().unwrap().token,
-        "token ghp_xxx"
+        "ghp_xxx"
+    );
+    assert_eq!(
+        final_payload
+            .delegated_token
+            .as_ref()
+            .unwrap()
+            .outbound_prefix,
+        "token "
     );
 }
 

@@ -9,6 +9,7 @@ use serde::Deserialize;
 use zeroize::Zeroizing;
 
 use praxis_policy_core::error::PluginViolation;
+use praxis_policy_core::hooks::payload::Extensions;
 use praxis_policy_core::host::{HostServices, HttpRequestError};
 use praxis_policy_core::http::{HttpRequest, HttpTransportError};
 use praxis_policy_core::http_retry::RetryPolicy;
@@ -16,6 +17,81 @@ use praxis_policy_core::http_retry::RetryPolicy;
 /// A Vault token obtained from login. Zeroized on drop.
 pub(crate) struct VaultToken {
     pub client_token: Zeroizing<String>,
+}
+
+/// An armed, one-shot revocation for a temporary Vault login token.
+///
+/// The cleanup task owns a single request authorized against the current
+/// invocation. Normal flow triggers and awaits it. If the parent handler is
+/// cancelled, dropping `trigger` wakes the already-spawned task and the
+/// revocation continues independently.
+pub(crate) struct RevokeGuard {
+    trigger: Option<tokio::sync::oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<Result<(), PluginViolation>>>,
+    client_token: Zeroizing<String>,
+}
+
+impl RevokeGuard {
+    /// Arm revocation immediately after login, before starting the KV read.
+    #[allow(
+        clippy::result_large_err,
+        reason = "PluginViolation is the hook boundary error type and preserves structured denial details"
+    )]
+    pub(crate) fn arm(
+        svc: &Extensions,
+        vault_addr: &str,
+        token: VaultToken,
+        timeout: Duration,
+    ) -> Result<Self, PluginViolation> {
+        let request = revoke_request(vault_addr, &token.client_token, timeout)?;
+        let request = svc
+            .start_http_request(
+                request,
+                RetryPolicy::undelivered_only().with_total_budget(timeout),
+            )
+            .map_err(|e| violation_for_transport("token revocation", &e))?;
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_e| {
+            PluginViolation::new(
+                "delegation.vault_revoke_failed",
+                "Vault token revocation requires an active async runtime",
+            )
+        })?;
+        let (trigger, ready) = tokio::sync::oneshot::channel();
+        let task = runtime.spawn(async move {
+            let _ = ready.await;
+            finish_revoke(request.await)
+        });
+
+        Ok(Self {
+            trigger: Some(trigger),
+            task: Some(task),
+            client_token: token.client_token,
+        })
+    }
+
+    pub(crate) fn client_token(&self) -> &str {
+        &self.client_token
+    }
+
+    /// Trigger revocation and wait for its result. Cancellation while waiting
+    /// only detaches the join handle; the cleanup task keeps running.
+    pub(crate) async fn revoke(mut self) -> Result<(), PluginViolation> {
+        if let Some(trigger) = self.trigger.take() {
+            let _ = trigger.send(());
+        }
+        let Some(task) = self.task.take() else {
+            return Err(PluginViolation::new(
+                "delegation.vault_revoke_failed",
+                "Vault token revocation task was not armed",
+            ));
+        };
+        task.await.map_err(|_join_error| {
+            PluginViolation::new(
+                "delegation.vault_revoke_failed",
+                "Vault token revocation task did not complete",
+            )
+        })?
+    }
 }
 
 /// Login to Vault using JWT auth.
@@ -176,12 +252,15 @@ pub(crate) async fn kv_read(
 /// Revoke the current Vault token after its single KV read.
 ///
 /// `POST /v1/auth/token/revoke-self` with the token in `X-Vault-Token`.
-pub(crate) async fn revoke_self(
-    svc: &dyn HostServices,
+#[allow(
+    clippy::result_large_err,
+    reason = "PluginViolation is the hook boundary error type and preserves invalid-request details"
+)]
+fn revoke_request(
     vault_addr: &str,
     vault_token: &str,
     timeout: Duration,
-) -> Result<(), PluginViolation> {
+) -> Result<HttpRequest, PluginViolation> {
     let url = format!("{vault_addr}/v1/auth/token/revoke-self");
     let request = HttpRequest::post(&url, Bytes::new())
         .timeout(timeout)
@@ -193,13 +272,17 @@ pub(crate) async fn revoke_self(
         .header("x-vault-request", "true")
         .map_err(|e| violation_for_invalid_request("token revocation", &e))?;
 
-    let response = svc
-        .http_request(
-            request,
-            RetryPolicy::undelivered_only().with_total_budget(timeout),
-        )
-        .await
-        .map_err(|e| violation_for_transport("token revocation", &e))?;
+    Ok(request)
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "PluginViolation is the hook boundary error type and preserves revocation failure details"
+)]
+fn finish_revoke(
+    response: Result<praxis_policy_core::http::HttpResponse, HttpRequestError>,
+) -> Result<(), PluginViolation> {
+    let response = response.map_err(|e| violation_for_transport("token revocation", &e))?;
 
     if !response.is_success() {
         return Err(PluginViolation::new(

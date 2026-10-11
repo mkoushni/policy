@@ -278,26 +278,24 @@ impl VaultDelegator {
                 .await?
             },
         };
+        let revoker =
+            vault::RevokeGuard::arm(ext, &self.typed.vault_addr, vault_token, self.timeout)?;
 
         // Read the KV secret, then revoke the login token even when the read
-        // fails. A revocation failure takes precedence because it leaves a
-        // live credential server-side; no downstream credential is returned.
+        // fails. Revocation was armed before this await, so cancellation also
+        // triggers the independent cleanup task. A revocation failure takes
+        // precedence because it leaves a live credential server-side; no
+        // downstream credential is returned.
         let kv_result = vault::kv_read(
             ext,
             &self.typed.vault_addr,
             &self.typed.kv_mount,
             resolved_path,
-            &vault_token.client_token,
+            revoker.client_token(),
             self.timeout,
         )
         .await;
-        vault::revoke_self(
-            ext,
-            &self.typed.vault_addr,
-            &vault_token.client_token,
-            self.timeout,
-        )
-        .await?;
+        revoker.revoke().await?;
         let kv_result = kv_result?;
 
         // Extract the configured field
@@ -315,19 +313,15 @@ impl VaultDelegator {
                 )
             })?;
 
-        let token_value = self.typed.scheme_prefix.as_ref().map_or_else(
-            || secret_value.to_owned(),
-            |prefix| format!("{prefix}{secret_value}"),
-        );
-
         let expires_at = Utc::now() + self.ttl;
         let token = RawDelegatedToken::new(
-            token_value,
+            secret_value,
             &self.typed.outbound_header,
             payload.target_audience().unwrap_or(""),
             Vec::new(),
             expires_at,
-        );
+        )
+        .with_outbound_prefix(self.typed.scheme_prefix.as_deref().unwrap_or(""));
 
         Ok(Mint {
             token,

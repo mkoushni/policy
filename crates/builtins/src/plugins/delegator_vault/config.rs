@@ -67,9 +67,10 @@ pub struct VaultDelegatorConfig {
     #[serde(default = "default_outbound_header")]
     pub outbound_header: String,
 
-    /// Optional prefix prepended to the secret value before it is stored in
-    /// the delegated token (for example, `"Bearer "` or `"token "`). Leave
-    /// unset for a bare credential such as `X-API-Key: <value>`.
+    /// Optional prefix the consuming host prepends to the secret when it
+    /// constructs the outbound header value (for example, `"Bearer "` or
+    /// `"token "`). Leave unset for a bare credential such as
+    /// `X-API-Key: <value>`.
     #[serde(default)]
     pub scheme_prefix: Option<String>,
 

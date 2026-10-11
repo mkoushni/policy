@@ -781,7 +781,7 @@ Omitting `scheme_prefix` deliberately produces the bare `X-API-Key` value.
 | `secret_path_template` | Required logical KV path. `{{identity}}` is mandatory when any caller-scoped auth entry is configured. Do not include the KV v2 `data/` segment. |
 | `secret_field` | String field containing the downstream credential; default `token`. |
 | `outbound_header` | Header used by the downstream transport; default `Authorization`. |
-| `scheme_prefix` | Optional exact prefix prepended to the stored value, such as `"token "` or `"Bearer "`. Unset means bare. |
+| `scheme_prefix` | Optional exact prefix the host prepends when constructing the outbound header value, such as `"token "` or `"Bearer "`. Unset means bare. |
 | `timeout_seconds` | Timeout for each Vault request; default `5`. |
 | `insecure_http` | Permit `http://` for development; default `false`. |
 | `auth.<subject>` | One entry for each allowed `user`, `client`, `caller_workload`, or `this_workload` subject. Missing entries deny. |
@@ -819,9 +819,11 @@ Omitting `scheme_prefix` deliberately produces the bare `X-API-Key` value.
 #### Vault revocation window
 
 After every KV read attempt, successful or failed, PPE calls Vault
-`auth/token/revoke-self`. If revocation fails, PPE returns no downstream
-credential. This bounds the lifetime of the temporary Vault login token; it
-does not revoke the PAT or API key stored in KV.
+`auth/token/revoke-self`. Revocation is armed before the KV request, so task
+cancellation also releases an independent, single-request cleanup operation.
+If an awaited revocation fails, PPE returns no downstream credential. This
+bounds the lifetime of the temporary Vault login token; it does not revoke the
+PAT or API key stored in KV.
 
 With caching enabled, `cache.ttl_seconds` is the maximum interval before PPE
 rereads Vault, so a rotated or deleted KV value may remain in memory until that

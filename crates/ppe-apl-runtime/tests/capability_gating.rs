@@ -218,13 +218,16 @@ impl HookHandler<TokenDelegateHook> for VaultShapedDelegate {
             .push(payload.bearer_token().to_owned());
 
         let mut updated = payload.clone();
-        updated.delegated_token = Some(RawDelegatedToken::new(
-            "token ghp_example",
-            "Authorization",
-            payload.target_audience().unwrap_or_default(),
-            payload.required_permissions().to_vec(),
-            Utc::now() + Duration::seconds(300),
-        ));
+        updated.delegated_token = Some(
+            RawDelegatedToken::new(
+                "ghp_example",
+                "Authorization",
+                payload.target_audience().unwrap_or_default(),
+                payload.required_permissions().to_vec(),
+                Utc::now() + Duration::seconds(300),
+            )
+            .with_outbound_prefix("token "),
+        );
         PluginResult::modify_payload(updated)
     }
 }
@@ -567,7 +570,8 @@ routes:
     let (key, token) = raw.delegated_tokens.iter().next().unwrap();
     assert_eq!(key.delegator_name, "vault-github");
     assert_eq!(key.target_name, "github-api");
-    assert_eq!(&*token.token, "token ghp_example");
+    assert_eq!(&*token.token, "ghp_example");
+    assert_eq!(token.outbound_prefix, "token ");
 }
 
 /// Predicate-only route: no plugins, just `require(authenticated)`.

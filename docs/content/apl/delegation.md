@@ -62,7 +62,7 @@ The bundled `delegator/vault` plugin resolves an existing PAT or API key from
 Vault KV v2 instead of minting an OAuth token. It requires
 `perform_http`, `read_inbound_credentials`, the relevant identity-read
 capability, and `write_delegated_tokens`. `scheme_prefix` explicitly controls
-the stored header value: use `"token "` for GitHub-style Authorization values,
+the outbound header value: use `"token "` for GitHub-style Authorization values,
 `"Bearer "` where required, or omit it for a bare `X-API-Key`. See the
 [Vault recipes](../identity-delegation.md#recipe-8-a-users-vault-stored-credential)
 for Vault policy, enrollment, and complete configuration.
