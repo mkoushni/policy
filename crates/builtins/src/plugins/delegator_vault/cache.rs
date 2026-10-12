@@ -107,7 +107,17 @@ impl CredentialCache {
             _ => "?",
         };
         let hash = Sha256::digest(credential.as_bytes());
-        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        let mut hex = String::with_capacity(64);
+        for byte in hash {
+            for nibble in [byte >> 4, byte & 0x0f] {
+                let digit = if nibble < 10 {
+                    b'0' + nibble
+                } else {
+                    b'a' + (nibble - 10)
+                };
+                hex.push(char::from(digit));
+            }
+        }
         format!(
             "{tag}:{}:{resolved_path}:{}:{audience}:{hex}",
             resolved_path.len(),
@@ -217,7 +227,10 @@ mod tests {
         let k2 =
             CredentialCache::cache_key(&DelegationSubject::User, "alice", "api", "jwt-alice-2");
         assert_ne!(k1, k2, "different JWTs must produce different keys");
-        assert_eq!(k1.rsplit(':').next().unwrap().len(), 64);
+        assert_eq!(
+            k1,
+            "u:5:alice:3:api:fdf87dfe5625971f70bd08b615201852695ea83a3d2fb3c10c13acf6da9e9528"
+        );
     }
 
     #[test]
