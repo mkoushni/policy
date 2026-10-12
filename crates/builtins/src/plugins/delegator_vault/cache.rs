@@ -53,7 +53,8 @@ impl std::fmt::Debug for Served {
     }
 }
 
-/// Bounded, coalescing credential cache keyed by principal identity.
+/// Bounded, coalescing credential cache keyed by subject, resolved path,
+/// audience, and authenticated credential.
 ///
 /// `try_get_with` coalesces concurrent requests for the same key:
 /// one caller fetches from Vault while the others wait, and all
@@ -85,17 +86,16 @@ impl CredentialCache {
         Ok(Some(Self { inner }))
     }
 
-    /// Cache key combining subject variant, identity claim value, target
-    /// audience, and a SHA-256 digest of the authenticated credential.
+    /// Cache key combining subject variant, resolved Vault path, target
+    /// audience, and the full SHA-256 digest of the authenticated credential.
     ///
     /// Including the credential hash prevents a JWT that Vault would
     /// reject from reusing another JWT's cached credential when the
-    /// subject type, identity claim, and audience happen to match.
-    /// The null byte separator is safe because `validate_identity_value`
-    /// rejects null bytes in identity values.
+    /// subject type, resolved path, and audience happen to match. Lengths
+    /// separate the variable fields without relying on their contents.
     pub(crate) fn cache_key(
         subject: &DelegationSubject,
-        identity: &str,
+        resolved_path: &str,
         audience: &str,
         credential: &str,
     ) -> String {
@@ -107,8 +107,12 @@ impl CredentialCache {
             _ => "?",
         };
         let hash = Sha256::digest(credential.as_bytes());
-        let hex: String = hash.iter().take(8).map(|b| format!("{b:02x}")).collect();
-        format!("{tag}:{identity}\0{audience}\0{hex}")
+        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        format!(
+            "{tag}:{}:{resolved_path}:{}:{audience}:{hex}",
+            resolved_path.len(),
+            audience.len()
+        )
     }
 
     /// Get a cached credential or mint a new one.
@@ -213,6 +217,7 @@ mod tests {
         let k2 =
             CredentialCache::cache_key(&DelegationSubject::User, "alice", "api", "jwt-alice-2");
         assert_ne!(k1, k2, "different JWTs must produce different keys");
+        assert_eq!(k1.rsplit(':').next().unwrap().len(), 64);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use praxis_policy_core::hooks::payload::Extensions;
 /// Resolve the identity claim value from the authenticated principal.
 ///
 /// The claim source depends on the delegation subject:
-/// - `User` → `security.subject.claims[identity_claim]`
+/// - `User` → `security.subject.id` for `sub`, otherwise `.claims[identity_claim]`
 /// - `Client` → `security.client.client_id` or `.claims[identity_claim]`
 /// - `CallerWorkload` → `security.caller_workload.{spiffe_id|trust_domain|client_id}`
 /// - `ThisWorkload` → `security.this_workload.{spiffe_id|trust_domain|client_id}`
@@ -88,7 +88,7 @@ pub(crate) fn resolve_identity(
 /// Resolve the JWT to send to Vault for authentication.
 ///
 /// - `User` / `Client` → `payload.bearer_token()`
-/// - `CallerWorkload` → `payload.actor_token()`
+/// - `CallerWorkload` → `payload.bearer_token()`
 /// - `ThisWorkload` → not applicable (uses `AppRole`)
 pub(crate) fn resolve_auth_token<'p>(
     subject: &DelegationSubject,
@@ -131,7 +131,8 @@ pub(crate) fn resolve_auth_token<'p>(
 ///
 /// Rejects empty values, null bytes, path traversal sequences (`..`),
 /// and percent-encoded forms of `/` and `.` that HTTP clients may decode
-/// before sending.
+/// before sending. Literal `/` is allowed for SPIFFE IDs; rejecting `.` and
+/// `..` segments prevents those values from escaping the configured path.
 pub(crate) fn validate_identity_value(value: &str) -> Result<(), Box<PluginViolation>> {
     if value.is_empty() {
         return Err(Box::new(PluginViolation::new(

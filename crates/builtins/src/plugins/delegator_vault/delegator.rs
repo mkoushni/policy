@@ -402,7 +402,7 @@ impl HookHandler<TokenDelegateHook> for VaultDelegator {
 
         // Resolve credential — cached or fresh.
         //
-        // When caching, the key includes a SHA-256 prefix of the
+        // When caching, the key includes the full SHA-256 digest of the
         // bearer token so a different JWT with the same subject claim
         // cannot reuse another caller's cached credential. For
         // `this_workload` (AppRole, no inbound token) the credential

@@ -9,7 +9,7 @@
 //! policy bound to that JWT auth mount. `this_workload` authenticates as PPE
 //! itself via `AppRole` and normally reads a workload-owned fixed path.
 
-/// Credential cache keyed by resolved principal identity.
+/// Credential cache keyed by subject, resolved path, audience, and credential.
 pub(crate) mod cache;
 /// Plugin configuration and its validation.
 pub mod config;
