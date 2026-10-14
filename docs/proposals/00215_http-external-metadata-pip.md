@@ -3,6 +3,8 @@ issue: https://github.com/praxis-proxy/policy/issues/215
 discussion: >-
   Design for an HTTP policy information point that enriches a request with
   external metadata before authorization.
+repos:
+  - policy
 status: proposed
 authors:
   - mkoushni
