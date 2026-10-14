@@ -136,6 +136,7 @@ cannot safely retain an extension mutation made by a stage.
 Normal APL rule conditions control whether the effect runs. Cheap gates should
 come first:
 
+<!-- validate: fragment -->
 ```yaml
 authorization:
   pre_invocation:
@@ -412,6 +413,7 @@ This proposed configuration fetches an account record after identity
 resolution and permits a tool only when the account is active and entitled to
 the requested operation.
 
+<!-- validate: fragment -->
 ```yaml
 engine_settings:
   dispatch: policy
