@@ -96,6 +96,12 @@ authorization.pre_invocation
   APL predicate / CEL / OPA / Cedar decision
 ```
 
+The `fetch(name)` effect publishes the result into framework-owned extensions
+and refreshes the evaluator's attribute bag before the next sequential step.
+The same refreshed snapshot is passed to PDP calls. The current route handler
+builds its bag once before evaluation, so writing an extension alone would not
+make fetched attributes visible to a later predicate or PDP in that invocation.
+
 The callout core belongs under
 `crates/builtins/src/plugins/metadata_http/callout/`, behind a new
 `metadata-http` feature. It remains internal to the builtins crate. When a
@@ -174,6 +180,11 @@ framework, acting for the `metadata.fetch` result, owns writes; there is no
 general `write_metadata` capability. An instance may create its own entry once
 per request. A duplicate write or an attempt to write another instance's name
 is a framework error. Once installed, the entry is immutable.
+
+The fetch hook returns its result to the evaluator for publication. It does not
+rely on a plugin's `modify_extensions` return: immutable slots are not merged
+from ordinary plugin extension writes. Publication and bag refresh complete
+before the evaluator advances to the next sequential step.
 
 The APL route handler must receive `read_metadata` when the compiled route
 contains `fetch(...)` or a `metadata.*` reference. Downstream plugins see the
@@ -370,7 +381,11 @@ For such a source, disable caching or set `volatile: true`, which caps TTL at
 30 seconds and disables stale serving.
 
 The in-process implementation uses the existing `moka` dependency for a
-bounded `max_entries` store and coalesced misses. Errors are not inserted.
+bounded store and coalesced misses. Bound retained response bytes as well as
+entry count: at the proposed 1 MiB default response limit, 10,000 entries
+could otherwise retain roughly 10 GiB of response data. `max_bytes` defaults
+to 64 MiB and counts cached payloads and response metadata; implementation
+overhead needs a separate allowance. Errors are not inserted.
 `ttl_seconds` is a ceiling. A later release may honor a smaller upstream
 `Cache-Control: max-age`, revalidate with ETag, and optionally serve a last
 good entry for at most `max_stale_seconds`. Every stale serve sets `$stale`
@@ -456,6 +471,7 @@ plugins:
         key: [subject.id, meta.entity_name]
         ttl_seconds: 30
         max_entries: 10000
+        max_bytes: 67108864
       max_concurrent_callouts: 64
 
 global:
@@ -567,7 +583,9 @@ the generic request, authentication, limit, and observation machinery.
    install semantics, `read_metadata`, extension filtering, and bag flattening.
 2. Add the `MetadataFetchHook` request/result types and hook metadata.
 3. Add `fetch(name)` to APL parsing, route reachability, dispatch plans, and
-   the pre-invocation evaluator. Reject it in all other positions.
+   the pre-invocation evaluator. Publish each successful result to the
+   framework-owned extension and refresh the bag/PDP input before the next
+   sequential step. Reject `fetch(name)` in all other positions.
 4. Grant the synthetic route handler `read_metadata` only for compiled routes
    that fetch or reference metadata.
 5. Add the Cedar `context.metadata` projection and schema tests. CEL and OPA
@@ -586,7 +604,7 @@ unprotected generic namespace or expose different data to different PDPs.
    limits.
 4. Use host HTTP with bounded retry budgets and normalized errors.
 5. Implement the in-process cache, HMAC keys, load-time coverage validation,
-   single-flight, TTL, and bounds.
+   single-flight, TTL, and entry/byte bounds.
 6. Add authenticated-subject gating, per-instance concurrency limits, and the
    circuit breaker.
 7. Emit tracing and audit events. Document the builtin and feature flag.
@@ -631,6 +649,7 @@ trait change.
 - Principal, tenant, instance, and config changes produce distinct keys.
 - Missing key attributes bypass cache and never share a null key.
 - Concurrent identical misses make one upstream call; errors are not cached.
+- Large responses evict entries before the configured byte limit is exceeded.
 - Property tests cover canonical encoding and HMAC derivation.
 
 ### Failure handling
@@ -638,7 +657,8 @@ trait change.
 - Fake-transport tests cover every error code, GET/POST retry policy, total
   budget, size limit, malformed JSON, rejected status, and auth rejection.
 - Route tests prove fetch occurs after identity and before APL/CEL/OPA/Cedar,
-  and a fetch violation prevents the decision from running.
+  that a subsequent APL predicate and each PDP see the published result in the
+  same invocation, and that a fetch violation prevents the decision from running.
 - Fail-open tests prove no partial or synthetic metadata is published and the
   worked example still denies on absence.
 - Deterministic clock tests cover semaphore saturation and every breaker
