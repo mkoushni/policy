@@ -192,10 +192,13 @@ slot only when their own declared capabilities include `read_metadata`.
 
 ### Bag projection and evaluator parity
 
-Values flatten to `metadata.<instance>.<path>`. Instance names follow the
-existing plugin-name grammar. JSON object keys containing `.` or starting with
-`$` are rejected rather than made ambiguous with dotted paths and reserved
-provenance fields.
+Values flatten to `metadata.<instance>.<path>`. Metadata instance names must
+match `^[A-Za-z_][A-Za-z0-9_-]*$`; the metadata adapter rejects any other name
+at load even though the general plugin registry permits broader names. This
+prevents an instance such as `acct.billing` from colliding with a `billing`
+object published by an `acct` instance. JSON object keys containing `.` or
+starting with `$` are rejected rather than made ambiguous with dotted paths
+and reserved provenance fields.
 
 CEL and OPA already rebuild nested values from arbitrary dotted bag keys, so a
 metadata projection reaches them without a second metadata-specific input.
@@ -203,6 +206,13 @@ APL predicates read the same bag keys directly. Cedar currently constructs a
 selected context rather than forwarding every bag namespace; the prerequisite
 work must add metadata at `context.metadata.<instance>.*`. A Cedar schema must
 declare that context shape when schema validation is enabled.
+
+The evaluator always registers the top-level `metadata` object, even when no
+fetch succeeds or `on_error: ignore` publishes no instance. Consequently CEL
+`has(metadata.account_status)` evaluates to false instead of failing on an
+undeclared variable. Metadata is also a sensitive diagnostic namespace: CEL
+deny diagnostics must redact it in the same way as payload namespaces rather
+than printing every referenced fetched value into audit logs.
 
 Provenance fields project as reserved leaves:
 
@@ -249,7 +259,7 @@ Encoding is determined by context:
 |---|---|
 | path segment | percent-encode outside the URI unreserved set, including `/`, `?`, `#`, and `%`; reject a resolved `.` or `..` segment |
 | query value | form-urlencode; repeat the parameter for a string set |
-| header value | reject CR, LF, and NUL; never strip them |
+| header value | reject CR, LF, and NUL; never strip them; reject `Host` as a configured or templated header name, case-insensitively |
 | JSON field | insert a typed JSON value; no string concatenation |
 | form field | form-urlencode |
 
@@ -277,12 +287,18 @@ overall timeout, connect-timeout hint, and maximum response bytes, and the host
 transport remains responsible for destination policy and connection pooling.
 
 The static authority rule prevents request data from choosing a destination.
+Rejecting a configured `Host` header also prevents request data from selecting
+a different virtual host at the pinned destination while an outbound secret is
+attached.
 The host must still enforce DNS/IP egress policy at resolution and connection
 time, including redirects if it follows them. The reference transport should
 reject loopback, link-local, RFC1918, and CGNAT destinations by default.
-Deployments that intentionally call in-cluster services must install a host
-transport policy that permits the exact destinations; plugin YAML gets no
-`allow_private_networks` bypass.
+The bundled `HyperTransport` currently offers only the transport-wide
+`with_allow_private_destinations` switch, which admits every private and
+link-local destination for every plugin using that transport. Until P2 adds a
+per-destination allow-list, an in-cluster metadata service therefore requires
+a separately scoped host transport or accepting that broader exposure. Plugin
+YAML gets no `allow_private_networks` bypass.
 
 Plain HTTP requires `insecure_http: true`. Custom trust and mTLS use a named
 host TLS profile referenced as `tls_profile: kube-api`; CA files, client keys,
@@ -316,9 +332,13 @@ on them; an accepted status is not itself an error.
 
 GET uses `RetryPolicy::idempotent()`. POST uses
 `RetryPolicy::undelivered_only()` because a delivered POST may have side
-effects even when its response is lost. In both cases `total_budget` is capped
-by the callout's overall timeout, so retry backoff cannot extend the policy
-request indefinitely.
+effects even when its response is lost. Configuration separates
+`attempt_timeout` from the larger `total_timeout`: `HttpRequest.timeout` is the
+per-attempt value and `RetryPolicy.total_budget` is the total value covering
+all attempts and backoff. Load validation requires `attempt_timeout` to be
+less than `total_timeout` when retries are enabled. This leaves room for a
+useful retry after a fast failure while bounding the complete callout by the
+policy request's remaining deadline.
 
 ## Runtime and failure semantics
 
@@ -340,7 +360,9 @@ authorization phase before any decision can consume absent or partial data.
 
 `on_error: ignore` is an explicit fail-open setting. It publishes no metadata
 entry, including no synthetic `$error` value. Policies using it must test
-existence and deny when metadata is absent. Caching errors is forbidden.
+existence and deny when metadata is absent. The evaluator still exposes an
+empty top-level `metadata` object so that existence checks are well-defined.
+Caching errors is forbidden.
 
 Each instance has a semaphore. Saturation fails immediately instead of
 waiting behind requests already consuming the upstream timeout. A basic
@@ -526,7 +548,7 @@ Equivalent evaluator access is:
 | Threat | Control |
 |---|---|
 | request-controlled SSRF | static authority, context encoding, host egress policy |
-| path/header injection | segment encoding; CR/LF/NUL rejection |
+| path/header injection | segment encoding; CR/LF/NUL rejection; `Host` header rejection |
 | one principal receives another's metadata | load-time key coverage, HMAC scoping, missing-key bypass |
 | cached data becomes a credential | metadata-only slot, no delegator access without `read_metadata` |
 | plugin over-reads context | template-derived capability check plus filtered extensions |
@@ -534,7 +556,7 @@ Equivalent evaluator access is:
 | malicious source floods the bag | response and flatten limits; atomic failure |
 | anonymous amplification | authenticated-subject default, cache, semaphore, breaker |
 | stale authorization after revocation | short bounded TTL; stale serving off by default |
-| secret leakage in logs | redacted request/debug output and value-free events |
+| secret or metadata leakage in logs | redacted request/debug output, redacted CEL diagnostics, and value-free events |
 
 The dominant residual risk is implicit server-side variation that is absent
 from the request and therefore invisible to cache-key analysis. Operators must
@@ -589,8 +611,11 @@ the generic request, authentication, limit, and observation machinery.
 4. Grant the synthetic route handler `read_metadata` only for compiled routes
    that fetch or reference metadata.
 5. Add the Cedar `context.metadata` projection and schema tests. CEL and OPA
-   receive coverage tests for arbitrary metadata keys.
-6. Define the callout error taxonomy and audit event schema.
+   receive coverage tests for arbitrary metadata keys. Always register an
+   empty top-level metadata object when no instance is published.
+6. Treat metadata as a sensitive namespace in CEL deny diagnostics and cover
+   its redaction in audit-log tests.
+7. Define the callout error taxonomy and audit event schema.
 
 These are prerequisites because without them the adapter would either write an
 unprotected generic namespace or expose different data to different PDPs.
@@ -598,11 +623,13 @@ unprotected generic namespace or expose different data to different PDPs.
 ### P1: initial metadata PIP
 
 1. Add the `metadata-http` feature, factory, adapter, and internal callout core.
-2. Implement GET/POST, static authority, context-aware template encoding,
+2. Implement GET/POST, static authority, metadata-instance name validation,
+   context-aware template encoding, `Host` header rejection,
    template-derived capability checks, and credential-interpolation opt-in.
 3. Implement shared-secret auth and JSON/text response flattening with hard
    limits.
-4. Use host HTTP with bounded retry budgets and normalized errors.
+4. Use host HTTP with distinct per-attempt and total timeouts, bounded retry
+   budgets, and normalized errors.
 5. Implement the in-process cache, HMAC keys, load-time coverage validation,
    single-flight, TTL, and entry/byte bounds.
 6. Add authenticated-subject gating, per-instance concurrency limits, and the
@@ -615,6 +642,9 @@ trait change.
 ### P2: shared infrastructure and richer HTTP
 
 - Named TLS profiles and optional `HttpRequest` profile selection.
+- Per-destination private/link-local allow-lists in `HyperTransport`, scoped so
+  enabling an in-cluster service does not admit every private destination for
+  every outbound plugin.
 - W3C trace-context propagation at the host transport seam.
 - OAuth2 client credentials with a separate token cache and one 401 refresh.
 - Cache-Control/ETag revalidation and bounded stale serving.
@@ -639,7 +669,10 @@ trait change.
   opt-in, and named field.
 - A plugin without `read_metadata` receives an empty metadata slot.
 - One metadata instance cannot write or replace another instance's entry.
+- Metadata instance names outside `^[A-Za-z_][A-Za-z0-9_-]*$` fail at load.
 - CEL, OPA, Cedar, and APL see the same allowed scalar and string-set values.
+- CEL receives an empty `metadata` object when no fetch publishes an instance,
+  and deny diagnostics never include fetched metadata values.
 
 ### Cache isolation
 
@@ -654,8 +687,9 @@ trait change.
 
 ### Failure handling
 
-- Fake-transport tests cover every error code, GET/POST retry policy, total
-  budget, size limit, malformed JSON, rejected status, and auth rejection.
+- Fake-transport tests cover every error code, GET/POST retry policy,
+  per-attempt and total budgets, size limit, malformed JSON, rejected status,
+  and auth rejection.
 - Route tests prove fetch occurs after identity and before APL/CEL/OPA/Cedar,
   that a subsequent APL predicate and each PDP see the published result in the
   same invocation, and that a fetch violation prevents the decision from running.
@@ -663,8 +697,9 @@ trait change.
   worked example still denies on absence.
 - Deterministic clock tests cover semaphore saturation and every breaker
   transition; cache hits remain available while open.
-- Security tests cover encoded traversal, header injection, authority
-  interpolation rejection, credential exfiltration, and bag-limit attacks.
+- Security tests cover encoded traversal, header injection, case-insensitive
+  `Host` header and authority interpolation rejection, credential
+  exfiltration, and bag-limit attacks.
 - A real-transport test covers host destination rejection. Benchmarks record
   cache-hit and miss overhead before assigning a numeric performance budget.
 
