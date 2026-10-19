@@ -6,7 +6,7 @@ keys. Plugins that received the typed slot still see the original struct. This
 document is the contract for what the bridge emits, how original collections
 relate to flattened booleans, and which keys exist.
 
-The twelve slots dispatched by `extract_extensions` are listed below.
+The thirteen slots dispatched by `extract_extensions` are listed below.
 `raw_credentials`, `candidate_constraint`, and `llm_request` are not among
 them: credentials never enter the bag, a routing constraint is not a policy
 attribute, and the parsed LLM request reaches PDPs as structured JSON instead
@@ -18,7 +18,7 @@ attribute, and the parsed LLM request reaches PDPs as structured JSON instead
 - [Original collections and flattened booleans](#original-collections-and-flattened-booleans)
 - [`subject.claims`](#subjectclaims)
 - [What each decision point does with a missing key](#what-each-decision-point-does-with-a-missing-key)
-- [The twelve slots](#the-twelve-slots)
+- [The thirteen slots](#the-thirteen-slots)
 - [Payloads that are not slots](#payloads-that-are-not-slots)
 
 ---
@@ -40,6 +40,11 @@ missing slots is out of scope.
 | `Int` | **Omitted** when `Option::None` (`http.status`, `agent.turn`, `completion.latency_ms`). A non-option int (`delegation.depth`) is always written, including `0`. | Emitting `0` for an unset HTTP status would make `http.status >= 500` and `http.status == 0` both lie. |
 | `Float` | Same as `Int`. `delegation.age_seconds` is non-option and always written, including `0.0`. | Same reason: a missing telemetry field is not zero. |
 | JSON object / claims map | **No parent key.** Each scalar (or scalar-array) child is written under a dotted path. `{}`, `null`, and an array holding a nested container set nothing. | The bag has no map type. See [`subject.claims`](#subjectclaims). |
+
+Acquired metadata is the deliberate exception to the last row: each present
+object, mixed array, or `null` writes `NonScalar` at its own path so an
+installed result remains distinguishable from a missing one. Its structured
+record remains available to later evaluator-native projections.
 
 `ppe-pdp-diff` is the executable form of this table for the keys Cedar can
 see. Empty `subject.teams` and a subject with no roles (no `role.*` keys,
@@ -194,7 +199,7 @@ keys), or a missing `subject.id`, is the `missing-collection` /
 
 ---
 
-## The twelve slots
+## The thirteen slots
 
 Keys listed **always** are written whenever the slot (and, where noted, the
 sub-record) is present. The rest are omitted when the field is `None` or the
@@ -515,6 +520,25 @@ policy as `args.*`; see
 | `custom.<dotted>` | flattened JSON | each map entry |
 
 An empty map adds nothing.
+
+### 13. `metadata` — `MetadataExtension`
+
+| Key | Type | When |
+|---|---|---|
+| `metadata.<name>` | acquired JSON | each installed instance and its derived value/provenance paths |
+
+Each instance is present as `NonScalar`. Object response members project
+directly below it; a scalar, array, or `null` root uses the stable `value`
+leaf. Scalar leaves keep their type, string arrays become `StringSet`, and
+objects, mixed arrays, and `null` are present as `NonScalar`. The structured
+`AcquiredFacts` value remains authoritative and is not reconstructed from
+these flattened keys.
+
+Reserved provenance leaves are `$source`, `$outcome`, `$fetched_at`, `$cache`,
+`$status`, `$stale`, and `$error_code`; optional leaves appear only when they
+apply. `$source` carries the registered plugin kind, while the containing
+namespace carries its instance name. A plugin sees this slot and namespace
+only with `read_metadata`.
 
 ---
 

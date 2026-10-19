@@ -42,7 +42,9 @@ use praxis_policy_core::error::PluginError as CoreError;
 use praxis_policy_core::extensions::raw_credentials::{
     RawCredentialsExtension, RawDelegatedToken, RawInboundToken, TokenKind, TokenRole,
 };
-use praxis_policy_core::extensions::{LlmRequestDocument, MetaExtension, SecurityExtension};
+use praxis_policy_core::extensions::{
+    AcquiredFacts, LlmRequestDocument, MetaExtension, MetadataCacheDisposition, SecurityExtension,
+};
 use praxis_policy_core::factory::{PluginFactory, PluginInstance};
 use praxis_policy_core::hooks::adapter::TypedHandlerAdapter;
 use praxis_policy_core::hooks::payload::Extensions;
@@ -295,9 +297,84 @@ fn extensions_with_label(label: &str) -> Extensions {
     }
 }
 
+fn extensions_with_metadata(active: bool) -> Extensions {
+    let mut extensions = Extensions {
+        meta: Some(Arc::new(meta_for_tool("get_weather"))),
+        ..Default::default()
+    };
+    extensions
+        .install_metadata(
+            "account",
+            "metadata/http",
+            AcquiredFacts::success(
+                serde_json::json!({"active": active}),
+                "2026-10-19T12:00:00Z"
+                    .parse()
+                    .expect("a literal RFC3339 instant"),
+                MetadataCacheDisposition::Disabled,
+            ),
+        )
+        .expect("metadata fixture installs");
+    extensions
+}
+
 // =====================================================================
 // Scenarios
 // =====================================================================
+
+#[tokio::test]
+async fn acquired_metadata_changes_the_apl_decision() {
+    const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
+plugins: []
+routes:
+  - tool: get_weather
+    authorization:
+      pre_invocation:
+        - "require(metadata.account.active)"
+"#;
+
+    let mgr = Arc::new(PolicyEngine::default());
+    register_apl(
+        &mgr,
+        AplOptions {
+            base_capabilities: Some(std::collections::HashSet::from(
+                ["read_metadata".to_owned()],
+            )),
+            ..AplOptions::in_process()
+        },
+    );
+    mgr.load_config_yaml(YAML).expect("load_config_yaml");
+    mgr.initialize().await.expect("initialize");
+
+    let (allowed, _bg) = mgr
+        .invoke_named::<CmfHook>(
+            "cmf.tool_pre_invoke",
+            cmf_payload("hi"),
+            extensions_with_metadata(true),
+            None,
+        )
+        .await;
+    assert!(
+        allowed.continue_processing,
+        "true acquired fact should allow: {:?}",
+        allowed.violation
+    );
+
+    let (denied, _bg) = mgr
+        .invoke_named::<CmfHook>(
+            "cmf.tool_pre_invoke",
+            cmf_payload("hi"),
+            extensions_with_metadata(false),
+            None,
+        )
+        .await;
+    assert!(
+        !denied.continue_processing,
+        "false acquired fact should deny"
+    );
+}
 
 /// Plugin declares `read_labels`; route references it; pre-existing
 /// label `EXISTING` is set on the request extensions. The plugin must
