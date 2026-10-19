@@ -276,10 +276,12 @@ pub enum MetadataInstallError {
 // Validation
 // -----------------------------------------------------------------------------
 
+/// Serde predicate for omitting a false stale marker.
 fn is_false(value: &bool) -> bool {
     !value
 }
 
+/// Enforce a single unambiguous dotted-namespace segment.
 fn validate_instance_name(instance: &str) -> Result<(), MetadataInstallError> {
     let mut chars = instance.chars();
     let Some(first) = chars.next() else {
@@ -297,6 +299,7 @@ fn validate_instance_name(instance: &str) -> Result<(), MetadataInstallError> {
     Ok(())
 }
 
+/// Enforce the mutually exclusive success and error record shapes.
 fn validate_record(facts: &AcquiredFacts) -> Result<(), MetadataInstallError> {
     match facts.outcome {
         MetadataOutcome::Success
@@ -326,6 +329,7 @@ fn validate_record(facts: &AcquiredFacts) -> Result<(), MetadataInstallError> {
     }
 }
 
+/// Reject response keys that collide in the derived dotted projection.
 fn validate_keys(value: &Value, root: bool) -> Result<(), MetadataInstallError> {
     match value {
         Value::Object(map) => {
@@ -367,11 +371,27 @@ mod tests {
         extensions
             .install_metadata("account", "metadata/http", success(json!({"active": true})))
             .expect("the first instance installs");
+        let allocation = Arc::as_ptr(
+            extensions
+                .metadata
+                .as_ref()
+                .expect("metadata allocation exists"),
+        );
         extensions
             .install_metadata("region", "metadata/http", success(json!("eu")))
             .expect("a second instance installs");
 
         let metadata = extensions.metadata.as_deref().expect("metadata is present");
+        assert_eq!(
+            Arc::as_ptr(
+                extensions
+                    .metadata
+                    .as_ref()
+                    .expect("metadata allocation remains")
+            ),
+            allocation,
+            "a uniquely owned metadata map should grow in place"
+        );
         let account = metadata.get("account").expect("account record exists");
         assert_eq!(
             account.source().expect("source is stamped").kind,
@@ -404,7 +424,33 @@ mod tests {
                 "account".to_owned()
             ))
         );
+        assert!(Arc::ptr_eq(
+            extensions
+                .metadata
+                .as_ref()
+                .expect("metadata allocation remains"),
+            &before
+        ));
         assert_eq!(extensions.metadata.as_deref(), Some(before.as_ref()));
+    }
+
+    #[test]
+    fn shared_metadata_clones_only_after_a_successful_install() {
+        let mut extensions = Extensions::default();
+        extensions
+            .install_metadata("account", "metadata/http", success(json!(true)))
+            .expect("first record installs");
+        let shared = Arc::clone(extensions.metadata.as_ref().expect("metadata exists"));
+
+        extensions
+            .install_metadata("region", "metadata/http", success(json!("eu")))
+            .expect("second record installs into a detached map");
+
+        let current = extensions.metadata.as_ref().expect("metadata remains");
+        assert!(!Arc::ptr_eq(current, &shared));
+        assert!(shared.get("account").is_some());
+        assert!(shared.get("region").is_none());
+        assert!(current.get("region").is_some());
     }
 
     #[test]

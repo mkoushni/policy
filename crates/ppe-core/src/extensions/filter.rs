@@ -1165,6 +1165,7 @@ mod tests {
         SlotName::Agent,
         SlotName::Http,
         SlotName::Meta,
+        SlotName::Metadata,
         SlotName::Delegation,
         SlotName::Custom,
         SlotName::Mcp,

@@ -234,6 +234,12 @@ impl Extensions {
         kind: &str,
         facts: AcquiredFacts,
     ) -> Result<(), MetadataInstallError> {
+        if let Some(existing) = self.metadata.as_mut()
+            && let Some(metadata) = Arc::get_mut(existing)
+        {
+            return metadata.install(instance, kind, facts);
+        }
+
         let mut metadata = self.metadata.as_deref().cloned().unwrap_or_default();
         metadata.install(instance, kind, facts)?;
         self.metadata = Some(Arc::new(metadata));

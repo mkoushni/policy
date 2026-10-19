@@ -114,6 +114,54 @@ impl PluginFactory for LabelReaderFactory {
     }
 }
 
+/// Plugin that records whether a nested dispatch received parent metadata.
+struct MetadataReader {
+    cfg: PluginConfig,
+    observed: Arc<std::sync::Mutex<Vec<bool>>>,
+}
+
+#[async_trait]
+impl Plugin for MetadataReader {
+    fn config(&self) -> &PluginConfig {
+        &self.cfg
+    }
+}
+
+impl HookHandler<CmfHook> for MetadataReader {
+    async fn handle(
+        &self,
+        _payload: &MessagePayload,
+        extensions: &Extensions,
+        _ctx: &mut PluginContext,
+    ) -> PluginResult<MessagePayload> {
+        self.observed
+            .lock()
+            .unwrap()
+            .push(extensions.metadata.is_some());
+        PluginResult::allow()
+    }
+}
+
+struct MetadataReaderFactory {
+    observed: Arc<std::sync::Mutex<Vec<bool>>>,
+}
+
+impl PluginFactory for MetadataReaderFactory {
+    fn create(&self, config: &PluginConfig) -> Result<PluginInstance, Box<CoreError>> {
+        let plugin = Arc::new(MetadataReader {
+            cfg: config.clone(),
+            observed: Arc::clone(&self.observed),
+        });
+        Ok(PluginInstance {
+            plugin: plugin.clone(),
+            handlers: vec![(
+                "cmf.tool_pre_invoke",
+                Arc::new(TypedHandlerAdapter::<CmfHook, _>::new(plugin)),
+            )],
+        })
+    }
+}
+
 /// Plugin that appends a label via `modify_extensions`. Used to verify
 /// write-cap propagation: requires both an `append_labels` declaration
 /// on the plugin AND the synthetic handler to also be granted
@@ -198,6 +246,7 @@ struct LlmRequestReaderFactory {
 struct VaultShapedDelegate {
     cfg: PluginConfig,
     observed_bearer: Arc<std::sync::Mutex<Vec<String>>>,
+    observed_metadata: Arc<std::sync::Mutex<Vec<bool>>>,
 }
 
 #[async_trait]
@@ -211,13 +260,17 @@ impl HookHandler<TokenDelegateHook> for VaultShapedDelegate {
     async fn handle(
         &self,
         payload: &DelegationPayload,
-        _extensions: &Extensions,
+        extensions: &Extensions,
         _ctx: &mut PluginContext,
     ) -> PluginResult<DelegationPayload> {
         self.observed_bearer
             .lock()
             .unwrap()
             .push(payload.bearer_token().to_owned());
+        self.observed_metadata
+            .lock()
+            .unwrap()
+            .push(extensions.metadata.is_some());
 
         let mut updated = payload.clone();
         updated.delegated_token = Some(
@@ -236,6 +289,7 @@ impl HookHandler<TokenDelegateHook> for VaultShapedDelegate {
 
 struct VaultShapedDelegateFactory {
     observed_bearer: Arc<std::sync::Mutex<Vec<String>>>,
+    observed_metadata: Arc<std::sync::Mutex<Vec<bool>>>,
 }
 
 impl PluginFactory for VaultShapedDelegateFactory {
@@ -243,6 +297,7 @@ impl PluginFactory for VaultShapedDelegateFactory {
         let plugin = Arc::new(VaultShapedDelegate {
             cfg: config.clone(),
             observed_bearer: Arc::clone(&self.observed_bearer),
+            observed_metadata: Arc::clone(&self.observed_metadata),
         });
         Ok(PluginInstance {
             plugin: plugin.clone(),
@@ -373,6 +428,83 @@ routes:
     assert!(
         !denied.continue_processing,
         "false acquired fact should deny"
+    );
+}
+
+#[tokio::test]
+async fn acquired_metadata_is_invisible_without_read_metadata() {
+    const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
+plugins: []
+routes:
+  - tool: get_weather
+    authorization:
+      pre_invocation:
+        - "require(metadata.account.active)"
+"#;
+    let mgr = Arc::new(PolicyEngine::default());
+    register_apl(&mgr, AplOptions::in_process());
+    mgr.load_config_yaml(YAML).expect("load_config_yaml");
+    mgr.initialize().await.expect("initialize");
+
+    let (result, _bg) = mgr
+        .invoke_named::<CmfHook>(
+            "cmf.tool_pre_invoke",
+            cmf_payload("hi"),
+            extensions_with_metadata(true),
+            None,
+        )
+        .await;
+
+    assert!(
+        !result.continue_processing,
+        "metadata must not reach the APL bag without read_metadata"
+    );
+}
+
+#[tokio::test]
+async fn nested_run_does_not_inherit_parent_metadata() {
+    const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
+plugins:
+  - name: metadata-reader
+    kind: metadata-reader
+    hooks: [cmf.tool_pre_invoke]
+    capabilities: [read_metadata]
+routes:
+  - tool: get_weather
+    authorization:
+      pre_invocation:
+        - "run(metadata-reader)"
+"#;
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mgr = Arc::new(PolicyEngine::default());
+    mgr.register_factory(
+        "metadata-reader",
+        Box::new(MetadataReaderFactory {
+            observed: Arc::clone(&observed),
+        }),
+    );
+    register_apl(&mgr, AplOptions::in_process());
+    mgr.load_config_yaml(YAML).expect("load_config_yaml");
+    mgr.initialize().await.expect("initialize");
+
+    let (result, _bg) = mgr
+        .invoke_named::<CmfHook>(
+            "cmf.tool_pre_invoke",
+            cmf_payload("hi"),
+            extensions_with_metadata(true),
+            None,
+        )
+        .await;
+
+    assert!(result.continue_processing, "nested plugin should allow");
+    assert_eq!(
+        *observed.lock().unwrap(),
+        vec![false],
+        "read_metadata on a child plugin must not expose its parent records"
     );
 }
 
@@ -514,7 +646,7 @@ plugins:
   - name: label-writer
     kind: label-writer
     hooks: [cmf.tool_pre_invoke]
-    capabilities: [append_labels, read_labels]
+    capabilities: [append_labels, read_labels, read_metadata]
 routes:
   - tool: get_weather
     authorization:
@@ -528,10 +660,7 @@ routes:
     mgr.load_config_yaml(YAML).expect("load_config_yaml");
     mgr.initialize().await.expect("initialize");
 
-    let ext = Extensions {
-        meta: Some(Arc::new(meta_for_tool("get_weather"))),
-        ..Default::default()
-    };
+    let ext = extensions_with_metadata(true);
     let (result, _bg) = mgr
         .invoke_named::<CmfHook>("cmf.tool_pre_invoke", cmf_payload("hi"), ext, None)
         .await;
@@ -559,6 +688,14 @@ routes:
          way out of AplRouteHandler (no append_labels cap on the synthetic). \
          Got: {labels:?}"
     );
+    assert!(
+        modified
+            .metadata
+            .as_deref()
+            .and_then(|metadata| metadata.get("account"))
+            .is_some(),
+        "merging child extension changes must preserve parent metadata"
+    );
 }
 
 /// A Vault-style delegate must receive the inbound caller JWT and its minted
@@ -578,6 +715,7 @@ plugins:
       - read_inbound_credentials
       - read_subject
       - read_claims
+      - read_metadata
       - write_delegated_tokens
 routes:
   - tool: get_weather
@@ -587,11 +725,13 @@ routes:
 "#;
 
     let observed_bearer = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_metadata = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mgr = Arc::new(PolicyEngine::default());
     mgr.register_factory(
         "vault-shaped-delegate",
         Box::new(VaultShapedDelegateFactory {
             observed_bearer: Arc::clone(&observed_bearer),
+            observed_metadata: Arc::clone(&observed_metadata),
         }),
     );
     register_apl(
@@ -613,11 +753,8 @@ routes:
         TokenRole::User,
         RawInboundToken::new("caller-jwt", "Authorization", TokenKind::Jwt),
     );
-    let ext = Extensions {
-        meta: Some(Arc::new(meta_for_tool("get_weather"))),
-        raw_credentials: Some(Arc::new(raw)),
-        ..Default::default()
-    };
+    let mut ext = extensions_with_metadata(true);
+    ext.raw_credentials = Some(Arc::new(raw));
     let (result, _bg) = mgr
         .invoke_named::<CmfHook>("cmf.tool_pre_invoke", cmf_payload("hi"), ext, None)
         .await;
@@ -630,6 +767,11 @@ routes:
         *observed_bearer.lock().unwrap(),
         vec!["caller-jwt".to_owned()],
         "read_inbound_credentials must reach the delegate payload"
+    );
+    assert_eq!(
+        *observed_metadata.lock().unwrap(),
+        vec![false],
+        "delegate child dispatch must not inherit parent metadata"
     );
 
     let modified = result

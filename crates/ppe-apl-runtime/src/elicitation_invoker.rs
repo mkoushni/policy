@@ -127,7 +127,7 @@ impl ElicitationPluginInvoker {
         payload: ElicitationPayload,
     ) -> Result<ElicitationPayload, ElicitationError> {
         let entry = self.entry_for(plugin_name)?;
-        let current_extensions = self.extensions.lock().await.clone();
+        let current_extensions = self.extensions.lock().await.for_child_request();
 
         let (result, _bg) = self
             .engine

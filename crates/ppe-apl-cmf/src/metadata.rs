@@ -21,6 +21,7 @@ pub fn extract_metadata(metadata: &MetadataExtension, bag: &mut AttributeBag) {
     }
 }
 
+/// Project a successful structured value below one instance prefix.
 fn extract_value(facts: &AcquiredFacts, prefix: &str, bag: &mut AttributeBag) {
     let Some(value) = facts.value() else { return };
     match value {
@@ -33,6 +34,7 @@ fn extract_value(facts: &AcquiredFacts, prefix: &str, bag: &mut AttributeBag) {
     }
 }
 
+/// Project the framework-stamped acquisition provenance leaves.
 fn extract_provenance(facts: &AcquiredFacts, prefix: &str, bag: &mut AttributeBag) {
     if let Some(source) = facts.source() {
         bag.set(format!("{prefix}.$source"), source.kind.clone());
@@ -59,6 +61,7 @@ fn extract_provenance(facts: &AcquiredFacts, prefix: &str, bag: &mut AttributeBa
     }
 }
 
+/// Flatten APL-compatible leaves while retaining unsupported-node presence.
 fn walk(value: &Value, prefix: &str, bag: &mut AttributeBag) {
     match value {
         Value::Object(map) => {

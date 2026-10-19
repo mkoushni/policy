@@ -377,11 +377,13 @@ where
                 ))
             })?;
 
-        // Snapshot the current payload + extensions — `invoke_entries`
+        // Snapshot the current payload + child extensions — `invoke_entries`
         // consumes by-value, so we clone for the call and keep the
-        // canonical copies in shared state for the next dispatch.
+        // canonical copies in shared state for the next dispatch. Acquired
+        // metadata belongs to the parent policy invocation and must not cross
+        // this nested plugin-dispatch boundary.
         let current_payload = self.payload.lock().await.clone();
-        let current_extensions = self.extensions.lock().await.clone();
+        let current_extensions = self.extensions.lock().await.for_child_request();
 
         // Per-call taint diff baseline. New labels in `result` minus
         // these become `PluginOutcome.taints`.
@@ -484,11 +486,13 @@ where
         // `Option<Extensions>` for the modified view — `Some` only when
         // a plugin actually changed extensions. The executor has
         // already validated label monotonicity on the way out.
-        let taints = if let Some(modified_ext) = result.modified_extensions {
+        let taints = if let Some(mut modified_ext) = result.modified_extensions {
             let after_labels = snapshot_labels(&modified_ext);
             let new_labels: Vec<String> =
                 after_labels.difference(&before_labels).cloned().collect();
-            *self.extensions.lock().await = modified_ext;
+            let mut parent_extensions = self.extensions.lock().await;
+            modified_ext.metadata = parent_extensions.metadata.clone();
+            *parent_extensions = modified_ext;
             new_labels
                 .into_iter()
                 .map(|label| TaintEvent {
