@@ -114,7 +114,7 @@ impl PluginFactory for LabelReaderFactory {
     }
 }
 
-/// Plugin that records whether a nested dispatch received parent metadata.
+/// Plugin that records whether a dispatch received the parent's metadata.
 struct MetadataReader {
     cfg: PluginConfig,
     observed: Arc<std::sync::Mutex<Vec<bool>>>,
@@ -463,22 +463,25 @@ routes:
     );
 }
 
-#[tokio::test]
-async fn nested_run_does_not_inherit_parent_metadata() {
-    const YAML: &str = r#"
+/// Run `metadata-reader` from a route with the given plugin capabilities and
+/// return whether each dispatch saw the parent's acquired metadata.
+async fn run_metadata_reader(capabilities: &str) -> Vec<bool> {
+    let yaml = format!(
+        r#"
 engine_settings:
   dispatch: policy
 plugins:
   - name: metadata-reader
     kind: metadata-reader
     hooks: [cmf.tool_pre_invoke]
-    capabilities: [read_metadata]
+    capabilities: [{capabilities}]
 routes:
   - tool: get_weather
     authorization:
       pre_invocation:
         - "run(metadata-reader)"
-"#;
+"#
+    );
     let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mgr = Arc::new(PolicyEngine::default());
     mgr.register_factory(
@@ -488,7 +491,7 @@ routes:
         }),
     );
     register_apl(&mgr, AplOptions::in_process());
-    mgr.load_config_yaml(YAML).expect("load_config_yaml");
+    mgr.load_config_yaml(&yaml).expect("load_config_yaml");
     mgr.initialize().await.expect("initialize");
 
     let (result, _bg) = mgr
@@ -500,11 +503,25 @@ routes:
         )
         .await;
 
-    assert!(result.continue_processing, "nested plugin should allow");
+    assert!(result.continue_processing, "run() plugin should allow");
+    observed.lock().unwrap().clone()
+}
+
+#[tokio::test]
+async fn run_plugin_with_read_metadata_sees_parent_metadata() {
     assert_eq!(
-        *observed.lock().unwrap(),
+        run_metadata_reader("read_metadata").await,
+        vec![true],
+        "a run() plugin in the same invocation sees metadata with read_metadata"
+    );
+}
+
+#[tokio::test]
+async fn run_plugin_without_read_metadata_sees_no_metadata() {
+    assert_eq!(
+        run_metadata_reader("").await,
         vec![false],
-        "read_metadata on a child plugin must not expose its parent records"
+        "metadata must not reach a run() plugin without read_metadata"
     );
 }
 
@@ -770,13 +787,21 @@ routes:
     );
     assert_eq!(
         *observed_metadata.lock().unwrap(),
-        vec![false],
-        "delegate child dispatch must not inherit parent metadata"
+        vec![true],
+        "a delegate in the same invocation sees metadata with read_metadata"
     );
 
     let modified = result
         .modified_extensions
         .expect("delegate should return modified extensions");
+    assert!(
+        modified
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("account"))
+            .is_some(),
+        "parent metadata must survive the delegate step"
+    );
     let raw = modified
         .raw_credentials
         .as_ref()

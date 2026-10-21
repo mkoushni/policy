@@ -20,9 +20,10 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 ### Added
 
 - Added immutable, framework-owned acquired metadata records under
-  `metadata.<instance>.*`. Plugins need `read_metadata` to receive the typed
-  slot or its APL projection; `Extensions::for_child_request` starts a child
-  policy invocation without parent records. This is the protected context
+  `metadata.<instance>.*`. Plugins in the same invocation need `read_metadata`
+  to receive the typed slot or its APL projection, and cannot add, replace, or
+  remove records; `Extensions::for_child_request` starts a child policy
+  invocation without parent records. This is the protected context
   foundation for the external metadata PIP tracked by
   [#184](https://github.com/praxis-proxy/policy/issues/184).
 

@@ -108,8 +108,9 @@ impl DelegationInvoker for DelegationPluginInvoker {
 
         // Snapshot extensions to construct the payload and pass into
         // invoke_entries. The canonical copy stays under the Mutex; this
-        // child snapshot cannot inherit metadata acquired by its parent.
-        let current_extensions = self.extensions.lock().await.for_child_request();
+        // snapshot is the per-call working copy. Acquired metadata is shared
+        // read-only within the invocation and filtered on `read_metadata`.
+        let current_extensions = self.extensions.lock().await.clone();
 
         // Read step args first — the subject / actor role selection below
         // reads from them. Step `config_override` is a yaml map per the IR;

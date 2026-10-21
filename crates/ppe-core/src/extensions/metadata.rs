@@ -698,6 +698,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn merge_back_keeps_parent_metadata_over_plugin_view() {
+        let mut parent = Extensions::default();
+        parent
+            .install_metadata("account", "metadata/http", success(json!(true)))
+            .expect("parent record installs");
+        let parent_record = Arc::clone(parent.metadata.as_ref().expect("parent metadata"));
+
+        for plugin_metadata in [None, Some(forged_record())] {
+            let mut returned = parent.clone();
+            returned.metadata = plugin_metadata;
+            returned.retain_metadata_from(&parent);
+            assert!(
+                Arc::ptr_eq(
+                    returned.metadata.as_ref().expect("parent metadata is kept"),
+                    &parent_record
+                ),
+                "merge-back must not drop or replace installed records"
+            );
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Test Utilities
     // -------------------------------------------------------------------------
@@ -710,5 +732,13 @@ mod tests {
                 .expect("a literal RFC3339 instant"),
             MetadataCacheDisposition::Disabled,
         )
+    }
+
+    fn forged_record() -> Arc<MetadataExtension> {
+        let mut forged = Extensions::default();
+        forged
+            .install_metadata("account", "metadata/forged", success(json!(false)))
+            .expect("forged fixture installs");
+        forged.metadata.expect("forged metadata")
     }
 }

@@ -236,10 +236,29 @@ async fn dispatch_maps_payload_outputs_and_passes_resolved_from() {
 }
 
 #[tokio::test]
-async fn elicitation_child_dispatch_does_not_inherit_parent_metadata() {
+async fn elicitation_dispatch_with_read_metadata_sees_parent_metadata() {
+    assert!(
+        elicitation_saw_metadata(true).await,
+        "an elicitation plugin in the same invocation sees metadata with read_metadata"
+    );
+}
+
+#[tokio::test]
+async fn elicitation_dispatch_without_read_metadata_sees_no_metadata() {
+    assert!(
+        !elicitation_saw_metadata(false).await,
+        "metadata must not reach an elicitation plugin without read_metadata"
+    );
+}
+
+/// Dispatch one elicitation with parent metadata installed and report
+/// whether the plugin's filtered view carried it.
+async fn elicitation_saw_metadata(read_metadata: bool) -> bool {
     let ledger = Arc::new(Mutex::new(Vec::new()));
     let mut plugin_cfg = approver_cfg("manager-approver");
-    plugin_cfg.capabilities.insert("read_metadata".to_owned());
+    if read_metadata {
+        plugin_cfg.capabilities.insert("read_metadata".to_owned());
+    }
     let plugin = Arc::new(FakeApprover {
         cfg: plugin_cfg.clone(),
         ledger: Arc::clone(&ledger),
@@ -269,10 +288,7 @@ async fn elicitation_child_dispatch_does_not_inherit_parent_metadata() {
         .await
         .expect("dispatch succeeds");
 
-    assert!(
-        !ledger.lock().unwrap()[0].saw_metadata,
-        "elicitation child dispatch must not inherit parent metadata"
-    );
+    ledger.lock().unwrap()[0].saw_metadata
 }
 
 #[tokio::test]

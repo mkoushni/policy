@@ -62,10 +62,12 @@ policy engine is its only writer today.
 
 Acquired metadata belongs to one policy invocation. Framework code installs
 one record per source instance with `Extensions::install_metadata`; ordinary
-plugin merge-back cannot replace or remove it. A host starting a child policy
-invocation uses `Extensions::for_child_request`, which retains the ordinary
-request context but clears acquired metadata. The child may install its own
-records, and those records are not merged into the parent.
+plugin merge-back cannot add, replace, or remove it. Plugins dispatched within
+the same invocation (`run`, delegation, elicitation) see the records read-only
+when they declare `read_metadata`. A host starting a child policy invocation
+uses `Extensions::for_child_request`, which retains the ordinary request
+context but clears acquired metadata. The child may install its own records,
+and those records are not merged into the parent.
 
 ## Capabilities
 

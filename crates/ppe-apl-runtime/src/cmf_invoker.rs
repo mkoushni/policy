@@ -377,13 +377,14 @@ where
                 ))
             })?;
 
-        // Snapshot the current payload + child extensions — `invoke_entries`
+        // Snapshot the current payload + extensions — `invoke_entries`
         // consumes by-value, so we clone for the call and keep the
-        // canonical copies in shared state for the next dispatch. Acquired
-        // metadata belongs to the parent policy invocation and must not cross
-        // this nested plugin-dispatch boundary.
+        // canonical copies in shared state for the next dispatch. This
+        // dispatch is part of the same policy invocation, so acquired
+        // metadata is shared read-only; the executor filters it on
+        // `read_metadata`.
         let current_payload = self.payload.lock().await.clone();
-        let current_extensions = self.extensions.lock().await.for_child_request();
+        let current_extensions = self.extensions.lock().await.clone();
 
         // Per-call taint diff baseline. New labels in `result` minus
         // these become `PluginOutcome.taints`.
@@ -491,7 +492,7 @@ where
             let new_labels: Vec<String> =
                 after_labels.difference(&before_labels).cloned().collect();
             let mut parent_extensions = self.extensions.lock().await;
-            modified_ext.metadata = parent_extensions.metadata.clone();
+            modified_ext.retain_metadata_from(&parent_extensions);
             *parent_extensions = modified_ext;
             new_labels
                 .into_iter()

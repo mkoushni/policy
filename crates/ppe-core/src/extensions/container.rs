@@ -219,6 +219,14 @@ impl Extensions {
         child
     }
 
+    /// Keep the parent's acquired metadata when adopting a plugin's view.
+    ///
+    /// Runtime merge-back calls this so a dispatched plugin's returned
+    /// extensions can never add, replace, or drop installed records.
+    pub fn retain_metadata_from(&mut self, parent: &Self) {
+        self.metadata = parent.metadata.clone();
+    }
+
     /// Install one source result under its trusted plugin registration.
     ///
     /// The framework calls this after dispatch. Ordinary plugins receive an
