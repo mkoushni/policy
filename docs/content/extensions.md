@@ -60,9 +60,12 @@ candidate set. Because PPE links the router in-process, this is a typed value,
 not a serialized blob. Capability-gating the write is not yet applied — the
 policy engine is its only writer today.
 
-Acquired metadata belongs to one policy invocation. Framework code installs
-one record per source instance with `Extensions::install_metadata`; ordinary
-plugin merge-back cannot add, replace, or remove it. Plugins dispatched within
+Acquired metadata belongs to one policy invocation. The metadata PIP fetch
+step ([#184](https://github.com/praxis-proxy/policy/issues/184)), or a host
+that resolves facts before dispatch, installs one record per source instance
+with `Extensions::install_metadata`; ordinary plugin merge-back cannot add,
+replace, or remove it. Route predicates always read `metadata.*`, because the
+synthetic APL handler holds `read_metadata` intrinsically. Plugins dispatched within
 the same invocation (`run`, delegation, elicitation) see the records read-only
 when they declare `read_metadata`. A host starting a child policy invocation
 uses `Extensions::for_child_request`, which retains the ordinary request

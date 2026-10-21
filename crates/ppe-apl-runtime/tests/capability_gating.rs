@@ -409,15 +409,7 @@ routes:
 "#;
 
     let mgr = Arc::new(PolicyEngine::default());
-    register_apl(
-        &mgr,
-        AplOptions {
-            base_capabilities: Some(std::collections::HashSet::from(
-                ["read_metadata".to_owned()],
-            )),
-            ..AplOptions::in_process()
-        },
-    );
+    register_apl(&mgr, AplOptions::in_process());
     mgr.load_config_yaml(YAML).expect("load_config_yaml");
     mgr.initialize().await.expect("initialize");
 
@@ -462,15 +454,7 @@ routes:
         - "require(metadata.account.$outcome == 'success')"
 "#;
     let mgr = Arc::new(PolicyEngine::default());
-    register_apl(
-        &mgr,
-        AplOptions {
-            base_capabilities: Some(std::collections::HashSet::from(
-                ["read_metadata".to_owned()],
-            )),
-            ..AplOptions::in_process()
-        },
-    );
+    register_apl(&mgr, AplOptions::in_process());
     mgr.load_config_yaml(YAML)
         .expect("a `$` provenance leaf must parse");
     mgr.initialize().await.expect("initialize");
@@ -501,7 +485,7 @@ routes:
 }
 
 #[tokio::test]
-async fn acquired_metadata_is_invisible_without_read_metadata() {
+async fn route_predicates_read_metadata_without_a_baseline_grant() {
     const YAML: &str = r#"
 engine_settings:
   dispatch: policy
@@ -527,8 +511,9 @@ routes:
         .await;
 
     assert!(
-        !result.continue_processing,
-        "metadata must not reach the APL bag without read_metadata"
+        result.continue_processing,
+        "the synthetic APL handler holds read_metadata intrinsically: {:?}",
+        result.violation
     );
 }
 
