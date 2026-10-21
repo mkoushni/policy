@@ -290,7 +290,7 @@ fn validate_instance_name(instance: &str) -> Result<(), MetadataInstallError> {
         ));
     };
     if !(first.is_ascii_alphabetic() || first == '_')
-        || !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+        || !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
     {
         return Err(MetadataInstallError::InvalidInstanceName(
             instance.to_owned(),
@@ -455,13 +455,20 @@ mod tests {
 
     #[test]
     fn instance_names_follow_the_namespace_contract() {
-        for valid in ["account", "_account", "account-status", "a1"] {
+        for valid in ["account", "_account", "account_status", "a1"] {
             let mut extensions = Extensions::default();
             extensions
                 .install_metadata(valid, "metadata/http", success(json!(true)))
                 .expect("valid instance should install");
         }
-        for invalid in ["", "1account", "account.status", "account/status", "é"] {
+        for invalid in [
+            "",
+            "1account",
+            "account-status",
+            "account.status",
+            "account/status",
+            "é",
+        ] {
             let mut extensions = Extensions::default();
             let result =
                 extensions.install_metadata(invalid, "metadata/http", success(json!(true)));

@@ -373,6 +373,24 @@ fn extensions_with_metadata(active: bool) -> Extensions {
     extensions
 }
 
+fn extensions_with_metadata_error() -> Extensions {
+    let mut extensions = Extensions {
+        meta: Some(Arc::new(meta_for_tool("get_weather"))),
+        ..Default::default()
+    };
+    extensions
+        .install_metadata(
+            "account",
+            "metadata/http",
+            AcquiredFacts::error(
+                "metadata.upstream_error",
+                MetadataCacheDisposition::Disabled,
+            ),
+        )
+        .expect("error metadata fixture installs");
+    extensions
+}
+
 // =====================================================================
 // Scenarios
 // =====================================================================
@@ -429,6 +447,57 @@ routes:
         !denied.continue_processing,
         "false acquired fact should deny"
     );
+}
+
+#[tokio::test]
+async fn apl_reads_metadata_provenance_leaves() {
+    const YAML: &str = r#"
+engine_settings:
+  dispatch: policy
+plugins: []
+routes:
+  - tool: get_weather
+    authorization:
+      pre_invocation:
+        - "require(metadata.account.$outcome == 'success')"
+"#;
+    let mgr = Arc::new(PolicyEngine::default());
+    register_apl(
+        &mgr,
+        AplOptions {
+            base_capabilities: Some(std::collections::HashSet::from(
+                ["read_metadata".to_owned()],
+            )),
+            ..AplOptions::in_process()
+        },
+    );
+    mgr.load_config_yaml(YAML)
+        .expect("a `$` provenance leaf must parse");
+    mgr.initialize().await.expect("initialize");
+
+    let (allowed, _bg) = mgr
+        .invoke_named::<CmfHook>(
+            "cmf.tool_pre_invoke",
+            cmf_payload("hi"),
+            extensions_with_metadata(true),
+            None,
+        )
+        .await;
+    assert!(
+        allowed.continue_processing,
+        "a success record should allow: {:?}",
+        allowed.violation
+    );
+
+    let (denied, _bg) = mgr
+        .invoke_named::<CmfHook>(
+            "cmf.tool_pre_invoke",
+            cmf_payload("hi"),
+            extensions_with_metadata_error(),
+            None,
+        )
+        .await;
+    assert!(!denied.continue_processing, "an error record should deny");
 }
 
 #[tokio::test]
