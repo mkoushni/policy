@@ -43,7 +43,10 @@ missing slots is out of scope.
 
 Acquired metadata is the deliberate exception to the last row: each present
 object, mixed array, or `null` writes `NonScalar` at its own path so an
-installed result remains distinguishable from a missing one. Its structured
+installed result remains distinguishable from a missing one in APL. CEL and
+OPA skip `NonScalar` entries until the evaluator-native projection lands, so
+there this presence is not yet visible. An integer outside the `i64` range
+also projects as `NonScalar` rather than a rounded float. The structured
 record remains available to later evaluator-native projections.
 
 `ppe-pdp-diff` is the executable form of this table for the keys Cedar can
@@ -537,8 +540,11 @@ these flattened keys.
 Reserved provenance leaves are `$source`, `$outcome`, `$fetched_at`, `$cache`,
 `$status`, `$stale`, and `$error_code`; optional leaves appear only when they
 apply. `$source` carries the registered plugin kind, while the containing
-namespace carries its instance name. A plugin sees this slot and namespace
-only with `read_metadata`.
+namespace carries its instance name. `$fetched_at` is an RFC 3339 UTC string
+at second precision with a `Z` suffix, such as `2026-10-19T12:00:00Z`,
+matching `<ns>.attested_at`. APL reads these leaves as ordinary path
+segments, as in `metadata.account.$outcome`. A plugin sees this slot and
+namespace only with `read_metadata`; route predicates always can.
 
 ---
 

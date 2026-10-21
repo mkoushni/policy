@@ -12,6 +12,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 /// Cache disposition for one metadata acquisition.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MetadataCacheDisposition {
@@ -42,6 +43,7 @@ impl MetadataCacheDisposition {
 }
 
 /// Whether an acquisition produced a value or a normalized error.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MetadataOutcome {
@@ -255,6 +257,7 @@ impl MetadataExtension {
 }
 
 /// Failure to install an acquired-facts record.
+#[non_exhaustive]
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum MetadataInstallError {
     /// An instance already owns its one record for this invocation.

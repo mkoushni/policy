@@ -48,7 +48,10 @@ fn extract_provenance(facts: &AcquiredFacts, prefix: &str, bag: &mut AttributeBa
         facts.cache().as_str().to_owned(),
     );
     if let Some(fetched_at) = facts.fetched_at() {
-        bag.set(format!("{prefix}.$fetched_at"), fetched_at.to_rfc3339());
+        bag.set(
+            format!("{prefix}.$fetched_at"),
+            fetched_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        );
     }
     if let Some(status) = facts.status() {
         bag.set(format!("{prefix}.$status"), i64::from(status));
@@ -158,7 +161,10 @@ mod tests {
         assert_eq!(bag.get_string("metadata.account.$cache"), Some("stale"));
         assert_eq!(bag.get_int("metadata.account.$status"), Some(200));
         assert_eq!(bag.get_bool("metadata.account.$stale"), Some(true));
-        assert!(bag.get_string("metadata.account.$fetched_at").is_some());
+        assert_eq!(
+            bag.get_string("metadata.account.$fetched_at"),
+            Some("2026-10-19T12:00:00Z")
+        );
         assert!(!bag.contains("metadata.account.$error_code"));
     }
 
