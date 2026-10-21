@@ -180,8 +180,10 @@ enforces the tier:
   workload, agent, meta, request, LLM, LLM request, MCP, completion,
   provenance, framework, and externally acquired metadata extensions. Metadata
   is installed once per source instance by the framework and has no plugin
-  write capability. The LLM request is also never serialized, so it stays out
-  of extension dumps and session stores.
+  write capability. The LLM request and acquired metadata are never
+  serialized with `Extensions`, so they stay out of extension dumps and
+  session stores, and serde cannot carry provenance the framework did not
+  stamp.
 - Monotonic: may only grow. Security labels (added via `append_labels`,
   never removed) and the delegation chain (extended via `append_delegation`).
 - Mutable: may be rewritten. HTTP headers (via `write_headers`) and the

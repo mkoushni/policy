@@ -64,6 +64,7 @@ impl MetadataOutcome {
 
 /// Trusted identity of the plugin instance that acquired a record.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetadataSource {
     /// Configured plugin instance name.
     pub instance: String,
@@ -73,6 +74,7 @@ pub struct MetadataSource {
 
 /// One immutable result returned by a policy information source.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AcquiredFacts {
     cache: MetadataCacheDisposition,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -725,6 +727,49 @@ mod tests {
                 "merge-back must not drop or replace installed records"
             );
         }
+    }
+
+    #[test]
+    fn extensions_serde_never_carries_metadata() {
+        let mut extensions = Extensions::default();
+        extensions
+            .install_metadata("account", "metadata/http", success(json!(true)))
+            .expect("record installs");
+        let encoded = serde_json::to_value(&extensions).expect("extensions serialize");
+        assert!(
+            encoded.get("metadata").is_none(),
+            "serializing extensions must omit metadata: {encoded}"
+        );
+
+        let stamped = serde_json::to_value(extensions.metadata.as_deref().expect("metadata"))
+            .expect("metadata serializes");
+        let decoded: Extensions =
+            serde_json::from_value(json!({ "metadata": stamped })).expect("extensions deserialize");
+        assert!(
+            decoded.metadata.is_none(),
+            "deserialized extensions must not adopt self-stamped metadata"
+        );
+    }
+
+    #[test]
+    fn records_reject_unknown_fields() {
+        let mut record = json!({
+            "cache": "disabled",
+            "fetched_at": "2026-10-19T12:00:00Z",
+            "outcome": "success",
+            "value": true,
+            "statuss": 200
+        });
+        serde_json::from_value::<AcquiredFacts>(record.clone())
+            .expect_err("a misspelled record field must not be ignored");
+
+        record
+            .as_object_mut()
+            .expect("record is an object")
+            .remove("statuss");
+        record["source"] = json!({"instance": "account", "kind": "metadata/http", "extra": 1});
+        serde_json::from_value::<AcquiredFacts>(record)
+            .expect_err("an unknown source field must not be ignored");
     }
 
     // -------------------------------------------------------------------------

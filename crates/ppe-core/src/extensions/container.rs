@@ -117,7 +117,9 @@ pub struct Extensions {
     pub meta: Option<Arc<MetaExtension>>,
 
     /// Immutable externally acquired policy facts.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Never serialized, so serde cannot carry provenance the framework did
+    /// not stamp.
+    #[serde(skip)]
     pub metadata: Option<Arc<MetadataExtension>>,
 
     /// Custom extensions (frozen as Arc — unfrozen in `OwnedExtensions`).
