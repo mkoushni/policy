@@ -303,19 +303,15 @@ fn validate_instance_name(instance: &str) -> Result<(), MetadataInstallError> {
 
 /// Enforce the mutually exclusive success and error record shapes.
 fn validate_record(facts: &AcquiredFacts) -> Result<(), MetadataInstallError> {
-    match facts.outcome {
-        MetadataOutcome::Success
-            if facts.value.is_some()
-                && facts.fetched_at.is_some()
+    match (facts.outcome, facts.value.as_ref()) {
+        (MetadataOutcome::Success, Some(value))
+            if facts.fetched_at.is_some()
                 && facts.error_code.is_none()
                 && facts.stale == (facts.cache == MetadataCacheDisposition::Stale) =>
         {
-            match facts.value.as_ref() {
-                Some(value) => validate_keys(value, true),
-                None => Err(MetadataInstallError::InvalidRecordShape),
-            }
+            validate_keys(value, true)
         },
-        MetadataOutcome::Error
+        (MetadataOutcome::Error, _)
             if facts.value.is_none()
                 && facts.fetched_at.is_none()
                 && facts
@@ -336,7 +332,11 @@ fn validate_keys(value: &Value, root: bool) -> Result<(), MetadataInstallError> 
     match value {
         Value::Object(map) => {
             for (key, child) in map {
-                if key.contains('.') || key.starts_with('$') || (root && key == "value") {
+                if key.is_empty()
+                    || key.contains('.')
+                    || key.starts_with('$')
+                    || (root && key == "value")
+                {
                     return Err(MetadataInstallError::InvalidResponseKey(key.clone()));
                 }
                 validate_keys(child, false)?;
@@ -354,12 +354,7 @@ fn validate_keys(value: &Value, root: bool) -> Result<(), MetadataInstallError> 
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::unwrap_used,
-    reason = "tests"
-)]
+#[allow(clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use super::*;
     use crate::extensions::{Capability, Extensions, MutabilityTier, SlotName, filter_extensions};
@@ -772,18 +767,176 @@ mod tests {
             .expect_err("an unknown source field must not be ignored");
     }
 
+    #[test]
+    fn every_invalid_record_shape_is_rejected_atomically() {
+        let stale_cache_without_marker =
+            AcquiredFacts::success(json!(true), instant(), MetadataCacheDisposition::Stale);
+        let mut success_with_error_code = success(json!(true));
+        success_with_error_code.error_code = Some("metadata.oops".to_owned());
+        let mut success_without_fetched_at = success(json!(true));
+        success_without_fetched_at.fetched_at = None;
+        let mut success_without_value = success(json!(true));
+        success_without_value.value = None;
+        let mut error_with_fetched_at = error("metadata.oops", MetadataCacheDisposition::Disabled);
+        error_with_fetched_at.fetched_at = Some(instant());
+        let mut error_with_value = error("metadata.oops", MetadataCacheDisposition::Disabled);
+        error_with_value.value = Some(json!(true));
+
+        for (name, facts) in [
+            ("stale cache without marker", stale_cache_without_marker),
+            ("success with error code", success_with_error_code),
+            ("success without fetched_at", success_without_fetched_at),
+            ("success without value", success_without_value),
+            (
+                "stale error",
+                error("metadata.oops", MetadataCacheDisposition::Disabled).with_stale(),
+            ),
+            (
+                "error with stale cache",
+                error("metadata.oops", MetadataCacheDisposition::Stale),
+            ),
+            (
+                "error without code",
+                error("", MetadataCacheDisposition::Disabled),
+            ),
+            ("error with fetched_at", error_with_fetched_at),
+            ("error with value", error_with_value),
+        ] {
+            let mut extensions = Extensions::default();
+            assert_eq!(
+                extensions.install_metadata("account", "metadata/http", facts),
+                Err(MetadataInstallError::InvalidRecordShape),
+                "{name}"
+            );
+            assert!(extensions.metadata.is_none(), "{name} must install nothing");
+        }
+    }
+
+    #[test]
+    fn response_keys_that_break_the_projection_are_rejected() {
+        for (key, value) in [
+            ("", json!({"": 1})),
+            ("a.b", json!({"a.b": 1})),
+            ("$source", json!({"$source": "forged"})),
+            ("value", json!({"value": 1})),
+            ("$x", json!({"nested": {"$x": 1}})),
+            ("", json!({"list": [{"": 1}]})),
+        ] {
+            let mut extensions = Extensions::default();
+            assert_eq!(
+                extensions.install_metadata("account", "metadata/http", success(value)),
+                Err(MetadataInstallError::InvalidResponseKey(key.to_owned()))
+            );
+            assert!(extensions.metadata.is_none());
+        }
+    }
+
+    #[test]
+    fn tampered_installed_metadata_fails_to_deserialize() {
+        let mut extensions = Extensions::default();
+        extensions
+            .install_metadata("account", "metadata/http", success(json!({"active": true})))
+            .expect("record installs");
+        let stamped = serde_json::to_value(extensions.metadata.as_deref().expect("metadata"))
+            .expect("metadata serializes");
+
+        let renamed = |key: &str| {
+            let mut tampered = stamped.clone();
+            let record = tampered
+                .as_object_mut()
+                .expect("map")
+                .remove("account")
+                .expect("record");
+            tampered[key] = record;
+            tampered
+        };
+        let edited = |pointer: &str, replacement: Value| {
+            let mut tampered = stamped.clone();
+            *tampered.pointer_mut(pointer).expect("field exists") = replacement;
+            tampered
+        };
+        let mut error_with_value = stamped.clone();
+        error_with_value["account"]["outcome"] = json!("error");
+        error_with_value["account"]["error_code"] = json!("metadata.oops");
+
+        for (name, tampered) in [
+            ("dotted key", renamed("a.b")),
+            ("numeric key", renamed("1x")),
+            ("key not matching source", renamed("billing")),
+            ("error with value", error_with_value),
+            (
+                "reserved key in value",
+                edited("/account/value", json!({"$source": "forged"})),
+            ),
+            (
+                "empty source kind",
+                edited("/account/source/kind", json!("")),
+            ),
+        ] {
+            serde_json::from_value::<MetadataExtension>(tampered).expect_err(name);
+        }
+    }
+
+    #[test]
+    fn failed_install_into_a_uniquely_owned_map_changes_nothing() {
+        let mut extensions = Extensions::default();
+        extensions
+            .install_metadata("account", "metadata/http", success(json!(true)))
+            .expect("first record installs");
+        let before = extensions.metadata.as_deref().cloned();
+
+        let result =
+            extensions.install_metadata("account", "metadata/other", success(json!(false)));
+
+        assert_eq!(
+            result,
+            Err(MetadataInstallError::DuplicateInstance(
+                "account".to_owned()
+            ))
+        );
+        assert_eq!(extensions.metadata.as_deref().cloned(), before);
+    }
+
+    #[test]
+    fn policy_spellings_match_serde_names() {
+        for (disposition, spelling) in [
+            (MetadataCacheDisposition::Disabled, "disabled"),
+            (MetadataCacheDisposition::Miss, "miss"),
+            (MetadataCacheDisposition::Hit, "hit"),
+            (MetadataCacheDisposition::Revalidated, "revalidated"),
+            (MetadataCacheDisposition::Stale, "stale"),
+        ] {
+            assert_eq!(disposition.as_str(), spelling);
+            assert_eq!(
+                serde_json::to_value(disposition).expect("serialize"),
+                spelling
+            );
+        }
+        for (outcome, spelling) in [
+            (MetadataOutcome::Success, "success"),
+            (MetadataOutcome::Error, "error"),
+        ] {
+            assert_eq!(outcome.as_str(), spelling);
+            assert_eq!(serde_json::to_value(outcome).expect("serialize"), spelling);
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Test Utilities
     // -------------------------------------------------------------------------
 
+    fn instant() -> DateTime<Utc> {
+        "2026-10-19T12:00:00Z"
+            .parse()
+            .expect("a literal RFC3339 instant")
+    }
+
     fn success(value: Value) -> AcquiredFacts {
-        AcquiredFacts::success(
-            value,
-            "2026-10-19T12:00:00Z"
-                .parse()
-                .expect("a literal RFC3339 instant"),
-            MetadataCacheDisposition::Disabled,
-        )
+        AcquiredFacts::success(value, instant(), MetadataCacheDisposition::Disabled)
+    }
+
+    fn error(code: &str, cache: MetadataCacheDisposition) -> AcquiredFacts {
+        AcquiredFacts::error(code, cache)
     }
 
     fn forged_record() -> Arc<MetadataExtension> {
