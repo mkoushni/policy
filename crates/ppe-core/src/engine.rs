@@ -2289,7 +2289,7 @@ impl PolicyEngine {
         let targeted_entries = entries_for_target(hook_entries, payload.as_ref());
 
         if targeted_entries.is_empty()
-            && let Some(target) = payload.target_plugin().map(|target| target.to_owned())
+            && let Some(target) = payload.target_plugin().map(ToOwned::to_owned)
         {
             let violation = crate::error::PluginViolation::new(
                 "plugin.not_found",
@@ -2452,7 +2452,7 @@ impl PolicyEngine {
         let targeted_entries = entries_for_target(hook_entries, &payload);
 
         if targeted_entries.is_empty()
-            && let Some(target) = payload.target_plugin().map(|target| target.to_owned())
+            && let Some(target) = payload.target_plugin().map(ToOwned::to_owned)
         {
             let violation = crate::error::PluginViolation::new(
                 "plugin.not_found",
@@ -2614,7 +2614,7 @@ impl PolicyEngine {
         let targeted_entries = entries_for_target(hook_entries, &payload);
 
         if targeted_entries.is_empty()
-            && let Some(target) = payload.target_plugin().map(|target| target.to_owned())
+            && let Some(target) = payload.target_plugin().map(ToOwned::to_owned)
         {
             let violation = crate::error::PluginViolation::new(
                 "plugin.not_found",
